@@ -1,0 +1,70 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tensorpils"
+dynamic = ["version"]
+description = "Physics-Informed Learning System powered by TensorMesh (neural operators trained with FEM-derived losses)"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "Shizheng Wen", email = "shizheng.wen@sam.math.ethz.ch"},
+]
+maintainers = [
+    {name = "Shizheng Wen", email = "shizheng.wen@sam.math.ethz.ch"},
+]
+keywords = [
+    "deep-learning",
+    "neural-operator",
+    "fourier-neural-operator",
+    "physics-informed",
+    "AI4S",
+    "ai-for-science",
+    "pytorch",
+    "finite-element-methods",
+    "fem",
+    "partial-differential-equation",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "tensormesh-fem",   # FEM backend; import name is `tensormesh`
+    "neuraloperator",   # provides `neuralop.models.FNO`
+    "torch>=2.0.0",
+    "numpy",
+    "scipy",
+    "meshio",
+    "matplotlib",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest",
+    "pytest-cov",
+]
+
+[project.scripts]
+tensorpils = "tensorpils.cli:main"
+
+[project.urls]
+Repository = "https://github.com/camlab-ethz/TensorPILS"
+
+[tool.setuptools.dynamic]
+version = {attr = "tensorpils._version.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["tensorpils*"]

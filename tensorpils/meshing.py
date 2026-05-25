@@ -1,0 +1,89 @@
+"""Structured quadrilateral grid → :class:`tensormesh.Mesh`, plus grid↔node maps.
+
+TensorMesh has no tensor-product (structured) mesh generator — ``Mesh.gen_rectangle``
+goes through Gmsh and yields an *unstructured* mesh with arbitrary node numbering.
+A Fourier Neural Operator, however, needs a regular grid whose node index maps to a
+grid cell by a plain reshape. So TensorPILS keeps its own structured-grid builder, but
+it emits a genuine :class:`tensormesh.Mesh` that TensorMesh's assemblers consume directly.
+
+Node ordering is row-major: node ``k = i * nx + j`` sits at grid row ``i`` (the second
+physical coordinate, "y") and column ``j`` (the first physical coordinate, "x").
+:func:`node_to_grid` / :func:`grid_to_node` are exact inverses that move between the
+flat node vector ``[..., nx*ny]`` and the image-shaped grid ``[..., ny, nx]``.
+"""
+
+import numpy as np
+import meshio
+import torch
+
+from tensormesh import Mesh
+
+__all__ = ["structured_quad_mesh", "node_to_grid", "grid_to_node"]
+
+
+def structured_quad_mesh(nx: int = 64, ny: int = 64,
+                         xlims=(0.0, 1.0), ylims=(0.0, 1.0),
+                         dtype=np.float64) -> Mesh:
+    """Build a structured bilinear-quad mesh on a rectangle as a ``tensormesh.Mesh``.
+
+    Parameters
+    ----------
+    nx, ny : int
+        Number of nodes along x (columns) and y (rows). The grid has ``nx*ny`` nodes
+        and ``(nx-1)*(ny-1)`` quad cells.
+    xlims, ylims : tuple(float, float)
+        Domain extents along the first / second coordinate.
+    dtype : numpy dtype
+        Point coordinate precision (``float64`` by default; the assembled stiffness/mass
+        matrices inherit it and are downcast at use).
+
+    Returns
+    -------
+    tensormesh.Mesh
+        Mesh with a single ``"quad"`` cell block, node ``k = i*nx + j`` at
+        ``(x_j, y_i)``, and a boolean ``boundary_mask`` over the outer frame.
+
+    Notes
+    -----
+    Connectivity is emitted in TensorMesh's **lexicographic** quad node order
+    ``(0,0),(1,0),(0,1),(1,1)`` → ``[BL, BR, TL, TR]`` so that, with ``reorder=False``,
+    each physical corner maps to the matching reference corner with a positive Jacobian.
+    """
+    xs = np.linspace(xlims[0], xlims[1], nx)          # along columns (j → x)
+    ys = np.linspace(ylims[0], ylims[1], ny)          # along rows (i → y)
+
+    # points: node k = i*nx + j at (xs[j], ys[i]); row-major over (i, j).
+    X, Y = np.meshgrid(xs, ys)                        # both [ny, nx]; X[i,j]=xs[j], Y[i,j]=ys[i]
+    points = np.stack([X.ravel(), Y.ravel()], axis=-1).astype(dtype)   # [nx*ny, 2]
+
+    # node-id grid: nids[i, j] = i*nx + j
+    nids = np.arange(nx * ny, dtype=np.int64).reshape(ny, nx)
+
+    # quad cells in lexicographic local order [BL, BR, TL, TR]:
+    #   BL = (i,   j  ) = nids[:-1, :-1]
+    #   BR = (i,   j+1) = nids[:-1, 1:]
+    #   TL = (i+1, j  ) = nids[1:,  :-1]
+    #   TR = (i+1, j+1) = nids[1:,  1:]
+    quads = np.stack([nids[:-1, :-1], nids[:-1, 1:],
+                      nids[1:, :-1],  nids[1:, 1:]], axis=-1).reshape(-1, 4)
+
+    # boundary frame mask over the outer rows/columns
+    bmask = np.zeros((ny, nx), dtype=bool)
+    bmask[0, :] = bmask[-1, :] = bmask[:, 0] = bmask[:, -1] = True
+
+    mio = meshio.Mesh(
+        points=points,
+        cells=[("quad", quads)],
+        point_data={"boundary_mask": bmask.ravel()},
+    )
+    return Mesh(mio, reorder=False)
+
+
+def node_to_grid(f: torch.Tensor, nx: int, ny: int) -> torch.Tensor:
+    """Flat node vector ``[..., nx*ny]`` → image grid ``[..., ny, nx]`` (node ``k=i*nx+j``)."""
+    return f.reshape(*f.shape[:-1], ny, nx)
+
+
+def grid_to_node(g: torch.Tensor, nx: int, ny: int) -> torch.Tensor:
+    """Image grid ``[..., ny, nx]`` → flat node vector ``[..., nx*ny]`` (inverse of :func:`node_to_grid`)."""
+    return g.reshape(*g.shape[:-2], ny * nx)

@@ -1,0 +1,306 @@
+"""Training loop, evaluation, checkpointing, and plotting orchestration."""
+
+import os
+from copy import deepcopy
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+from .meshing import node_to_grid, grid_to_node
+from .physics import apply_zero_boundary
+from .multigrid import GeometricMultigrid
+from .losses import build_loss
+from .optim import build_optimizer
+from . import viz
+
+__all__ = ["Trainer", "TrainingStats"]
+
+
+@dataclass
+class TrainingStats:
+    train_losses: List[float] = field(default_factory=list)
+    val_errors: List[float] = field(default_factory=list)
+    learning_rates: List[float] = field(default_factory=list)
+    best_epoch: int = 0
+    best_val_error: float = float("inf")
+
+
+class Trainer:
+    def __init__(
+        self,
+        model: nn.Module,
+        train_dataset,
+        val_dataset,
+        test_dataset,
+        loss_type: str = "galerkin",
+        optimizer_name: str = "adam",
+        lr: float = 1e-3,
+        lr_min: float = 1e-6,
+        weight_decay: float = 0.0,
+        batch_size: int = 32,
+        epochs: int = 500,
+        device: str = "cuda",
+        output_dir: str = "output",
+        lambda_bc: float = 100.0,
+        bc_mode: str = "penalty",
+        precondition: bool = False,
+        mg_levels: int = 4,
+        mg_pre_smooth: int = 2,
+        mg_post_smooth: int = 2,
+        mg_omega: float = 2.0 / 3.0,
+    ):
+        self.model = model.to(device)
+        self.train_dataset = train_dataset
+        self.val_dataset = val_dataset
+        self.test_dataset = test_dataset
+        self.device = device
+        self.epochs = epochs
+        self.output_dir = output_dir
+        self.loss_type = loss_type
+        self.K = train_dataset.K
+        self.grid_size = train_dataset.grid_size
+
+        # All splits share one PoissonProblem; move it (and its A, M) to the device once.
+        self.problem = train_dataset.problem.to(device)
+
+        self.train_loader = DataLoader(train_dataset, batch_size=batch_size,
+                                       shuffle=True, collate_fn=self._collate)
+        self.val_loader = DataLoader(val_dataset, batch_size=batch_size,
+                                     shuffle=False, collate_fn=self._collate)
+        self.test_loader = DataLoader(test_dataset, batch_size=batch_size,
+                                      shuffle=False, collate_fn=self._collate)
+
+        self.bc_mode = bc_mode
+        self.precondition = precondition
+
+        # Multigrid preconditioner for PLS or preconditioned Deep Ritz.
+        self.mg: Optional[GeometricMultigrid] = None
+        self.mg_settings = (mg_levels, mg_pre_smooth, mg_post_smooth, mg_omega)
+        needs_mg = (loss_type == "pls") or (loss_type == "deepritz" and precondition)
+        if needs_mg:
+            nx, ny = self.grid_size
+            self.mg = GeometricMultigrid(
+                nx_fine=nx, ny_fine=ny, n_levels=mg_levels,
+                pre_smooth=mg_pre_smooth, post_smooth=mg_post_smooth, omega=mg_omega,
+            ).to(device)
+
+        # Project boundary to 0 at eval time whenever it was unconstrained during training.
+        self.eval_project_bc = (
+            (loss_type == "deepritz" and bc_mode == "hard")
+            or (loss_type == "deepritz" and precondition)
+            or (loss_type == "data" and bc_mode == "hard")
+        )
+
+        self.criterion = build_loss(loss_type, self.problem, lambda_bc,
+                                    bc_mode=bc_mode, mg=self.mg,
+                                    precondition=precondition)
+
+        self.optimizer = build_optimizer(optimizer_name, model.parameters(),
+                                         lr=lr, weight_decay=weight_decay)
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=epochs, eta_min=lr_min,
+        )
+
+        self.stats = TrainingStats()
+        self.best_state = None
+
+        for sub in ("checkpoints", "curves", "visualization", "error"):
+            os.makedirs(f"{output_dir}/{sub}", exist_ok=True)
+
+    @staticmethod
+    def _collate(batch):
+        fs_grid = torch.stack([item[0][0] for item in batch], dim=0)    # [B, 1, H, W]
+        us_grid = torch.stack([item[1] for item in batch], dim=0)        # [B, H, W]
+        grid_size = batch[0][0][1]
+        fs_node = torch.stack([item[0][2] for item in batch], dim=0)     # [B, N]
+        us_node = torch.stack([item[0][3] for item in batch], dim=0)     # [B, N]
+        return (fs_grid, grid_size, fs_node, us_node), us_grid
+
+    # -------------------- forward pass --------------------
+    def _forward(self, fs_grid, us_grid, fs_node, us_node):
+        u_pred_grid = self.model(fs_grid).squeeze(1)                     # [B, H, W]
+        if self.loss_type == "data":
+            return self.criterion(u_pred_grid, us_grid)
+        # Galerkin / Deep Ritz / PLS: convert back to node order.
+        nx, ny = self.grid_size
+        u_pred_node = grid_to_node(u_pred_grid, nx, ny)                  # [B, N]
+        return self.criterion(u_pred_node, fs_node, us_node)
+
+    def train_epoch(self) -> float:
+        self.model.train()
+        total, nb = 0.0, 0
+        for batch_data, us in self.train_loader:
+            self.optimizer.zero_grad()
+            fs_grid, _, fs_node, us_node = batch_data
+            fs_grid, us = fs_grid.to(self.device), us.to(self.device)
+            fs_node, us_node = fs_node.to(self.device), us_node.to(self.device)
+            loss = self._forward(fs_grid, us, fs_node, us_node)
+            loss.backward()
+            self.optimizer.step()
+            total += loss.item()
+            nb += 1
+        return total / nb
+
+    def _apply_eval_bc(self, u_grid: torch.Tensor) -> torch.Tensor:
+        """Project the prediction onto the zero Dirichlet BC at eval time when the boundary
+        was unconstrained during training. Accepts ``[H, W]`` or ``[B, H, W]``; pass-through
+        otherwise."""
+        if not self.eval_project_bc:
+            return u_grid
+        mask = self.problem.boundary_mask.to(u_grid.device)
+        nx, ny = self.grid_size
+        node = grid_to_node(u_grid, nx, ny)            # [..., N]
+        node = apply_zero_boundary(node, mask)
+        return node_to_grid(node, nx, ny)              # [..., H, W]
+
+    @torch.no_grad()
+    def _eval_loader(self, loader) -> float:
+        self.model.eval()
+        total_mse, n = 0.0, 0
+        for batch_data, us in loader:
+            fs_grid, _, _, _ = batch_data
+            fs_grid, us = fs_grid.to(self.device), us.to(self.device)
+            u_pred = self.model(fs_grid).squeeze(1)                      # [B, H, W]
+            u_pred = self._apply_eval_bc(u_pred)
+            mse = ((u_pred - us) ** 2).mean().item()
+            total_mse += mse * fs_grid.shape[0]
+            n += fs_grid.shape[0]
+        return total_mse / n
+
+    def validate(self):
+        return self._eval_loader(self.val_loader)
+
+    def test(self):
+        return self._eval_loader(self.test_loader)
+
+    # -------------------- multigrid sanity check (PLS only) --------------------
+    @torch.no_grad()
+    def _check_mg(self, n_samples: int = 4, n_cycles: int = 3):
+        """Apply V-cycles to random zero-boundary residuals and report ‖r−A V(r)‖/‖r‖.
+        A healthy GMG reduces the residual by ~0.05–0.2 per cycle (mesh-independent)."""
+        if self.mg is None:
+            return
+        nx, ny = self.grid_size
+        N = nx * ny
+        mask = self.problem.boundary_mask.to(self.device)
+
+        torch.manual_seed(0)
+        r0 = torch.randn(n_samples, N, device=self.device)
+        r0 = apply_zero_boundary(r0, mask)
+        A_sp = self.mg._A_sparse(0).to(self.device)
+
+        print(f"\n[MG sanity] n_levels={self.mg.n_levels}, "
+              f"pre/post={self.mg.pre_smooth}/{self.mg.post_smooth}, omega={self.mg.omega:.3f}")
+        print(f"[MG sanity] level dims: {self.mg.dims}")
+        r = r0.clone()
+        e_total = torch.zeros_like(r)
+        norms = [r.norm(dim=1).mean().item()]
+        for _ in range(n_cycles):
+            e_total = e_total + self.mg.v_cycle(r)
+            Ae = torch.sparse.mm(A_sp, e_total.T).T
+            r = r0 - Ae
+            norms.append(r.norm(dim=1).mean().item())
+        for k in range(n_cycles):
+            print(f"[MG sanity] after cycle {k+1}: ||r||/||r0|| = {norms[k+1]/norms[0]:.3e}   "
+                  f"(reduction this cycle: {norms[k+1]/max(norms[k],1e-30):.3e})")
+        print()
+
+    # -------------------- training loop --------------------
+    def train(self) -> float:
+        print(f"Training FNO with {self.loss_type} loss")
+        print(f"  Train: {len(self.train_dataset)}  Val: {len(self.val_dataset)}  "
+              f"Test: {len(self.test_dataset)}  Device: {self.device}\n")
+        if self.mg is not None:
+            self._check_mg()
+
+        with tqdm(range(self.epochs), desc="Training", unit="epoch", colour="green") as bar:
+            for epoch in bar:
+                tr = self.train_epoch()
+                vl = self.validate()
+                self.scheduler.step()
+                lr = self.scheduler.get_last_lr()[0]
+
+                self.stats.train_losses.append(tr)
+                self.stats.val_errors.append(vl)
+                self.stats.learning_rates.append(lr)
+
+                if vl < self.stats.best_val_error:
+                    self.stats.best_val_error = vl
+                    self.stats.best_epoch = epoch
+                    self.best_state = deepcopy(self.model.state_dict())
+                    self._save_checkpoint(epoch, vl)
+
+                bar.set_postfix(loss=f"{tr:.2e}", val=f"{vl:.2e}",
+                                best=f"{self.stats.best_val_error:.2e}", lr=f"{lr:.2e}")
+
+        if self.best_state is not None:
+            self.model.load_state_dict(self.best_state, strict=False)
+            print(f"\nRestored best model from epoch {self.stats.best_epoch} "
+                  f"(val={self.stats.best_val_error:.2e})")
+
+        test_err = self.test()
+        print(f"Test MSE: {test_err:.2e}")
+        self.plot_loss_curve()
+        self.visualize_sample(self.train_dataset, "train", 0)
+        self.visualize_sample(self.test_dataset, "test", 0)
+        self.compute_error_distribution()
+        return test_err
+
+    # -------------------- checkpointing --------------------
+    def _file_prefix(self) -> str:
+        if self.loss_type == "deepritz":
+            tag = "_precond" if self.precondition else f"_bc-{self.bc_mode}"
+        elif self.loss_type == "data":
+            tag = "_bc-hard" if self.bc_mode == "hard" else ""
+        elif self.loss_type == "pls":
+            L, pre, post, _ = self.mg_settings
+            tag = f"_mg-L{L}-s{pre}{post}"
+        else:
+            tag = ""
+        return (f"fno_{self.loss_type}{tag}_K{self.K}_"
+                f"samples-{len(self.train_dataset)}-{len(self.val_dataset)}-{len(self.test_dataset)}")
+
+    def _save_checkpoint(self, epoch, val_error):
+        path = f"{self.output_dir}/checkpoints/{self._file_prefix()}_best.pth"
+        torch.save({
+            "epoch": epoch,
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "val_error": val_error,
+            "stats": self.stats,
+        }, path)
+
+    def load_checkpoint(self, path: Optional[str] = None) -> bool:
+        if path is None:
+            path = f"{self.output_dir}/checkpoints/{self._file_prefix()}_best.pth"
+        if not os.path.exists(path):
+            print(f"Checkpoint not found: {path}")
+            return False
+        ck = torch.load(path, map_location=self.device, weights_only=False)
+        sd = ck["model_state_dict"]
+        sd.pop("_metadata", None)
+        self.model.load_state_dict(sd, strict=False)
+        self.stats = ck.get("stats", TrainingStats())
+        print(f"Loaded checkpoint from epoch {ck.get('epoch', '?')}, "
+              f"val={ck.get('val_error', float('nan')):.2e}")
+        return True
+
+    # -------------------- plotting / visualization --------------------
+    def plot_loss_curve(self):
+        path = f"{self.output_dir}/curves/{self._file_prefix()}_loss.png"
+        viz.plot_loss_curve(self.stats, self.loss_type, self.K, path)
+
+    def visualize_sample(self, dataset, split: str, sample_idx: int = 0):
+        suffix = "" if sample_idx == 0 else f"_sample{sample_idx}"
+        path = f"{self.output_dir}/visualization/{self._file_prefix()}_{split}{suffix}.png"
+        viz.visualize_sample(self.model, dataset, split, sample_idx, self.device,
+                             self._apply_eval_bc, self.loss_type, self.K, path)
+
+    def compute_error_distribution(self):
+        path = f"{self.output_dir}/error/{self._file_prefix()}_error_dist.png"
+        return viz.compute_error_distribution(self.model, self.test_dataset, self.device,
+                                              self._apply_eval_bc, self.loss_type, self.K, path)

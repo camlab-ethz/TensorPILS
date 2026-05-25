@@ -1,0 +1,48 @@
+# Byte-compiled / optimized
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Packaging / build
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Training artifacts
+output/
+checkpoints/
+*.pth
+*.ckpt
+*.npz
+*.png
+*.gif
+*.mp4
+
+# Mesh / FEM scratch files
+*.msh
+*.vtk
+*.vtu
+*.xdmf
+
+# Test / tooling caches
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Editor / OS
+.ipynb_checkpoints/
+.DS_Store
+.idea/
+.vscode/
+
+# Privatized / scratch (mirror TensorMesh convention)
+_private/
