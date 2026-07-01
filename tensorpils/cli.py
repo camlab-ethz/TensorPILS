@@ -141,8 +141,8 @@ def main():
     if args.eval_only:
         if not trainer.load_checkpoint(args.checkpoint):
             return
-        test_err = trainer.test()
-        print(f"Test MSE: {test_err:.2e}")
+        test_mse, test_l2, test_rl2 = trainer.test()
+        print(f"Test MSE: {test_mse:.2e}  Test FEM-L2: {test_l2:.2e}  Test rel-L2: {test_rl2:.2%}")
         for idx in args.sample_idx:
             if idx < len(train_ds):
                 trainer.visualize_sample(train_ds, "train", idx)
@@ -150,11 +150,13 @@ def main():
                 trainer.visualize_sample(test_ds, "test", idx)
         trainer.compute_error_distribution()
     else:
-        test_err = trainer.train()
+        test_mse, test_l2, test_rl2 = trainer.train()
         print("\n" + "=" * 60)
         print("Done.")
-        print(f"  best val MSE : {trainer.stats.best_val_error:.2e}")
-        print(f"  final test MSE: {test_err:.2e}")
+        print(f"  best val MSE   : {trainer.stats.best_val_error:.2e}")
+        print(f"  final test MSE : {test_mse:.2e}")
+        print(f"  final test L2  : {test_l2:.2e}")
+        print(f"  final test rL2 : {test_rl2:.2%}")
         print("=" * 60)
 
 

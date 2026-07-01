@@ -24,6 +24,8 @@ __all__ = ["Trainer", "TrainingStats"]
 class TrainingStats:
     train_losses: List[float] = field(default_factory=list)
     val_errors: List[float] = field(default_factory=list)
+    val_l2_errors: List[float] = field(default_factory=list)
+    val_rel_l2_errors: List[float] = field(default_factory=list)
     learning_rates: List[float] = field(default_factory=list)
     best_epoch: int = 0
     best_val_error: float = float("inf")
@@ -158,18 +160,27 @@ class Trainer:
         return node_to_grid(node, nx, ny)              # [..., H, W]
 
     @torch.no_grad()
-    def _eval_loader(self, loader) -> float:
+    def _eval_loader(self, loader):
         self.model.eval()
-        total_mse, n = 0.0, 0
+        total_mse, total_l2, total_rel_l2, n = 0.0, 0.0, 0.0, 0
+        nx, ny = self.grid_size
         for batch_data, us in loader:
-            fs_grid, _, _, _ = batch_data
+            fs_grid, _, _, us_node = batch_data
             fs_grid, us = fs_grid.to(self.device), us.to(self.device)
+            us_node = us_node.to(self.device)
             u_pred = self.model(fs_grid).squeeze(1)                      # [B, H, W]
             u_pred = self._apply_eval_bc(u_pred)
             mse = ((u_pred - us) ** 2).mean().item()
             total_mse += mse * fs_grid.shape[0]
+            e = grid_to_node(u_pred, nx, ny) - us_node                  # [B, N]
+            Me = self.problem._spmm(self.problem.M, e)                   # [B, N]
+            l2_per_sample = (e * Me).sum(dim=1).sqrt()                   # [B]
+            total_l2 += l2_per_sample.sum().item()
+            Mu = self.problem._spmm(self.problem.M, us_node)             # [B, N]
+            u_norm = (us_node * Mu).sum(dim=1).sqrt()                    # [B]
+            total_rel_l2 += (l2_per_sample / u_norm.clamp(min=1e-12)).sum().item()
             n += fs_grid.shape[0]
-        return total_mse / n
+        return total_mse / n, total_l2 / n, total_rel_l2 / n
 
     def validate(self):
         return self._eval_loader(self.val_loader)
@@ -220,12 +231,14 @@ class Trainer:
         with tqdm(range(self.epochs), desc="Training", unit="epoch", colour="green") as bar:
             for epoch in bar:
                 tr = self.train_epoch()
-                vl = self.validate()
+                vl, l2, rl2 = self.validate()
                 self.scheduler.step()
                 lr = self.scheduler.get_last_lr()[0]
 
                 self.stats.train_losses.append(tr)
                 self.stats.val_errors.append(vl)
+                self.stats.val_l2_errors.append(l2)
+                self.stats.val_rel_l2_errors.append(rl2)
                 self.stats.learning_rates.append(lr)
 
                 if vl < self.stats.best_val_error:
@@ -235,6 +248,7 @@ class Trainer:
                     self._save_checkpoint(epoch, vl)
 
                 bar.set_postfix(loss=f"{tr:.2e}", val=f"{vl:.2e}",
+                                l2=f"{l2:.2e}", rl2=f"{rl2:.2%}",
                                 best=f"{self.stats.best_val_error:.2e}", lr=f"{lr:.2e}")
 
         if self.best_state is not None:
@@ -242,13 +256,13 @@ class Trainer:
             print(f"\nRestored best model from epoch {self.stats.best_epoch} "
                   f"(val={self.stats.best_val_error:.2e})")
 
-        test_err = self.test()
-        print(f"Test MSE: {test_err:.2e}")
+        test_mse, test_l2, test_rl2 = self.test()
+        print(f"Test MSE: {test_mse:.2e}  Test FEM-L2: {test_l2:.2e}  Test rel-L2: {test_rl2:.2%}")
         self.plot_loss_curve()
         self.visualize_sample(self.train_dataset, "train", 0)
         self.visualize_sample(self.test_dataset, "test", 0)
         self.compute_error_distribution()
-        return test_err
+        return test_mse, test_l2, test_rl2
 
     # -------------------- checkpointing --------------------
     def _file_prefix(self) -> str:
