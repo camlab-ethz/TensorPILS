@@ -12,7 +12,7 @@ from tqdm import tqdm
 
 from .meshing import node_to_grid, grid_to_node
 from .physics import apply_zero_boundary
-from .multigrid import GeometricMultigrid
+from .preconditioners import Preconditioner, GeometricMultigrid, build_preconditioner
 from .losses import build_loss
 from .optim import build_optimizer
 from . import viz
@@ -29,6 +29,11 @@ class TrainingStats:
     learning_rates: List[float] = field(default_factory=list)
     best_epoch: int = 0
     best_val_error: float = float("inf")
+    # Preconditioner identity + conditioning (for the sweep / collapse plot).
+    precond_kind: str = ""
+    precond_strength: float = float("nan")
+    precond_cond_pa: float = float("nan")
+    precond_cond_h: float = float("nan")
 
 
 class Trainer:
@@ -50,6 +55,8 @@ class Trainer:
         lambda_bc: float = 100.0,
         bc_mode: str = "penalty",
         precondition: bool = False,
+        precond_kind: str = "multigrid",
+        precond_strength: float = 1.0,
         mg_levels: int = 4,
         mg_pre_smooth: int = 2,
         mg_post_smooth: int = 2,
@@ -79,16 +86,19 @@ class Trainer:
         self.bc_mode = bc_mode
         self.precondition = precondition
 
-        # Multigrid preconditioner for PLS or preconditioned Deep Ritz.
-        self.mg: Optional[GeometricMultigrid] = None
+        # Preconditioner for PLS or preconditioned Deep Ritz (multigrid or spectral).
+        self.precond: Optional[Preconditioner] = None
+        self.precond_kind = precond_kind
+        self.precond_strength = precond_strength
         self.mg_settings = (mg_levels, mg_pre_smooth, mg_post_smooth, mg_omega)
-        needs_mg = (loss_type == "pls") or (loss_type == "deepritz" and precondition)
-        if needs_mg:
-            nx, ny = self.grid_size
-            self.mg = GeometricMultigrid(
-                nx_fine=nx, ny_fine=ny, n_levels=mg_levels,
-                pre_smooth=mg_pre_smooth, post_smooth=mg_post_smooth, omega=mg_omega,
-            ).to(device)
+        needs_precond = (loss_type == "pls") or (loss_type == "deepritz" and precondition)
+        if needs_precond:
+            self.precond = build_preconditioner(
+                kind=precond_kind, problem=self.problem, grid_size=self.grid_size,
+                mg_levels=mg_levels, mg_pre_smooth=mg_pre_smooth,
+                mg_post_smooth=mg_post_smooth, mg_omega=mg_omega,
+                strength=precond_strength, device=device,
+            )
 
         # Project boundary to 0 at eval time whenever it was unconstrained during training.
         self.eval_project_bc = (
@@ -98,7 +108,7 @@ class Trainer:
         )
 
         self.criterion = build_loss(loss_type, self.problem, lambda_bc,
-                                    bc_mode=bc_mode, mg=self.mg,
+                                    bc_mode=bc_mode, precond=self.precond,
                                     precondition=precondition)
 
         self.optimizer = build_optimizer(optimizer_name, model.parameters(),
@@ -108,9 +118,14 @@ class Trainer:
         )
 
         self.stats = TrainingStats()
+        if self.precond is not None:
+            self.stats.precond_kind = self.precond_kind
+            self.stats.precond_strength = self.precond_strength
+            self.stats.precond_cond_pa = getattr(self.precond, "cond_PA", float("nan"))
+            self.stats.precond_cond_h = getattr(self.precond, "cond_H", float("nan"))
         self.best_state = None
 
-        for sub in ("checkpoints", "curves", "visualization", "error"):
+        for sub in ("checkpoints", "curves", "visualization", "error", "results"):
             os.makedirs(f"{output_dir}/{sub}", exist_ok=True)
 
     @staticmethod
@@ -188,12 +203,12 @@ class Trainer:
     def test(self):
         return self._eval_loader(self.test_loader)
 
-    # -------------------- multigrid sanity check (PLS only) --------------------
+    # -------------------- multigrid sanity check (GMG only) --------------------
     @torch.no_grad()
     def _check_mg(self, n_samples: int = 4, n_cycles: int = 3):
         """Apply V-cycles to random zero-boundary residuals and report ‖r−A V(r)‖/‖r‖.
         A healthy GMG reduces the residual by ~0.05–0.2 per cycle (mesh-independent)."""
-        if self.mg is None:
+        if not isinstance(self.precond, GeometricMultigrid):
             return
         nx, ny = self.grid_size
         N = nx * ny
@@ -202,16 +217,17 @@ class Trainer:
         torch.manual_seed(0)
         r0 = torch.randn(n_samples, N, device=self.device)
         r0 = apply_zero_boundary(r0, mask)
-        A_sp = self.mg._A_sparse(0).to(self.device)
+        A_sp = self.precond._A_sparse(0).to(self.device)
 
-        print(f"\n[MG sanity] n_levels={self.mg.n_levels}, "
-              f"pre/post={self.mg.pre_smooth}/{self.mg.post_smooth}, omega={self.mg.omega:.3f}")
-        print(f"[MG sanity] level dims: {self.mg.dims}")
+        print(f"\n[MG sanity] n_levels={self.precond.n_levels}, "
+              f"pre/post={self.precond.pre_smooth}/{self.precond.post_smooth}, "
+              f"omega={self.precond.omega:.3f}")
+        print(f"[MG sanity] level dims: {self.precond.dims}")
         r = r0.clone()
         e_total = torch.zeros_like(r)
         norms = [r.norm(dim=1).mean().item()]
         for _ in range(n_cycles):
-            e_total = e_total + self.mg.v_cycle(r)
+            e_total = e_total + self.precond.v_cycle(r)
             Ae = torch.sparse.mm(A_sp, e_total.T).T
             r = r0 - Ae
             norms.append(r.norm(dim=1).mean().item())
@@ -225,7 +241,8 @@ class Trainer:
         print(f"Training FNO with {self.loss_type} loss")
         print(f"  Train: {len(self.train_dataset)}  Val: {len(self.val_dataset)}  "
               f"Test: {len(self.test_dataset)}  Device: {self.device}\n")
-        if self.mg is not None:
+        if self.precond is not None:
+            self.precond.report()
             self._check_mg()
 
         with tqdm(range(self.epochs), desc="Training", unit="epoch", colour="green") as bar:
@@ -262,17 +279,46 @@ class Trainer:
         self.visualize_sample(self.train_dataset, "train", 0)
         self.visualize_sample(self.test_dataset, "test", 0)
         self.compute_error_distribution()
+        self._save_results_json((test_mse, test_l2, test_rl2))
         return test_mse, test_l2, test_rl2
 
+    def _save_results_json(self, test_metrics) -> None:
+        """Dump full stats + config to ``results/{prefix}.json`` for cross-run aggregation."""
+        import json
+        from dataclasses import asdict
+
+        test_mse, test_l2, test_rl2 = test_metrics
+        record = {
+            "prefix": self._file_prefix(),
+            "loss_type": self.loss_type,
+            "precond_kind": self.precond_kind,
+            "precond_strength": self.precond_strength,
+            "K": self.K,
+            "n_train": len(self.train_dataset),
+            "epochs": self.epochs,
+            "test_mse": test_mse, "test_l2": test_l2, "test_rl2": test_rl2,
+            "stats": asdict(self.stats),
+        }
+        path = f"{self.output_dir}/results/{self._file_prefix()}.json"
+        with open(path, "w") as fh:
+            json.dump(record, fh)
+        print(f"Results -> {path}")
+
     # -------------------- checkpointing --------------------
+    def _precond_tag(self) -> str:
+        """Short tag describing the active preconditioner (for run file names)."""
+        if self.precond_kind == "multigrid":
+            L, pre, post, _ = self.mg_settings
+            return f"mg-L{L}-s{pre}{post}"
+        return f"{self.precond_kind}-{self.precond_strength:.2f}"
+
     def _file_prefix(self) -> str:
         if self.loss_type == "deepritz":
-            tag = "_precond" if self.precondition else f"_bc-{self.bc_mode}"
+            tag = f"_precond-{self._precond_tag()}" if self.precondition else f"_bc-{self.bc_mode}"
         elif self.loss_type == "data":
             tag = "_bc-hard" if self.bc_mode == "hard" else ""
         elif self.loss_type == "pls":
-            L, pre, post, _ = self.mg_settings
-            tag = f"_mg-L{L}-s{pre}{post}"
+            tag = f"_{self._precond_tag()}"
         else:
             tag = ""
         return (f"fno_{self.loss_type}{tag}_K{self.K}_"

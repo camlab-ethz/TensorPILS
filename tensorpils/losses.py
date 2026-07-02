@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 
 from .physics import PoissonProblem, apply_zero_boundary
-from .multigrid import GeometricMultigrid
+from .preconditioners import Preconditioner
 
 __all__ = [
     "DataLoss", "GalerkinLoss", "DeepRitzLoss",
@@ -94,22 +94,23 @@ class DeepRitzLoss(nn.Module):
 class PreconditionedLSLoss(nn.Module):
     r"""Preconditioned least-squares loss :math:`L = \tfrac12\|P(Au-b)\|^2`.
 
-    ``P`` is one geometric-multigrid V-cycle (``P ≈ A⁻¹``). The squared-norm form has
-    c-space Hessian ``AᵀPᵀPA ≈ I`` (mesh-independent conditioning) and gradient
-    ``≈ J_θᵀ(u − u⋆)``, recovering supervised training dynamics without labels.
+    ``P`` is a preconditioner ``P ≈ A⁻¹`` (a multigrid V-cycle, or the exact spectral
+    blend/power operator). The squared-norm form has c-space Hessian ``AᵀPᵀPA ≈ I``
+    (mesh-independent conditioning) and gradient ``≈ J_θᵀ(u − u⋆)``, recovering supervised
+    training dynamics without labels.
     """
 
-    def __init__(self, problem: PoissonProblem, mg: GeometricMultigrid):
+    def __init__(self, problem: PoissonProblem, precond: Preconditioner):
         super().__init__()
         self.problem = problem
-        self.mg = mg
+        self.precond = precond
 
     def forward(self, u_pred_node: torch.Tensor, f_node: torch.Tensor,
                 u_true_node: torch.Tensor = None) -> torch.Tensor:
         r = self.problem.residual(u_pred_node, f_node)
         if r.dim() == 1:
             r = r.unsqueeze(0)
-        Pr = self.mg.v_cycle(r)                 # ≈ A⁻¹ r
+        Pr = self.precond(r)                    # ≈ A⁻¹ r
         return 0.5 * (Pr * Pr).mean()
 
 
@@ -122,10 +123,10 @@ class PreconditionedDeepRitzLoss(nn.Module):
     uses validation MSE, so this is harmless.
     """
 
-    def __init__(self, problem: PoissonProblem, mg: GeometricMultigrid):
+    def __init__(self, problem: PoissonProblem, precond: Preconditioner):
         super().__init__()
         self.problem = problem
-        self.mg = mg
+        self.precond = precond
 
     def forward(self, u_pred_node: torch.Tensor, f_node: torch.Tensor,
                 u_true_node: torch.Tensor = None) -> torch.Tensor:
@@ -134,13 +135,13 @@ class PreconditionedDeepRitzLoss(nn.Module):
         if r.dim() == 1:
             r = r.unsqueeze(0)
             u = u.unsqueeze(0)
-        Mr = self.mg.v_cycle(r).detach()        # preconditioned descent direction
+        Mr = self.precond(r).detach()           # preconditioned descent direction
         return (u * Mr).sum(dim=1).mean()       # surrogate: ∂/∂u = M r
 
 
 def build_loss(loss_type: str, problem: PoissonProblem,
                lambda_bc: float, bc_mode: str = "penalty",
-               mg: Optional[GeometricMultigrid] = None,
+               precond: Optional[Preconditioner] = None,
                precondition: bool = False):
     """Factory for the loss criterion. Add a branch here to register a new loss."""
     if loss_type == "data":
@@ -149,12 +150,12 @@ def build_loss(loss_type: str, problem: PoissonProblem,
         return GalerkinLoss(problem)
     if loss_type == "deepritz":
         if precondition:
-            if mg is None:
-                raise ValueError("preconditioned deepritz requires a GeometricMultigrid")
-            return PreconditionedDeepRitzLoss(problem, mg)
+            if precond is None:
+                raise ValueError("preconditioned deepritz requires a preconditioner")
+            return PreconditionedDeepRitzLoss(problem, precond)
         return DeepRitzLoss(problem, lambda_bc=lambda_bc, bc_mode=bc_mode)
     if loss_type == "pls":
-        if mg is None:
-            raise ValueError("loss_type='pls' requires a GeometricMultigrid")
-        return PreconditionedLSLoss(problem, mg)
+        if precond is None:
+            raise ValueError("loss_type='pls' requires a preconditioner")
+        return PreconditionedLSLoss(problem, precond)
     raise ValueError(f"Unknown loss type {loss_type!r}")

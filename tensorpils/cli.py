@@ -39,7 +39,18 @@ def build_parser() -> ArgumentParser:
                         "(M~A^-1). Flattens the A-norm dynamics toward the supervised/Newton "
                         "direction. Implies hard-BC.")
 
-    # Multigrid preconditioner (PLS, or preconditioned Deep Ritz)
+    # Preconditioner selection (PLS, or preconditioned Deep Ritz)
+    p.add_argument("--precond_kind", choices=["multigrid", "blend", "power"],
+                   default="multigrid",
+                   help="Preconditioner P≈A^-1. 'multigrid' (default): geometric-multigrid "
+                        "V-cycle (computational path). 'blend': convex mix (1-t)I+tA^-1. "
+                        "'power': fractional power A^-s. blend/power are exact spectral "
+                        "operators for illustrating the residual->supervised transition.")
+    p.add_argument("--precond_strength", type=float, default=1.0,
+                   help="Strength for blend (t) / power (s) in [0,1]. 0 -> P=I "
+                        "(no preconditioning); 1 -> P=A^-1 (supervised). Ignored for multigrid.")
+
+    # Multigrid preconditioner settings (used when --precond_kind multigrid)
     p.add_argument("--mg_levels", type=int, default=4,
                    help="Number of GMG levels for PLS (incl. finest).")
     p.add_argument("--mg_pre_smooth", type=int, default=2,
@@ -92,8 +103,11 @@ def main():
         print(f"bc_mode     : {args.bc_mode}"
               + ("  (interior-only MSE)" if args.bc_mode == "hard" else "  (full-grid MSE)"))
     if args.loss == "pls" or (args.loss == "deepritz" and args.precondition):
-        print(f"mg          : levels={args.mg_levels}  "
-              f"smooth={args.mg_pre_smooth}/{args.mg_post_smooth}  omega={args.mg_omega:.3f}")
+        if args.precond_kind == "multigrid":
+            print(f"precond     : multigrid  levels={args.mg_levels}  "
+                  f"smooth={args.mg_pre_smooth}/{args.mg_post_smooth}  omega={args.mg_omega:.3f}")
+        else:
+            print(f"precond     : {args.precond_kind}  strength={args.precond_strength:.3f}")
     print(f"K           : {args.k}")
     print(f"samples     : train={args.n_train}, val={args.n_val}, test={args.n_test}")
     print(f"epochs/bs   : {args.epochs} / {args.batch_size}")
@@ -132,6 +146,8 @@ def main():
         lambda_bc=args.lambda_bc,
         bc_mode=args.bc_mode,
         precondition=args.precondition,
+        precond_kind=args.precond_kind,
+        precond_strength=args.precond_strength,
         mg_levels=args.mg_levels,
         mg_pre_smooth=args.mg_pre_smooth,
         mg_post_smooth=args.mg_post_smooth,

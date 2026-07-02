@@ -13,7 +13,9 @@ training loop.
 from ._version import __version__
 from .meshing import structured_quad_mesh, node_to_grid, grid_to_node
 from .physics import PoissonProblem, apply_zero_boundary
-from .multigrid import GeometricMultigrid
+from .preconditioners import (
+    Preconditioner, GeometricMultigrid, SpectralPreconditioner, build_preconditioner,
+)
 from .data import PoissonDataset, create_datasets
 from .losses import build_loss
 from .optim import build_optimizer
@@ -30,7 +32,10 @@ __all__ = [
     "grid_to_node",
     "PoissonProblem",
     "apply_zero_boundary",
+    "Preconditioner",
     "GeometricMultigrid",
+    "SpectralPreconditioner",
+    "build_preconditioner",
     "PoissonDataset",
     "create_datasets",
     "build_loss",
