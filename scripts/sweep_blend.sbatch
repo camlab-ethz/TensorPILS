@@ -14,9 +14,10 @@
 #SBATCH --output=logs/sweep_%A_%a.out
 #SBATCH --array=0-6
 
-set -euo pipefail
-
+# Source the environment first (module/Lmod is not always `set -u`-safe), then
+# enable strict mode for the rest of the script.
 source ~/env_tensorpils.sh
+set -eo pipefail
 
 # --- sweep configuration -----------------------------------------------------
 STRENGTHS=(0.0 0.25 0.5 0.75 0.9 0.99 1.0)
