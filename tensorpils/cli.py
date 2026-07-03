@@ -9,7 +9,7 @@ from argparse import ArgumentParser
 import numpy as np
 import torch
 
-from .data import create_datasets
+from .data import create_datasets, PoissonDataset
 from .models import FNOModel
 from .trainer import Trainer
 
@@ -63,6 +63,15 @@ def build_parser() -> ArgumentParser:
     # Optimizer (the place to plug in Shampoo via build_optimizer)
     p.add_argument("--optimizer", type=str, default="adam",
                    help="adam | adamw | sgd | <register-yours-in build_optimizer>")
+
+    # Out-of-distribution generalization eval: score relative-L2 each epoch on datasets
+    # with different source complexity K (same grid). E.g. --ood_k 6 8.
+    p.add_argument("--ood_k", type=int, nargs="+", default=[],
+                   help="Extra K values to evaluate each epoch (out-of-distribution sources).")
+    p.add_argument("--ood_n_val", type=int, default=128,
+                   help="Number of samples per OOD eval dataset.")
+    p.add_argument("--ood_seed", type=int, default=123,
+                   help="Seed for the OOD eval datasets (fixed across runs for fair comparison).")
 
     # FNO model
     p.add_argument("--hidden_dim", type=int, default=64)
@@ -126,6 +135,16 @@ def main():
     print(f"  train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}, "
           f"grid={train_ds.grid_size}\n")
 
+    # Out-of-distribution eval datasets (higher source complexity K, same grid).
+    eval_datasets = {
+        f"K{k}": PoissonDataset(num_samples=args.ood_n_val, K=k, seed=args.ood_seed,
+                                grid_resolution=args.grid_resolution)
+        for k in args.ood_k
+    }
+    if eval_datasets:
+        print(f"  OOD eval sets: {', '.join(eval_datasets)} "
+              f"(n={args.ood_n_val} each, seed={args.ood_seed})\n")
+
     print("Building model...")
     model = FNOModel(
         n_modes=tuple(args.n_modes),
@@ -152,6 +171,7 @@ def main():
         mg_pre_smooth=args.mg_pre_smooth,
         mg_post_smooth=args.mg_post_smooth,
         mg_omega=args.mg_omega,
+        eval_datasets=eval_datasets,
     )
 
     if args.eval_only:

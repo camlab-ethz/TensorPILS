@@ -27,6 +27,8 @@ class TrainingStats:
     val_l2_errors: List[float] = field(default_factory=list)
     val_rel_l2_errors: List[float] = field(default_factory=list)
     learning_rates: List[float] = field(default_factory=list)
+    # Per-epoch relative-L2 on extra (out-of-distribution) eval sets, keyed by label.
+    ood_rel_l2: dict = field(default_factory=dict)
     best_epoch: int = 0
     best_val_error: float = float("inf")
     # Preconditioner identity + conditioning (for the sweep / collapse plot).
@@ -61,6 +63,7 @@ class Trainer:
         mg_pre_smooth: int = 2,
         mg_post_smooth: int = 2,
         mg_omega: float = 2.0 / 3.0,
+        eval_datasets: Optional[dict] = None,
     ):
         self.model = model.to(device)
         self.train_dataset = train_dataset
@@ -82,6 +85,14 @@ class Trainer:
                                      shuffle=False, collate_fn=self._collate)
         self.test_loader = DataLoader(test_dataset, batch_size=batch_size,
                                       shuffle=False, collate_fn=self._collate)
+
+        # Extra (out-of-distribution) eval loaders, scored each epoch. Same grid as the
+        # training set, so self.problem.M is the correct metric for their relative-L2.
+        self.eval_loaders = {
+            label: DataLoader(ds, batch_size=batch_size, shuffle=False,
+                              collate_fn=self._collate)
+            for label, ds in (eval_datasets or {}).items()
+        }
 
         self.bc_mode = bc_mode
         self.precondition = precondition
@@ -118,6 +129,7 @@ class Trainer:
         )
 
         self.stats = TrainingStats()
+        self.stats.ood_rel_l2 = {label: [] for label in self.eval_loaders}
         if self.precond is not None:
             self.stats.precond_kind = self.precond_kind
             self.stats.precond_strength = self.precond_strength
@@ -257,6 +269,10 @@ class Trainer:
                 self.stats.val_l2_errors.append(l2)
                 self.stats.val_rel_l2_errors.append(rl2)
                 self.stats.learning_rates.append(lr)
+
+                # Out-of-distribution generalization: relative-L2 on each extra eval set.
+                for label, loader in self.eval_loaders.items():
+                    self.stats.ood_rel_l2[label].append(self._eval_loader(loader)[2])
 
                 if vl < self.stats.best_val_error:
                     self.stats.best_val_error = vl
