@@ -1,18 +1,18 @@
-"""FEM Poisson operator built on TensorMesh's assembled matrices.
+"""FEM operators built on TensorMesh's assembled matrices.
 
-:class:`PoissonProblem` replaces the standalone script's hand-rolled
-``PoissonEquation``. It assembles the stiffness ``A`` and mass ``M`` matrices once
-from a structured :class:`tensormesh.Mesh` (via TensorMesh's
-``LaplaceElementAssembler`` / ``MassElementAssembler``) and exposes a batched,
-autograd-differentiable interface used by the physics-informed losses:
+Two PDE operators live here, both assembled once from a structured
+:class:`tensormesh.Mesh` and both exposing a batched, autograd-differentiable
+interface used by the physics-informed losses:
 
-* :meth:`load_vector`  — consistent load ``b = M f``
-* :meth:`residual`     — boundary-masked Galerkin residual ``A u − b``
-* :meth:`energy`       — Deep Ritz energy ``½ uᵀA u − uᵀ(M f)``
+* :class:`PoissonProblem` — static :math:`-\\Delta u = f`
+* :class:`WaveProblem`    — time-dependent :math:`u_{tt} = c^2 \\Delta u`
+* :class:`ACProblem`      — time-dependent Allen–Cahn :math:`u_t = a^2 \\Delta u + \\epsilon^2 u(1-u^2)`
 
-All public methods take/return node fields in ``[batch, n_nodes]`` (or ``[n_nodes]``)
-convention; the ``[n_nodes, batch]`` transpose required by sparse mat–vec products is
-confined to this module.
+They share :class:`FEMOperator`, which assembles the stiffness ``A`` and mass ``M``
+matrices (via TensorMesh's ``LaplaceElementAssembler`` / ``MassElementAssembler``),
+holds the Dirichlet ``boundary_mask``, and confines the ``[n_nodes, batch]`` transpose
+required by sparse mat–vec products. All public methods take/return node fields in
+``[batch, n_nodes]`` (or ``[n_nodes]``) convention.
 """
 
 import torch
@@ -20,7 +20,7 @@ import torch.nn as nn
 
 from tensormesh import LaplaceElementAssembler, MassElementAssembler
 
-__all__ = ["PoissonProblem", "apply_zero_boundary"]
+__all__ = ["FEMOperator", "PoissonProblem", "WaveProblem", "ACProblem", "apply_zero_boundary"]
 
 
 def apply_zero_boundary(u: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -33,8 +33,8 @@ def apply_zero_boundary(u: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return out
 
 
-class PoissonProblem(nn.Module):
-    r"""Discrete FEM operator for :math:`-\Delta u = f` with zero Dirichlet BC.
+class FEMOperator(nn.Module):
+    r"""Shared FEM machinery: assembled stiffness ``A`` and mass ``M`` + Dirichlet mask.
 
     Parameters
     ----------
@@ -46,10 +46,8 @@ class PoissonProblem(nn.Module):
 
     Notes
     -----
-    The energy uses the matrix identity
-    :math:`E(u) = \tfrac12 u^\top A u - u^\top (M f)`, which is exactly the FE energy
-    :math:`\int(\tfrac12|\nabla u_h|^2 - f_h u_h)` and whose gradient w.r.t. ``u`` is the
-    residual :math:`A u - M f` — the property the Deep Ritz / preconditioned losses rely on.
+    ``A`` and ``M`` are plain attributes (TensorMesh ``SparseMatrix``, not registered
+    buffers), so :meth:`to` is overridden to move them alongside the module.
     """
 
     def __init__(self, mesh, quadrature_order: int = 4):
@@ -76,10 +74,21 @@ class PoissonProblem(nn.Module):
             return mat @ x                 # [N]
         return (mat @ x.T).T               # [B, N]
 
-    # ---------------------------------------------------------------- load vector
     def load_vector(self, f: torch.Tensor) -> torch.Tensor:
         r"""Consistent load :math:`b = M f`. ``f``: ``[N]`` or ``[B, N]``; returns same shape."""
         return self._spmm(self.M, f)
+
+
+class PoissonProblem(FEMOperator):
+    r"""Discrete FEM operator for :math:`-\Delta u = f` with zero Dirichlet BC.
+
+    Notes
+    -----
+    The energy uses the matrix identity
+    :math:`E(u) = \tfrac12 u^\top A u - u^\top (M f)`, which is exactly the FE energy
+    :math:`\int(\tfrac12|\nabla u_h|^2 - f_h u_h)` and whose gradient w.r.t. ``u`` is the
+    residual :math:`A u - M f` — the property the Deep Ritz / preconditioned losses rely on.
+    """
 
     # ------------------------------------------------------------------ residual
     def residual(self, u: torch.Tensor, f: torch.Tensor) -> torch.Tensor:
@@ -110,3 +119,170 @@ class PoissonProblem(nn.Module):
         if reduce == "sum":
             return e.sum()
         return e
+
+
+class WaveProblem(FEMOperator):
+    r"""Discrete FEM operator for the wave equation :math:`u_{tt} = c^2 \Delta u`
+    with zero Dirichlet BC, in central-difference (explicit) time.
+
+    The semi-discrete form is :math:`M\ddot u + c^2 A u = 0`; replacing
+    :math:`\ddot u` by the second-order central difference gives the nodal residual
+
+    .. math::
+        R = M\,\frac{u^{n+1} - 2u^n + u^{n-1}}{\Delta t^2} + c^2 A\,u^n,
+
+    which the label-free Galerkin loss drives to zero. This mirrors the update
+    :math:`M u^{n+1} = 2M u^n - M u^{n-1} - \Delta t^2 c^2 A u^n` of TensorMesh's
+    ``examples/wave/wave.py``. ``A`` (stiffness) and ``M`` (mass) are the same
+    matrices :class:`PoissonProblem` assembles.
+    """
+
+    # ------------------------------------------------------------------ residual
+    def residual(self, u_prev: torch.Tensor, u_curr: torch.Tensor,
+                 u_next: torch.Tensor, c: float, dt: float) -> torch.Tensor:
+        r"""Boundary-masked central-difference wave residual.
+
+        ``u_prev``/``u_curr``/``u_next`` are :math:`u^{n-1}, u^n, u^{n+1}` in ``[N]`` or
+        ``[B, N]``. Each is projected to zero on the Dirichlet boundary before use and
+        the returned residual is also zeroed there. Fully differentiable in the inputs.
+        """
+        mask = self.boundary_mask
+        up = apply_zero_boundary(u_prev, mask)
+        uc = apply_zero_boundary(u_curr, mask)
+        un = apply_zero_boundary(u_next, mask)
+        accel = (un - 2.0 * uc + up) / (dt * dt)
+        r = self._spmm(self.M, accel) + (c * c) * self._spmm(self.A, uc)
+        return apply_zero_boundary(r, mask)
+
+    # -------------------------------------------------------------------- energy
+    def energy(self, u: torch.Tensor, v: torch.Tensor, c: float,
+               reduce: str = "mean") -> torch.Tensor:
+        r"""Mechanical energy :math:`E = \tfrac12 v^\top M v + \tfrac12 c^2 u^\top A u`
+        (kinetic + potential). ``u``, ``v``: ``[N]`` or ``[B, N]``. Diagnostic only."""
+        Mv = self._spmm(self.M, v)
+        Au = self._spmm(self.A, u)
+        if u.dim() == 1:
+            return 0.5 * (v * Mv).sum() + 0.5 * (c * c) * (u * Au).sum()
+        e = 0.5 * (v * Mv).sum(dim=-1) + 0.5 * (c * c) * (u * Au).sum(dim=-1)   # [B]
+        if reduce == "mean":
+            return e.mean()
+        if reduce == "sum":
+            return e.sum()
+        return e
+
+
+class ACProblem(FEMOperator):
+    r"""Discrete FEM operator for the Allen–Cahn equation
+
+    .. math::
+        \partial_t u = a^2 \Delta u + \epsilon^2 u(1-u^2)
+
+    on the unit square with zero Dirichlet BC, in fully-implicit backward Euler time.
+    ``a`` is the diffusion coefficient and ``\epsilon`` the reaction strength (following
+    TensorGalerkin's ``Trainer/ac.py`` and TensorMesh's ``examples/diffusion/allen-cahn``:
+    the large factor multiplies the double-well term, not the Laplacian).
+
+    Backward Euler with the reaction evaluated at the new level gives the weak-form nodal
+    residual (group / product FEM, consistent mass ``M`` and stiffness ``A``):
+
+    .. math::
+        R = M\,\frac{u^{n+1} - u^n}{\Delta t} + a^2 A\,u^{n+1}
+            - \epsilon^2 M\,\big(u^{n+1} - (u^{n+1})^3\big),
+
+    which the label-free Galerkin loss drives to zero. The FEM reference trajectory
+    (:meth:`fem_reference`) solves ``R = 0`` per step by Newton, so it exactly zeroes this
+    residual — the discrete target the physics loss is trained toward. ``A``/``M`` are the
+    same matrices :class:`PoissonProblem` / :class:`WaveProblem` assemble.
+    """
+
+    # ------------------------------------------------------------------ residual
+    def residual(self, u_curr: torch.Tensor, u_next: torch.Tensor,
+                 a: float, eps: float, dt: float) -> torch.Tensor:
+        r"""Boundary-masked fully-implicit backward-Euler Allen–Cahn residual.
+
+        ``u_curr``/``u_next`` are :math:`u^n, u^{n+1}` in ``[N]`` or ``[B, N]``. Both are
+        projected to zero on the Dirichlet boundary before use and the returned residual is
+        also zeroed there. Fully differentiable in the inputs."""
+        mask = self.boundary_mask
+        uc = apply_zero_boundary(u_curr, mask)
+        un = apply_zero_boundary(u_next, mask)
+        reaction = (eps * eps) * (un - un ** 3)                    # ε² u(1-u²) at new level
+        r = self._spmm(self.M, (un - uc) / dt) \
+            + (a * a) * self._spmm(self.A, un) \
+            - self._spmm(self.M, reaction)
+        return apply_zero_boundary(r, mask)
+
+    # -------------------------------------------------------------------- energy
+    def energy(self, u: torch.Tensor, a: float, eps: float,
+               reduce: str = "mean") -> torch.Tensor:
+        r"""Ginzburg–Landau energy :math:`E = \tfrac12 a^2 u^\top A u + \epsilon^2 \tfrac14 u^\top M (u^2-1)^2`
+        (gradient + double-well). ``u``: ``[N]`` or ``[B, N]``. Diagnostic only; Allen–Cahn is
+        the ``L^2`` gradient flow of this energy, so it is non-increasing in time."""
+        Au = self._spmm(self.A, u)
+        well = 0.25 * (u * u - 1.0) ** 2                           # W(u)=¼(u²-1)²
+        Mw = self._spmm(self.M, well)
+        if u.dim() == 1:
+            return 0.5 * (a * a) * (u * Au).sum() + (eps * eps) * Mw.sum()
+        e = 0.5 * (a * a) * (u * Au).sum(dim=-1) + (eps * eps) * Mw.sum(dim=-1)   # [B]
+        if reduce == "mean":
+            return e.mean()
+        if reduce == "sum":
+            return e.sum()
+        return e
+
+    # ---------------------------------------------------------- FEM reference solve
+    @torch.no_grad()
+    def fem_reference(self, u0: torch.Tensor, a: float, eps: float, dt: float,
+                      n_steps: int, newton_tol: float = 1e-8, newton_max: int = 20,
+                      chunk: int = 64) -> torch.Tensor:
+        r"""Batched implicit-Euler + Newton reference trajectory (build-time ground truth).
+
+        Solves ``R(u^{n+1}; u^n) = 0`` (the :meth:`residual` above) each step by Newton on the
+        interior DOFs (Dirichlet nodes held at 0). Uses dense linear algebra on the interior
+        block — appropriate for structured grids up to a few thousand nodes; process ``chunk``
+        samples at a time to bound memory. ``u0``: ``[N]`` or ``[B, N]``. Returns the trajectory
+        ``[B, n_steps+1, N]`` (or ``[n_steps+1, N]`` for a single sample).
+
+        The Jacobian is :math:`J = M/\Delta t + a^2 A - \epsilon^2 M\,\mathrm{diag}(1-3u^2)`;
+        the constant part ``L = M/\Delta t + a^2 A`` is formed once and the reaction Jacobian
+        is a per-iterate column scaling of ``M``."""
+        single = (u0.dim() == 1)
+        if single:
+            u0 = u0.unsqueeze(0)
+        device, dtype = u0.device, u0.dtype
+        mask = self.boundary_mask.to(device)
+        inner = ~mask
+        idx = torch.nonzero(inner, as_tuple=False).squeeze(1)
+
+        # Dense operators on the interior block (assembled once).
+        M = self.M.to_dense().to(device=device, dtype=dtype)
+        A = self.A.to_dense().to(device=device, dtype=dtype)
+        M_ii = M[idx][:, idx]                                      # [Ni, Ni]
+        A_ii = A[idx][:, idx]                                      # [Ni, Ni]
+        L_ii = M_ii / dt + (a * a) * A_ii                          # constant Newton LHS part
+
+        B = u0.shape[0]
+        traj = torch.zeros(B, n_steps + 1, self.n_nodes, device=device, dtype=dtype)
+        traj[:, 0] = apply_zero_boundary(u0, mask)
+
+        for lo in range(0, B, chunk):
+            hi = min(lo + chunk, B)
+            u_old = traj[lo:hi, 0, idx].clone()                   # [b, Ni]
+            for step in range(1, n_steps + 1):
+                u = u_old.clone()                                 # Newton initial guess
+                for _ in range(newton_max):
+                    # residual on interior: M(u-u_old)/dt + a²A u - ε²M(u-u³)
+                    reac = (eps * eps) * (u - u ** 3)             # [b, Ni]
+                    r = (M_ii @ ((u - u_old) / dt).T).T \
+                        + (a * a) * (A_ii @ u.T).T \
+                        - (M_ii @ reac.T).T                       # [b, Ni]
+                    if r.norm(dim=1).max() < newton_tol:
+                        break
+                    # J = L_ii - ε² M_ii diag(1-3u²)  (column-scale M_ii per sample)
+                    d = 1.0 - 3.0 * u * u                          # [b, Ni]
+                    J = L_ii.unsqueeze(0) - (eps * eps) * (M_ii.unsqueeze(0) * d.unsqueeze(1))
+                    du = torch.linalg.solve(J, -r.unsqueeze(-1)).squeeze(-1)   # [b, Ni]
+                    u = u + du
+                traj[lo:hi, step, idx] = u
+                u_old = u
+        return traj[0] if single else traj

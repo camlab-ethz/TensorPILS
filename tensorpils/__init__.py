@@ -12,12 +12,15 @@ training loop.
 
 from ._version import __version__
 from .meshing import structured_quad_mesh, node_to_grid, grid_to_node
-from .physics import PoissonProblem, apply_zero_boundary
+from .physics import (FEMOperator, PoissonProblem, WaveProblem, ACProblem,
+                      apply_zero_boundary)
 from .multigrid import GeometricMultigrid
-from .data import PoissonDataset, create_datasets
-from .losses import build_loss
+from .data import (PoissonDataset, create_datasets, WaveDataset, create_wave_datasets,
+                   ACDataset, create_ac_datasets)
+from .losses import build_loss, build_wave_loss, build_ac_loss
 from .optim import build_optimizer
-from .trainer import Trainer, TrainingStats
+from .trainer import (Trainer, PoissonTrainer, RolloutTrainer, WaveTrainer, ACTrainer,
+                      BaseTrainer, TrainingStats)
 
 # ``FNOModel`` lives in ``tensorpils.models`` and pulls in ``neuralop`` on
 # import; import it explicitly (``from tensorpils.models import FNOModel``)
@@ -28,13 +31,27 @@ __all__ = [
     "structured_quad_mesh",
     "node_to_grid",
     "grid_to_node",
+    "FEMOperator",
     "PoissonProblem",
+    "WaveProblem",
+    "ACProblem",
     "apply_zero_boundary",
     "GeometricMultigrid",
     "PoissonDataset",
     "create_datasets",
+    "WaveDataset",
+    "create_wave_datasets",
+    "ACDataset",
+    "create_ac_datasets",
     "build_loss",
+    "build_wave_loss",
+    "build_ac_loss",
     "build_optimizer",
     "Trainer",
+    "PoissonTrainer",
+    "RolloutTrainer",
+    "WaveTrainer",
+    "ACTrainer",
+    "BaseTrainer",
     "TrainingStats",
 ]

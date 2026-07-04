@@ -10,7 +10,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-__all__ = ["plot_loss_curve", "visualize_sample", "compute_error_distribution"]
+__all__ = ["plot_loss_curve", "visualize_sample", "compute_error_distribution",
+           "visualize_rollout_sample", "compute_rollout_error_distribution"]
 
 
 def plot_loss_curve(stats, loss_type: str, K: int, save_path: str):
@@ -110,6 +111,94 @@ def compute_error_distribution(model, test_dataset, device, apply_eval_bc,
     print(f"  median: {median:.4f}%")
     print(f"  mean  : {mean:.4f}%   std: {std:.4f}%")
     print(f"  min   : {errs.min():.4f}%   max: {errs.max():.4f}%")
+    print(f"  saved -> {save_path}")
+    print("=" * 50 + "\n")
+    return median, errs
+
+
+# ==================== autoregressive rollout visualization (wave / AC) ====================
+
+@torch.no_grad()
+def _rollout_grid(model, traj_grid, device, project_bc, rollout_steps, n_seed_frames):
+    """Seed with the first ``n_seed_frames`` frames of a single trajectory ``[T+1, H, W]`` and
+    roll forward. Returns ``(preds [R, H, W], refs [R, H, W])`` on ``device`` (zero-BC projected)."""
+    traj_grid = traj_grid.to(device)
+    window = [project_bc(traj_grid[i]) for i in range(n_seed_frames)]     # each [H, W]
+    preds = []
+    for _ in range(rollout_steps):
+        inp = torch.stack(window, dim=0).unsqueeze(0)         # [1, ns, H, W]
+        nxt = project_bc(model(inp).squeeze(0).squeeze(0))    # [H, W]
+        preds.append(nxt)
+        window = window[1:] + [nxt]
+    preds = torch.stack(preds, dim=0)                         # [R, H, W]
+    refs = traj_grid[n_seed_frames:n_seed_frames + rollout_steps]         # [R, H, W]
+    return preds, refs
+
+
+@torch.no_grad()
+def visualize_rollout_sample(model, dataset, split: str, sample_idx: int,
+                             device, project_bc, rollout_steps: int, n_seed_frames: int,
+                             loss_type: str, K: int, save_path: str):
+    """Snapshot panels (reference / prediction / |error|) at a few rollout times."""
+    model.eval()
+    traj_grid, _ = dataset[sample_idx]
+    preds, refs = _rollout_grid(model, traj_grid, device, project_bc, rollout_steps, n_seed_frames)
+    preds, refs = preds.cpu().numpy(), refs.cpu().numpy()
+
+    R = preds.shape[0]
+    snaps = sorted(set([0, R // 2, R - 1]))                   # up to 3 distinct frames
+    fig, ax = plt.subplots(len(snaps), 3, figsize=(11, 3.4 * len(snaps)), squeeze=False)
+    for row, k in enumerate(snaps):
+        ref, pred = refs[k], preds[k]
+        vmin, vmax = float(min(ref.min(), pred.min())), float(max(ref.max(), pred.max()))
+        err = np.abs(pred - ref)
+        rel_l2 = np.sqrt((err ** 2).sum() / max((ref ** 2).sum(), 1e-30)) * 100.0
+        ax[row, 0].imshow(ref, cmap="RdBu_r", origin="lower", vmin=vmin, vmax=vmax)
+        ax[row, 0].set_ylabel(f"step {k + n_seed_frames}")
+        ax[row, 0].set_title("Reference $u$" if row == 0 else "")
+        ax[row, 1].imshow(pred, cmap="RdBu_r", origin="lower", vmin=vmin, vmax=vmax)
+        ax[row, 1].set_title(f"Predicted $u$ ({loss_type})" if row == 0 else "")
+        ax[row, 2].imshow(err, cmap="hot", origin="lower")
+        ax[row, 2].set_title("|err|" if row == 0 else "")
+        ax[row, 2].text(0.98, 0.04, f"relL2={rel_l2:.2f}%", color="w",
+                        ha="right", va="bottom", transform=ax[row, 2].transAxes, fontsize=9)
+        for c in range(3):
+            ax[row, c].set_xticks([]); ax[row, c].set_yticks([])
+    plt.suptitle(f"FNO {split} sample #{sample_idx}  (K={K}, rollout={R})")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200, bbox_inches="tight"); plt.close()
+    print(f"Visualization -> {save_path}")
+
+
+@torch.no_grad()
+def compute_rollout_error_distribution(model, test_dataset, device, project_bc,
+                                       rollout_steps: int, n_seed_frames: int,
+                                       loss_type: str, K: int, save_path: str):
+    """Histogram of per-sample rollout relative L2 error (over the whole window) on the test set."""
+    model.eval()
+    errs = []
+    for i in range(len(test_dataset)):
+        traj_grid, _ = test_dataset[i]
+        preds, refs = _rollout_grid(model, traj_grid, device, project_bc, rollout_steps, n_seed_frames)
+        rel = torch.sqrt(((preds - refs) ** 2).sum() / (refs ** 2).sum().clamp_min(1e-30))
+        errs.append(rel.item() * 100.0)
+    errs = np.array(errs)
+    median, mean, std = np.median(errs), np.mean(errs), np.std(errs)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.hist(errs, bins=30, color="#9b59b6", edgecolor="white", alpha=0.85)
+    ax.axvline(median, color="#e74c3c", linestyle="--", linewidth=2, label=f"median {median:.2f}%")
+    ax.axvline(mean, color="#2ecc71", linestyle="-.", linewidth=2, label=f"mean {mean:.2f}%")
+    ax.set_xlabel("Rollout relative $L^2$ error (%)"); ax.set_ylabel("Count")
+    ax.set_title(f"FNO ({loss_type}) test rollout error (K={K}, steps={rollout_steps})")
+    ax.legend(); ax.grid(alpha=0.3)
+    plt.tight_layout(); plt.savefig(save_path, dpi=200, bbox_inches="tight"); plt.close()
+
+    print("\n" + "=" * 50)
+    print("Test set rollout error distribution")
+    print(f"  n     : {len(errs)}")
+    print(f"  median: {median:.4f}%")
+    print(f"  mean  : {mean:.4f}%   std: {std:.4f}%")
     print(f"  saved -> {save_path}")
     print("=" * 50 + "\n")
     return median, errs

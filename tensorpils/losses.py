@@ -17,12 +17,14 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from .physics import PoissonProblem, apply_zero_boundary
+from .physics import PoissonProblem, WaveProblem, ACProblem, apply_zero_boundary
 from .multigrid import GeometricMultigrid
 
 __all__ = [
     "DataLoss", "GalerkinLoss", "DeepRitzLoss",
     "PreconditionedLSLoss", "PreconditionedDeepRitzLoss", "build_loss",
+    "WaveGalerkinLoss", "build_wave_loss",
+    "ACGalerkinLoss", "build_ac_loss",
 ]
 
 
@@ -142,7 +144,7 @@ def build_loss(loss_type: str, problem: PoissonProblem,
                lambda_bc: float, bc_mode: str = "penalty",
                mg: Optional[GeometricMultigrid] = None,
                precondition: bool = False):
-    """Factory for the loss criterion. Add a branch here to register a new loss."""
+    """Factory for the Poisson loss criterion. Add a branch here to register a new loss."""
     if loss_type == "data":
         return DataLoss(bc_mode=bc_mode)
     if loss_type == "galerkin":
@@ -158,3 +160,83 @@ def build_loss(loss_type: str, problem: PoissonProblem,
             raise ValueError("loss_type='pls' requires a GeometricMultigrid")
         return PreconditionedLSLoss(problem, mg)
     raise ValueError(f"Unknown loss type {loss_type!r}")
+
+
+# ============================ wave equation losses ============================
+
+class WaveGalerkinLoss(nn.Module):
+    r"""Central-difference weak-form residual loss for the wave equation (no labels).
+
+    Given a node-space trajectory ``seq`` of shape ``[B, L, N]`` — the two ground-truth
+    seed frames followed by the model's autoregressive predictions — this sums the squared
+    boundary-masked residual over every consecutive triple
+    :math:`(u^{k-1}, u^k, u^{k+1})`, weighted by ``discount**(k-1)`` so later (more error-prone)
+    rollout steps can be down-weighted. See :meth:`WaveProblem.residual`.
+    """
+
+    def __init__(self, problem: WaveProblem, c: float, dt: float, discount: float = 1.0):
+        super().__init__()
+        self.problem = problem
+        self.c = c
+        self.dt = dt
+        self.discount = discount
+
+    def forward(self, seq_node: torch.Tensor) -> torch.Tensor:
+        L = seq_node.shape[1]
+        if L < 3:
+            raise ValueError(f"wave residual needs at least 3 frames, got L={L}")
+        total = seq_node.new_zeros(())
+        wsum = 0.0
+        for k in range(1, L - 1):
+            r = self.problem.residual(seq_node[:, k - 1], seq_node[:, k],
+                                      seq_node[:, k + 1], self.c, self.dt)
+            w = self.discount ** (k - 1)
+            total = total + w * (r ** 2).mean()
+            wsum += w
+        return total / wsum
+
+
+def build_wave_loss(problem: WaveProblem, c: float, dt: float, discount: float = 1.0):
+    """Factory for the wave physics (Galerkin) criterion. The supervised data term is a
+    plain trajectory MSE handled by the trainer; only the residual loss is assembled here."""
+    return WaveGalerkinLoss(problem, c=c, dt=dt, discount=discount)
+
+
+# ============================ Allen–Cahn losses ============================
+
+class ACGalerkinLoss(nn.Module):
+    r"""Backward-Euler weak-form residual loss for Allen–Cahn (no labels).
+
+    Given a node-space trajectory ``seq`` of shape ``[B, L, N]`` — the ground-truth seed frame
+    followed by the model's autoregressive predictions — this sums the squared boundary-masked
+    residual over every consecutive pair :math:`(u^k, u^{k+1})`, weighted by ``discount**k`` so
+    later (more error-prone) rollout steps can be down-weighted. See :meth:`ACProblem.residual`.
+    """
+
+    def __init__(self, problem: ACProblem, a: float, eps: float, dt: float, discount: float = 1.0):
+        super().__init__()
+        self.problem = problem
+        self.a = a
+        self.eps = eps
+        self.dt = dt
+        self.discount = discount
+
+    def forward(self, seq_node: torch.Tensor) -> torch.Tensor:
+        L = seq_node.shape[1]
+        if L < 2:
+            raise ValueError(f"AC residual needs at least 2 frames, got L={L}")
+        total = seq_node.new_zeros(())
+        wsum = 0.0
+        for k in range(L - 1):
+            r = self.problem.residual(seq_node[:, k], seq_node[:, k + 1],
+                                      self.a, self.eps, self.dt)
+            w = self.discount ** k
+            total = total + w * (r ** 2).mean()
+            wsum += w
+        return total / wsum
+
+
+def build_ac_loss(problem: ACProblem, a: float, eps: float, dt: float, discount: float = 1.0):
+    """Factory for the Allen–Cahn physics (Galerkin) criterion. The supervised data term is a
+    plain trajectory MSE handled by the trainer; only the residual loss is assembled here."""
+    return ACGalerkinLoss(problem, a=a, eps=eps, dt=dt, discount=discount)

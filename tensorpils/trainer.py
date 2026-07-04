@@ -1,4 +1,15 @@
-"""Training loop, evaluation, checkpointing, and plotting orchestration."""
+"""Training loops, evaluation, checkpointing, and plotting orchestration.
+
+``BaseTrainer`` holds the machinery shared by every PDE: optimizer/scheduler,
+the epoch loop, best-model tracking, checkpointing (keyed by ``_file_prefix``),
+and the boundary projection / loss-curve helpers. Two subclasses specialize it:
+
+* :class:`PoissonTrainer` — static Poisson, one of four losses (grid-space MSE eval).
+* :class:`WaveTrainer`    — autoregressive wave time-stepper (trajectory-MSE eval).
+
+Evaluation is **always** grid-space MSE against the analytical solution, regardless of
+the training loss, so model selection and the reported error stay comparable.
+"""
 
 import os
 from copy import deepcopy
@@ -13,11 +24,12 @@ from tqdm import tqdm
 from .meshing import node_to_grid, grid_to_node
 from .physics import apply_zero_boundary
 from .multigrid import GeometricMultigrid
-from .losses import build_loss
+from .losses import build_loss, build_wave_loss, build_ac_loss
 from .optim import build_optimizer
 from . import viz
 
-__all__ = ["Trainer", "TrainingStats"]
+__all__ = ["BaseTrainer", "Trainer", "PoissonTrainer", "RolloutTrainer",
+           "WaveTrainer", "ACTrainer", "TrainingStats"]
 
 
 @dataclass
@@ -29,7 +41,144 @@ class TrainingStats:
     best_val_error: float = float("inf")
 
 
-class Trainer:
+class BaseTrainer:
+    """Shared training scaffolding. Subclasses build their datasets/loaders/criterion,
+    then implement ``train_epoch``, ``validate``/``test``, ``_file_prefix`` and the
+    end-of-training visualization hook ``_after_train_viz``."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        loss_type: str,
+        K: int,
+        optimizer_name: str = "adam",
+        lr: float = 1e-3,
+        lr_min: float = 1e-6,
+        weight_decay: float = 0.0,
+        epochs: int = 500,
+        device: str = "cuda",
+        output_dir: str = "output",
+    ):
+        self.model = model.to(device)
+        self.device = device
+        self.epochs = epochs
+        self.output_dir = output_dir
+        self.loss_type = loss_type
+        self.K = K
+
+        self.optimizer = build_optimizer(optimizer_name, model.parameters(),
+                                         lr=lr, weight_decay=weight_decay)
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=epochs, eta_min=lr_min,
+        )
+
+        self.stats = TrainingStats()
+        self.best_state = None
+
+        # Subclasses set these before train() (problem carries A/M + boundary_mask).
+        self.problem = None
+        self.grid_size = None
+        self.eval_project_bc = False
+
+        for sub in ("checkpoints", "curves", "visualization", "error"):
+            os.makedirs(f"{output_dir}/{sub}", exist_ok=True)
+
+    # -------------------- boundary projection --------------------
+    def _project_zero_bc(self, u_grid: torch.Tensor) -> torch.Tensor:
+        """Project a grid field onto the zero Dirichlet boundary. ``[H, W]`` or ``[..., H, W]``."""
+        mask = self.problem.boundary_mask.to(u_grid.device)
+        nx, ny = self.grid_size
+        node = grid_to_node(u_grid, nx, ny)
+        node = apply_zero_boundary(node, mask)
+        return node_to_grid(node, nx, ny)
+
+    def _apply_eval_bc(self, u_grid: torch.Tensor) -> torch.Tensor:
+        """Project the prediction onto the zero Dirichlet BC at eval time when the boundary
+        was unconstrained during training; otherwise pass through."""
+        if not self.eval_project_bc:
+            return u_grid
+        return self._project_zero_bc(u_grid)
+
+    # -------------------- training loop --------------------
+    def _before_train(self):
+        """Hook run once before the epoch loop (e.g. multigrid sanity check)."""
+
+    def _after_train_viz(self):
+        """Hook run after training to write sample panels / error distribution."""
+
+    def train(self) -> float:
+        print(f"Training FNO with {self.loss_type} loss  (device: {self.device})\n")
+        self._before_train()
+
+        with tqdm(range(self.epochs), desc="Training", unit="epoch", colour="green") as bar:
+            for epoch in bar:
+                tr = self.train_epoch()
+                vl = self.validate()
+                self.scheduler.step()
+                lr = self.scheduler.get_last_lr()[0]
+
+                self.stats.train_losses.append(tr)
+                self.stats.val_errors.append(vl)
+                self.stats.learning_rates.append(lr)
+
+                if vl < self.stats.best_val_error:
+                    self.stats.best_val_error = vl
+                    self.stats.best_epoch = epoch
+                    self.best_state = deepcopy(self.model.state_dict())
+                    self._save_checkpoint(epoch, vl)
+
+                bar.set_postfix(loss=f"{tr:.2e}", val=f"{vl:.2e}",
+                                best=f"{self.stats.best_val_error:.2e}", lr=f"{lr:.2e}")
+
+        if self.best_state is not None:
+            self.model.load_state_dict(self.best_state, strict=False)
+            print(f"\nRestored best model from epoch {self.stats.best_epoch} "
+                  f"(val={self.stats.best_val_error:.2e})")
+
+        test_err = self.test()
+        print(f"Test MSE: {test_err:.2e}")
+        self.plot_loss_curve()
+        self._after_train_viz()
+        return test_err
+
+    # -------------------- checkpointing --------------------
+    def _file_prefix(self) -> str:
+        raise NotImplementedError
+
+    def _save_checkpoint(self, epoch, val_error):
+        path = f"{self.output_dir}/checkpoints/{self._file_prefix()}_best.pth"
+        torch.save({
+            "epoch": epoch,
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "val_error": val_error,
+            "stats": self.stats,
+        }, path)
+
+    def load_checkpoint(self, path: Optional[str] = None) -> bool:
+        if path is None:
+            path = f"{self.output_dir}/checkpoints/{self._file_prefix()}_best.pth"
+        if not os.path.exists(path):
+            print(f"Checkpoint not found: {path}")
+            return False
+        ck = torch.load(path, map_location=self.device, weights_only=False)
+        sd = ck["model_state_dict"]
+        sd.pop("_metadata", None)
+        self.model.load_state_dict(sd, strict=False)
+        self.stats = ck.get("stats", TrainingStats())
+        print(f"Loaded checkpoint from epoch {ck.get('epoch', '?')}, "
+              f"val={ck.get('val_error', float('nan')):.2e}")
+        return True
+
+    # -------------------- plotting --------------------
+    def plot_loss_curve(self):
+        path = f"{self.output_dir}/curves/{self._file_prefix()}_loss.png"
+        viz.plot_loss_curve(self.stats, self.loss_type, self.K, path)
+
+
+class PoissonTrainer(BaseTrainer):
+    """Trainer for the static Poisson problem (``data`` / ``galerkin`` / ``deepritz`` / ``pls``)."""
+
     def __init__(
         self,
         model: nn.Module,
@@ -53,15 +202,11 @@ class Trainer:
         mg_post_smooth: int = 2,
         mg_omega: float = 2.0 / 3.0,
     ):
-        self.model = model.to(device)
+        super().__init__(model, loss_type, train_dataset.K, optimizer_name,
+                         lr, lr_min, weight_decay, epochs, device, output_dir)
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
         self.test_dataset = test_dataset
-        self.device = device
-        self.epochs = epochs
-        self.output_dir = output_dir
-        self.loss_type = loss_type
-        self.K = train_dataset.K
         self.grid_size = train_dataset.grid_size
 
         # All splits share one PoissonProblem; move it (and its A, M) to the device once.
@@ -99,18 +244,6 @@ class Trainer:
                                     bc_mode=bc_mode, mg=self.mg,
                                     precondition=precondition)
 
-        self.optimizer = build_optimizer(optimizer_name, model.parameters(),
-                                         lr=lr, weight_decay=weight_decay)
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=epochs, eta_min=lr_min,
-        )
-
-        self.stats = TrainingStats()
-        self.best_state = None
-
-        for sub in ("checkpoints", "curves", "visualization", "error"):
-            os.makedirs(f"{output_dir}/{sub}", exist_ok=True)
-
     @staticmethod
     def _collate(batch):
         fs_grid = torch.stack([item[0][0] for item in batch], dim=0)    # [B, 1, H, W]
@@ -144,18 +277,6 @@ class Trainer:
             total += loss.item()
             nb += 1
         return total / nb
-
-    def _apply_eval_bc(self, u_grid: torch.Tensor) -> torch.Tensor:
-        """Project the prediction onto the zero Dirichlet BC at eval time when the boundary
-        was unconstrained during training. Accepts ``[H, W]`` or ``[B, H, W]``; pass-through
-        otherwise."""
-        if not self.eval_project_bc:
-            return u_grid
-        mask = self.problem.boundary_mask.to(u_grid.device)
-        nx, ny = self.grid_size
-        node = grid_to_node(u_grid, nx, ny)            # [..., N]
-        node = apply_zero_boundary(node, mask)
-        return node_to_grid(node, nx, ny)              # [..., H, W]
 
     @torch.no_grad()
     def _eval_loader(self, loader) -> float:
@@ -209,48 +330,11 @@ class Trainer:
                   f"(reduction this cycle: {norms[k+1]/max(norms[k],1e-30):.3e})")
         print()
 
-    # -------------------- training loop --------------------
-    def train(self) -> float:
-        print(f"Training FNO with {self.loss_type} loss")
-        print(f"  Train: {len(self.train_dataset)}  Val: {len(self.val_dataset)}  "
-              f"Test: {len(self.test_dataset)}  Device: {self.device}\n")
+    def _before_train(self):
         if self.mg is not None:
             self._check_mg()
 
-        with tqdm(range(self.epochs), desc="Training", unit="epoch", colour="green") as bar:
-            for epoch in bar:
-                tr = self.train_epoch()
-                vl = self.validate()
-                self.scheduler.step()
-                lr = self.scheduler.get_last_lr()[0]
-
-                self.stats.train_losses.append(tr)
-                self.stats.val_errors.append(vl)
-                self.stats.learning_rates.append(lr)
-
-                if vl < self.stats.best_val_error:
-                    self.stats.best_val_error = vl
-                    self.stats.best_epoch = epoch
-                    self.best_state = deepcopy(self.model.state_dict())
-                    self._save_checkpoint(epoch, vl)
-
-                bar.set_postfix(loss=f"{tr:.2e}", val=f"{vl:.2e}",
-                                best=f"{self.stats.best_val_error:.2e}", lr=f"{lr:.2e}")
-
-        if self.best_state is not None:
-            self.model.load_state_dict(self.best_state, strict=False)
-            print(f"\nRestored best model from epoch {self.stats.best_epoch} "
-                  f"(val={self.stats.best_val_error:.2e})")
-
-        test_err = self.test()
-        print(f"Test MSE: {test_err:.2e}")
-        self.plot_loss_curve()
-        self.visualize_sample(self.train_dataset, "train", 0)
-        self.visualize_sample(self.test_dataset, "test", 0)
-        self.compute_error_distribution()
-        return test_err
-
-    # -------------------- checkpointing --------------------
+    # -------------------- checkpointing / viz --------------------
     def _file_prefix(self) -> str:
         if self.loss_type == "deepritz":
             tag = "_precond" if self.precondition else f"_bc-{self.bc_mode}"
@@ -264,36 +348,6 @@ class Trainer:
         return (f"fno_{self.loss_type}{tag}_K{self.K}_"
                 f"samples-{len(self.train_dataset)}-{len(self.val_dataset)}-{len(self.test_dataset)}")
 
-    def _save_checkpoint(self, epoch, val_error):
-        path = f"{self.output_dir}/checkpoints/{self._file_prefix()}_best.pth"
-        torch.save({
-            "epoch": epoch,
-            "model_state_dict": self.model.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "val_error": val_error,
-            "stats": self.stats,
-        }, path)
-
-    def load_checkpoint(self, path: Optional[str] = None) -> bool:
-        if path is None:
-            path = f"{self.output_dir}/checkpoints/{self._file_prefix()}_best.pth"
-        if not os.path.exists(path):
-            print(f"Checkpoint not found: {path}")
-            return False
-        ck = torch.load(path, map_location=self.device, weights_only=False)
-        sd = ck["model_state_dict"]
-        sd.pop("_metadata", None)
-        self.model.load_state_dict(sd, strict=False)
-        self.stats = ck.get("stats", TrainingStats())
-        print(f"Loaded checkpoint from epoch {ck.get('epoch', '?')}, "
-              f"val={ck.get('val_error', float('nan')):.2e}")
-        return True
-
-    # -------------------- plotting / visualization --------------------
-    def plot_loss_curve(self):
-        path = f"{self.output_dir}/curves/{self._file_prefix()}_loss.png"
-        viz.plot_loss_curve(self.stats, self.loss_type, self.K, path)
-
     def visualize_sample(self, dataset, split: str, sample_idx: int = 0):
         suffix = "" if sample_idx == 0 else f"_sample{sample_idx}"
         path = f"{self.output_dir}/visualization/{self._file_prefix()}_{split}{suffix}.png"
@@ -304,3 +358,212 @@ class Trainer:
         path = f"{self.output_dir}/error/{self._file_prefix()}_error_dist.png"
         return viz.compute_error_distribution(self.model, self.test_dataset, self.device,
                                               self._apply_eval_bc, self.loss_type, self.K, path)
+
+    def _after_train_viz(self):
+        self.visualize_sample(self.train_dataset, "train", 0)
+        self.visualize_sample(self.test_dataset, "test", 0)
+        self.compute_error_distribution()
+
+
+# Backwards-compatible alias: the historical name for the Poisson trainer.
+Trainer = PoissonTrainer
+
+
+class RolloutTrainer(BaseTrainer):
+    r"""Shared trainer for time-dependent PDEs as autoregressive FNO steppers.
+
+    The FNO maps the last ``n_seed_frames`` frames (an ``n_seed_frames``-channel grid) to the
+    next frame. Each batch is seeded with the first ``n_seed_frames`` ground-truth frames and
+    rolled forward ``rollout_steps`` times; predicted frames are projected onto the zero
+    Dirichlet boundary before being fed back. The loss is ``λ_gal·galerkin + λ_data·data``:
+    the Galerkin term is the weak-form residual over the rollout (supplied by ``self.criterion``,
+    which the subclass builds), the optional data term is the trajectory MSE against the
+    reference. Evaluation is always grid-space rollout MSE versus the reference trajectory.
+
+    Subclasses set ``self.criterion`` after ``super().__init__`` and implement ``_file_prefix``.
+    ``n_seed_frames`` = 2 for the (second-order) wave equation, 1 for (first-order) Allen–Cahn.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        train_dataset,
+        val_dataset,
+        test_dataset,
+        loss_type: str,
+        n_seed_frames: int,
+        optimizer_name: str = "adam",
+        lr: float = 1e-3,
+        lr_min: float = 1e-6,
+        weight_decay: float = 0.0,
+        batch_size: int = 32,
+        epochs: int = 500,
+        device: str = "cuda",
+        output_dir: str = "output",
+        lambda_galerkin: float = 1.0,
+        lambda_data: float = 0.0,
+        rollout_steps: int = 4,
+    ):
+        super().__init__(model, loss_type, train_dataset.K, optimizer_name,
+                         lr, lr_min, weight_decay, epochs, device, output_dir)
+        self.train_dataset = train_dataset
+        self.val_dataset = val_dataset
+        self.test_dataset = test_dataset
+        self.grid_size = train_dataset.grid_size
+
+        self.problem = train_dataset.problem.to(device)
+        self.dt = train_dataset.dt
+        self.n_steps = train_dataset.n_steps
+        self.n_seed_frames = n_seed_frames
+        # Rollout produces preds at frame indices n_seed .. n_seed+R-1, which must exist.
+        self.rollout_steps = max(1, min(rollout_steps, self.n_steps - n_seed_frames + 1))
+        self.lambda_galerkin = lambda_galerkin
+        self.lambda_data = lambda_data
+
+        # Predictions are unconstrained on the boundary during training (the residual masks
+        # it), so project to zero-BC at eval — matching the zero-boundary reference.
+        self.eval_project_bc = True
+
+        self.train_loader = DataLoader(train_dataset, batch_size=batch_size,
+                                       shuffle=True, collate_fn=self._collate)
+        self.val_loader = DataLoader(val_dataset, batch_size=batch_size,
+                                     shuffle=False, collate_fn=self._collate)
+        self.test_loader = DataLoader(test_dataset, batch_size=batch_size,
+                                      shuffle=False, collate_fn=self._collate)
+
+        self.criterion = None   # set by the subclass
+
+    @staticmethod
+    def _collate(batch):
+        trajs_grid = torch.stack([item[0] for item in batch], dim=0)     # [B, T+1, H, W]
+        trajs_node = torch.stack([item[1] for item in batch], dim=0)     # [B, T+1, N]
+        return trajs_grid, trajs_node
+
+    # -------------------- autoregressive rollout --------------------
+    def _rollout(self, traj_grid: torch.Tensor):
+        """Seed with the first ``n_seed_frames`` frames and roll ``rollout_steps`` forward.
+
+        Returns ``(preds_grid [B, R, H, W], seq_node [B, n_seed+R, N])`` where ``seq_node`` is
+        the ground-truth seed frames followed by the predicted frames, all zeroed on the
+        Dirichlet boundary. ``preds_grid`` are the predicted frames (also projected)."""
+        nx, ny = self.grid_size
+        ns = self.n_seed_frames
+        window = [self._project_zero_bc(traj_grid[:, i]) for i in range(ns)]   # each [B, H, W]
+        seq_node = [grid_to_node(f, nx, ny) for f in window]
+        preds_grid = []
+        for _ in range(self.rollout_steps):
+            inp = torch.stack(window, dim=1)                             # [B, ns, H, W]
+            nxt = self._project_zero_bc(self.model(inp).squeeze(1))      # [B, H, W]
+            preds_grid.append(nxt)
+            seq_node.append(grid_to_node(nxt, nx, ny))
+            window = window[1:] + [nxt]                                  # slide the window
+        return torch.stack(preds_grid, dim=1), torch.stack(seq_node, dim=1)
+
+    def train_epoch(self) -> float:
+        self.model.train()
+        total, nb = 0.0, 0
+        ns, R = self.n_seed_frames, self.rollout_steps
+        for trajs_grid, _ in self.train_loader:
+            self.optimizer.zero_grad()
+            trajs_grid = trajs_grid.to(self.device)
+            preds_grid, seq_node = self._rollout(trajs_grid)
+            loss = self.lambda_galerkin * self.criterion(seq_node)
+            if self.lambda_data > 0.0:
+                ref = trajs_grid[:, ns:ns + R]                           # [B, R, H, W]
+                loss = loss + self.lambda_data * ((preds_grid - ref) ** 2).mean()
+            loss.backward()
+            self.optimizer.step()
+            total += loss.item()
+            nb += 1
+        return total / nb
+
+    @torch.no_grad()
+    def _eval_loader(self, loader) -> float:
+        """Rollout MSE vs the reference trajectory over the ``rollout_steps`` window."""
+        self.model.eval()
+        ns, R = self.n_seed_frames, self.rollout_steps
+        total_mse, n = 0.0, 0
+        for trajs_grid, _ in loader:
+            trajs_grid = trajs_grid.to(self.device)
+            preds_grid, _ = self._rollout(trajs_grid)                    # [B, R, H, W]
+            ref = trajs_grid[:, ns:ns + R]
+            mse = ((preds_grid - ref) ** 2).mean().item()
+            total_mse += mse * trajs_grid.shape[0]
+            n += trajs_grid.shape[0]
+        return total_mse / n
+
+    def validate(self):
+        return self._eval_loader(self.val_loader)
+
+    def test(self):
+        return self._eval_loader(self.test_loader)
+
+    # -------------------- viz --------------------
+    def visualize_sample(self, dataset, split: str, sample_idx: int = 0):
+        suffix = "" if sample_idx == 0 else f"_sample{sample_idx}"
+        path = f"{self.output_dir}/visualization/{self._file_prefix()}_{split}{suffix}.png"
+        viz.visualize_rollout_sample(self.model, dataset, split, sample_idx, self.device,
+                                     self._project_zero_bc, self.rollout_steps, self.n_seed_frames,
+                                     self.loss_type, self.K, path)
+
+    def compute_error_distribution(self):
+        path = f"{self.output_dir}/error/{self._file_prefix()}_error_dist.png"
+        return viz.compute_rollout_error_distribution(
+            self.model, self.test_dataset, self.device, self._project_zero_bc,
+            self.rollout_steps, self.n_seed_frames, self.loss_type, self.K, path)
+
+    def _after_train_viz(self):
+        self.visualize_sample(self.train_dataset, "train", 0)
+        self.visualize_sample(self.test_dataset, "test", 0)
+        self.compute_error_distribution()
+
+
+class WaveTrainer(RolloutTrainer):
+    r"""Wave equation stepper: FNO maps ``[u^{n-1}, u^n]`` → ``u^{n+1}`` (2 seed frames),
+    trained on the central-difference weak-form residual (label-free) + optional data MSE."""
+
+    def __init__(self, model, train_dataset, val_dataset, test_dataset,
+                 loss_type="galerkin", optimizer_name="adam", lr=1e-3, lr_min=1e-6,
+                 weight_decay=0.0, batch_size=32, epochs=500, device="cuda",
+                 output_dir="output", lambda_galerkin=1.0, lambda_data=0.0,
+                 rollout_steps=4, discount_factor=1.0):
+        super().__init__(model, train_dataset, val_dataset, test_dataset, loss_type,
+                         n_seed_frames=2, optimizer_name=optimizer_name, lr=lr, lr_min=lr_min,
+                         weight_decay=weight_decay, batch_size=batch_size, epochs=epochs,
+                         device=device, output_dir=output_dir, lambda_galerkin=lambda_galerkin,
+                         lambda_data=lambda_data, rollout_steps=rollout_steps)
+        self.c = train_dataset.c
+        self.discount_factor = discount_factor
+        self.criterion = build_wave_loss(self.problem, c=self.c, dt=self.dt,
+                                         discount=discount_factor)
+
+    def _file_prefix(self) -> str:
+        return (f"fno_wave_{self.loss_type}_c{self.c:g}_dt{self.dt:g}_"
+                f"T{self.n_steps}_R{self.rollout_steps}_K{self.K}_"
+                f"samples-{len(self.train_dataset)}-{len(self.val_dataset)}-{len(self.test_dataset)}")
+
+
+class ACTrainer(RolloutTrainer):
+    r"""Allen–Cahn stepper: FNO maps ``u^n`` → ``u^{n+1}`` (1 seed frame), trained on the
+    backward-Euler weak-form residual (label-free) + optional data MSE against the FEM reference."""
+
+    def __init__(self, model, train_dataset, val_dataset, test_dataset,
+                 loss_type="galerkin", optimizer_name="adam", lr=1e-3, lr_min=1e-6,
+                 weight_decay=0.0, batch_size=32, epochs=500, device="cuda",
+                 output_dir="output", lambda_galerkin=1.0, lambda_data=0.0,
+                 rollout_steps=4, discount_factor=1.0):
+        super().__init__(model, train_dataset, val_dataset, test_dataset, loss_type,
+                         n_seed_frames=1, optimizer_name=optimizer_name, lr=lr, lr_min=lr_min,
+                         weight_decay=weight_decay, batch_size=batch_size, epochs=epochs,
+                         device=device, output_dir=output_dir, lambda_galerkin=lambda_galerkin,
+                         lambda_data=lambda_data, rollout_steps=rollout_steps)
+        self.a = train_dataset.a
+        self.eps = train_dataset.eps
+        self.discount_factor = discount_factor
+        self.criterion = build_ac_loss(self.problem, a=self.a, eps=self.eps, dt=self.dt,
+                                       discount=discount_factor)
+
+    def _file_prefix(self) -> str:
+        return (f"fno_ac_{self.loss_type}_a{self.a:g}_eps{self.eps:g}_dt{self.dt:g}_"
+                f"T{self.n_steps}_R{self.rollout_steps}_K{self.K}_"
+                f"samples-{len(self.train_dataset)}-{len(self.val_dataset)}-{len(self.test_dataset)}")
