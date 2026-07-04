@@ -148,6 +148,12 @@ Useful flags: `--bc_mode {penalty,hard}` (boundary handling for `data`/`deepritz
 `--n_modes`, `--hidden_dim`, `--num_layers`, `--optimizer`, `--device`,
 `--eval_only --checkpoint <path>`. Run `tensorpils --help` for the full list.
 
+## Experiments
+
+Reproducible experiments (description, SLURM sweep script, and plot script) live under
+[`experiments/`](experiments/README.md) — currently the blend-strength conditioning sweep
+and the out-of-distribution generalization study. See that folder's README for an index.
+
 ## Outputs
 
 Each run writes under `--output_dir` (default `output/`):

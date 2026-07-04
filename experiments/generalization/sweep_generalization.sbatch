@@ -5,7 +5,7 @@
 # task per t value; all tasks share the output dir (files keyed by the blend-<t> tag).
 #
 # Submit from ~/TensorPILS after `mkdir -p logs`:
-#     sbatch scripts/sweep_generalization.sbatch
+#     sbatch experiments/generalization/sweep_generalization.sbatch
 # Watch:   squeue --me      Logs: logs/gen_<jobid>_<task>.out
 #
 #SBATCH --job-name=pils-gen-sweep

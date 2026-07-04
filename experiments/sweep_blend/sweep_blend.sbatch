@@ -4,7 +4,7 @@
 # keyed by the blend-<t> tag, so they do not collide).
 #
 # Submit from ~/TensorPILS after `mkdir -p logs`:
-#     sbatch scripts/sweep_blend.sbatch
+#     sbatch experiments/sweep_blend/sweep_blend.sbatch
 # Watch:   squeue --me      Logs: logs/sweep_<jobid>_<task>.out
 #
 #SBATCH --job-name=pils-blend-sweep
