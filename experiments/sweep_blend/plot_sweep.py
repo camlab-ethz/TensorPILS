@@ -7,7 +7,8 @@ Reads the per-run ``results/*.json`` written by ``Trainer._save_results_json`` a
   2. collapse — final relative-L2 vs the conditioning number kappa(H_P).
 
 Usage (after pulling the sweep output back from the cluster):
-    python scripts/plot_sweep.py --results_dir output/sweep_blend/results
+    python experiments/sweep_blend/plot_sweep.py \
+        --results_dir output/sweep_blend/pls/results   # or .../deepritz/results
 """
 
 import argparse
@@ -76,7 +77,7 @@ def plot_collapse(runs, out_path):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--results_dir", default="output/sweep_blend/results")
+    ap.add_argument("--results_dir", default="output/sweep_blend/pls/results")
     ap.add_argument("--out_dir", default=None,
                     help="Where to write the figures (default: alongside results_dir).")
     args = ap.parse_args()
