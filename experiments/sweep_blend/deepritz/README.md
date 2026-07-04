@@ -9,9 +9,9 @@ supervised/Newton direction (`t=1`, `P=A⁻¹` → `u−u★`). As with PLS, thi
 metric, where the relevant conditioning is `κ(PA)` (running from `κ(A)` at `t=0` to `1` at
 `t=1`). Preconditioned Deep Ritz uses hard boundary conditions (implied by `--precondition`).
 
-The `plot_sweep.py` collapse plot uses `κ(H)=κ(PA)²`, which is monotone in `κ(PA)`, so the
-collapse trend is unchanged (only the x-axis is squared relative to the surrogate's natural
-`κ(PA)`).
+`plot_sweep.py` auto-detects the loss form from each run's `loss_type` and plots the
+**morally correct** conditioning per case: `κ(PA)` for this Deep Ritz surrogate (vs `κ(H)=κ(PA)²`
+for the squared PLS loss). So the collapse x-axis here is `κ(PA)`, not the squared `κ(H)`.
 
 ## Facts
 

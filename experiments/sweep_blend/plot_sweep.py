@@ -4,7 +4,9 @@ Reads the per-run ``results/*.json`` written by ``Trainer._save_results_json`` a
 
   1. overlay  — validation relative-L2 vs epoch, one curve per strength (the
                 "physics-informed -> supervised transition" figure);
-  2. collapse — final relative-L2 vs the conditioning number kappa(H_P).
+  2. collapse — final relative-L2 vs conditioning: kappa(H)=kappa(PA)^2 for the squared PLS
+                loss, kappa(PA) for the preconditioned Deep Ritz surrogate (whose descent
+                direction is P*r). The loss form is auto-detected from each run's loss_type.
 
 Usage (after pulling the sweep output back from the cluster):
     python experiments/sweep_blend/plot_sweep.py \
@@ -29,18 +31,34 @@ def load_runs(results_dir):
     return runs
 
 
+def conditioning(run):
+    """(value, latex symbol) for the collapse axis / legend, per the loss form.
+
+    Deep Ritz preconditions the descent direction ``P*r``, so its natural conditioning is
+    ``kappa(PA)``; the squared PLS loss squares it into the Hessian, ``kappa(H)=kappa(PA)^2``.
+    """
+    if run.get("loss_type") == "deepritz":
+        return run["stats"].get("precond_cond_pa", float("nan")), r"\kappa(PA)"
+    return run["stats"].get("precond_cond_h", float("nan")), r"\kappa(H)"
+
+
+def loss_label(runs):
+    return "Deep Ritz" if runs and runs[0].get("loss_type") == "deepritz" else "PLS"
+
+
 def plot_overlay(runs, out_path):
     fig, ax = plt.subplots(figsize=(7, 5))
     for r in runs:
         rl2 = r["stats"]["val_rel_l2_errors"]
         if not rl2:
             continue
-        label = f"t={r['precond_strength']:.2f} (κ(H)={r['stats']['precond_cond_h']:.1e})"
+        kval, ksym = conditioning(r)
+        label = f"t={r['precond_strength']:.2f} (${ksym}$={kval:.1e})"
         ax.plot(range(1, len(rl2) + 1), rl2, label=label, lw=1.6)
     ax.set_xlabel("epoch")
     ax.set_ylabel("validation relative $L^2$")
     ax.set_yscale("log")
-    ax.set_title("PLS: convergence vs preconditioner strength $t$")
+    ax.set_title(f"{loss_label(runs)}: convergence vs preconditioner strength $t$")
     ax.legend(fontsize=8, framealpha=0.9)
     ax.grid(True, which="both", alpha=0.3)
     fig.tight_layout()
@@ -49,13 +67,14 @@ def plot_overlay(runs, out_path):
 
 
 def plot_collapse(runs, out_path):
+    sym = conditioning(runs[0])[1]         # uniform per results dir (one loss form)
     kappa, final_rl2, strengths = [], [], []
     for r in runs:
         rl2 = r["stats"]["val_rel_l2_errors"]
-        kh = r["stats"]["precond_cond_h"]
-        if not rl2 or kh != kh:            # skip empty / NaN-conditioning runs
+        kval, sym = conditioning(r)
+        if not rl2 or kval != kval:         # skip empty / NaN-conditioning runs
             continue
-        kappa.append(kh)
+        kappa.append(kval)
         final_rl2.append(min(rl2))          # best achieved
         strengths.append(r["precond_strength"])
 
@@ -64,11 +83,11 @@ def plot_collapse(runs, out_path):
     for k, e, t in zip(kappa, final_rl2, strengths):
         ax.annotate(f"t={t:.2f}", (k, e), fontsize=8,
                     textcoords="offset points", xytext=(5, 5))
-    ax.set_xlabel(r"conditioning $\kappa(H_P)$")
+    ax.set_xlabel(rf"conditioning ${sym}$")
     ax.set_ylabel("best validation relative $L^2$")
     ax.set_xscale("log")
     ax.set_yscale("log")
-    ax.set_title("Collapse: final error vs conditioning")
+    ax.set_title(f"{loss_label(runs)} collapse: final error vs conditioning")
     ax.grid(True, which="both", alpha=0.3)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
