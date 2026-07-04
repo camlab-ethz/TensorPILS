@@ -5,14 +5,14 @@
 # task per t value; all tasks share the output dir (files keyed by the blend-<t> tag).
 #
 # Submit from ~/TensorPILS after `mkdir -p logs`:
-#     sbatch experiments/generalization/sweep_generalization.sbatch
-# Watch:   squeue --me      Logs: logs/gen_<jobid>_<task>.out
+#     sbatch experiments/generalization/pls_k4/sweep.sbatch
+# Watch:   squeue --me      Logs: logs/gen_k4_<jobid>_<task>.out
 #
-#SBATCH --job-name=pils-gen-sweep
+#SBATCH --job-name=pils-gen-k4
 #SBATCH --time=02:00:00
 #SBATCH --gpus=1
 #SBATCH --mem-per-cpu=8G
-#SBATCH --output=logs/gen_%A_%a.out
+#SBATCH --output=logs/gen_k4_%A_%a.out
 #SBATCH --array=0-3
 
 # Source the environment first (module/Lmod is not always `set -u`-safe), then
@@ -24,7 +24,7 @@ set -eo pipefail
 STRENGTHS=(0.05 0.1 0.25 1.0)
 T=${STRENGTHS[$SLURM_ARRAY_TASK_ID]}
 
-OUT=~/TensorPILS/output/generalization
+OUT=~/TensorPILS/output/generalization/pls_k4
 # -----------------------------------------------------------------------------
 
 echo "=== generalization sweep: strength t=${T} (task ${SLURM_ARRAY_TASK_ID}) on $(hostname) ==="

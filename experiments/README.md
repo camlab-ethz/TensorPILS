@@ -8,6 +8,6 @@ artifacts land in `output/<name>/` (git-ignored); pull them back from the cluste
 | Experiment | Question |
 |---|---|
 | [`sweep_blend/`](sweep_blend/README.md) | Does the blend preconditioner strength `t` (residual `t=0` → supervised `t=1`) control training conditioning? Overlay + collapse plots vs `κ(H)`. |
-| [`generalization/`](generalization/README.md) | Does that loss geometry `t` affect out-of-distribution generalization to higher-frequency `K=6,8` sources (trained on `K=4`)? |
+| [`generalization/`](generalization/README.md) | Does that loss geometry `t` affect out-of-distribution generalization? Organized into per-regime **scenarios** (`pls_k4/`: K=4→6,8; `pls_k16/`: K=16→20; Deep Ritz variants planned). |
 
 Theory write-up for the spectral preconditioners: `../preconditioner_notes/`.

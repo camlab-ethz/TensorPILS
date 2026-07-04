@@ -7,7 +7,8 @@ overlays the relative-L2-vs-epoch curves for every preconditioner strength ``t``
   * out-of-distribution  -> from ``stats.ood_rel_l2["K6"]``, ``["K8"]``, ...
 
 Usage (after pulling the sweep output back from the cluster):
-    python scripts/plot_generalization.py --results_dir output/generalization/results
+    python experiments/generalization/plot_generalization.py \
+        --results_dir output/generalization/pls_k4/results   # or .../pls_k16/results
 """
 
 import argparse
@@ -67,7 +68,7 @@ def eval_ks(runs):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--results_dir", default="output/generalization/results")
+    ap.add_argument("--results_dir", default="output/generalization/pls_k4/results")
     ap.add_argument("--out_dir", default=None,
                     help="Where to write the figures (default: alongside results_dir).")
     args = ap.parse_args()
