@@ -21,7 +21,7 @@ from .physics import PoissonProblem, apply_zero_boundary
 from .preconditioners import Preconditioner
 
 __all__ = [
-    "DataLoss", "GalerkinLoss", "DeepRitzLoss",
+    "DataLoss", "DataL2Loss", "GalerkinLoss", "DeepRitzLoss",
     "PreconditionedLSLoss", "PreconditionedDeepRitzLoss", "build_loss",
 ]
 
@@ -45,6 +45,25 @@ class DataLoss(nn.Module):
         if self.bc_mode == "hard":
             return ((u_pred[..., 1:-1, 1:-1] - u_true[..., 1:-1, 1:-1]) ** 2).mean()
         return ((u_pred - u_true) ** 2).mean()
+
+
+class DataL2Loss(nn.Module):
+    r"""Supervised true-``L²`` loss ``½‖u−u★‖²_{L²} = ½ eᵀ M e`` on node values ``[B, N]``.
+
+    Unlike :class:`DataLoss` (flat grid MSE), the error ``e = u_pred − u_true`` is measured in
+    the finite-element ``L²`` norm via the mass matrix ``M`` — the same metric used to report
+    validation error. Requires labels ``u_true``.
+    """
+
+    def __init__(self, problem: PoissonProblem):
+        super().__init__()
+        self.problem = problem
+
+    def forward(self, u_pred_node: torch.Tensor, f_node: torch.Tensor,
+                u_true_node: torch.Tensor = None) -> torch.Tensor:
+        e = u_pred_node - u_true_node
+        Me = self.problem._spmm(self.problem.M, e)      # M e
+        return 0.5 * (e * Me).sum(dim=-1).mean()        # ½ mean_B(eᵀ M e)
 
 
 class GalerkinLoss(nn.Module):
@@ -146,6 +165,8 @@ def build_loss(loss_type: str, problem: PoissonProblem,
     """Factory for the loss criterion. Add a branch here to register a new loss."""
     if loss_type == "data":
         return DataLoss(bc_mode=bc_mode)
+    if loss_type == "data_l2":
+        return DataL2Loss(problem)
     if loss_type == "galerkin":
         return GalerkinLoss(problem)
     if loss_type == "deepritz":
