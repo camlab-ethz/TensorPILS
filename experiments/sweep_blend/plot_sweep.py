@@ -18,6 +18,8 @@ import glob
 import json
 import os
 
+import matplotlib
+matplotlib.use("Agg")            # headless: render to file, no display needed
 import matplotlib.pyplot as plt
 
 
