@@ -37,14 +37,31 @@ def curve_for(run, target_k):
     return run["stats"].get("ood_rel_l2", {}).get(f"K{target_k}", [])
 
 
+_LOSS_NAMES = {"data": "MSE", "data_l2": r"$L^2$", "data_h1": r"$H^1_0$",
+               "galerkin": "Galerkin", "pls": "PLS"}
+
+
+def make_labeler(runs):
+    """Label curves by loss when a scenario compares losses, else by strength t."""
+    if len({r.get("loss_type") for r in runs}) > 1:
+        def by_loss(r):
+            lt = r.get("loss_type", "?")
+            if lt == "deepritz":
+                return f"Deep Ritz ({r.get('bc_mode', 'penalty')} BC)"
+            return _LOSS_NAMES.get(lt, lt)
+        return by_loss
+    return lambda r: f"t={r.get('precond_strength', float('nan')):.2f}"
+
+
 def plot_for_k(runs, target_k, out_path):
     fig, ax = plt.subplots(figsize=(7, 5))
     train_k = runs[0]["K"]
+    label_of = make_labeler(runs)
     for r in runs:
         rl2 = curve_for(r, target_k)
         if not rl2:
             continue
-        ax.plot(range(1, len(rl2) + 1), rl2, lw=1.6, label=f"t={r['precond_strength']:.2f}")
+        ax.plot(range(1, len(rl2) + 1), rl2, lw=1.6, label=label_of(r))
     tag = "in-distribution" if target_k == train_k else "out-of-distribution"
     ax.set_xlabel("epoch")
     ax.set_ylabel("relative $L^2$")

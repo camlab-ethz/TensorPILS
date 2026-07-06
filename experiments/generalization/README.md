@@ -17,6 +17,7 @@ each run's results). Scenario folders are named `<method>_k<train-K>`.
 |---|---|---|---|---|---|
 | [`pls_k4/`](pls_k4/README.md) | PLS (blend) | 4 | 6, 8 | 16 | OOD within the representable band |
 | [`pls_k16/`](pls_k16/README.md) | PLS (blend) | 16 | 20 | 16 | Shizheng's regime; OOD **exceeds** the band (deliberate truncation floor) |
+| [`data_k16/`](data_k16/README.md) | data-driven (MSE, H¹₀) | 16 | 20 | 16 | supervised losses; does the H¹₀ metric help OOD extrapolation vs MSE? |
 
 Planned: Deep Ritz variants (`deepritz_k4/`, `deepritz_k16/`, …) — same layout, different loss.
 
