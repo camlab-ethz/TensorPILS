@@ -116,6 +116,7 @@ class Trainer:
             (loss_type == "deepritz" and bc_mode == "hard")
             or (loss_type == "deepritz" and precondition)
             or (loss_type == "data" and bc_mode == "hard")
+            or (loss_type == "data_h1")   # H¹₀ loss imposes zero boundary in the loss
         )
 
         self.criterion = build_loss(loss_type, self.problem, lambda_bc,

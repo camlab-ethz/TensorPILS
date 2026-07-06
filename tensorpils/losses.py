@@ -67,11 +67,13 @@ class DataL2Loss(nn.Module):
 
 
 class DataH1Loss(nn.Module):
-    r"""Supervised ``H¹₀``-seminorm loss ``½‖u−u★‖²_{H¹₀} = ½ eᵀ A e`` on node values ``[B, N]``.
+    r"""Supervised ``H¹₀``-norm loss ``½‖u−u★‖²_{H¹₀} = ½ eᵀ A e`` on node values ``[B, N]``.
 
-    Identical to :class:`DataL2Loss` but with the stiffness matrix ``A`` (``∫∇φ·∇φ``) in place
-    of the mass matrix, i.e. the error is measured in the energy / ``H¹₀`` seminorm
-    ``½∫|∇e|²``. Requires labels ``u_true``.
+    Like :class:`DataL2Loss` but with the stiffness matrix ``A`` (``∫∇φ·∇φ``) in place of the
+    mass matrix, measuring the error in the energy / ``H¹₀`` seminorm ``½∫|∇e|²``. The
+    prediction is first projected to zero on the Dirichlet boundary, so ``e = Πu_pred − u★``
+    lies in ``H₀¹`` where the seminorm is a genuine norm (Poincaré) — without this the
+    constant/boundary mode is in the loss nullspace. Requires labels ``u_true``.
     """
 
     def __init__(self, problem: PoissonProblem):
@@ -80,7 +82,8 @@ class DataH1Loss(nn.Module):
 
     def forward(self, u_pred_node: torch.Tensor, f_node: torch.Tensor,
                 u_true_node: torch.Tensor = None) -> torch.Tensor:
-        e = u_pred_node - u_true_node
+        u_bc = apply_zero_boundary(u_pred_node, self.problem.boundary_mask)  # -> H¹₀
+        e = u_bc - u_true_node
         Ae = self.problem._spmm(self.problem.A, e)      # A e
         return 0.5 * (e * Ae).sum(dim=-1).mean()        # ½ mean_B(eᵀ A e)
 

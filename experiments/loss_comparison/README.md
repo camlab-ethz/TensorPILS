@@ -7,8 +7,10 @@ finite-element relative-L2 error on the validation set:
   geometry / mass weighting).
 - **`data_l2`** — supervised **true-L2** loss `½‖u−u★‖²_{L²} = ½ eᵀ M e` (mass-weighted). This
   trains in *exactly* the metric used for evaluation.
-- **`data_h1`** — supervised **H¹₀ seminorm** loss `½‖u−u★‖²_{H¹₀} = ½ eᵀ A e` (stiffness-weighted;
-  same implementation as `data_l2` but with the stiffness `A` in place of the mass `M`).
+- **`data_h1`** — supervised **H¹₀ norm** loss `½‖u−u★‖²_{H¹₀} = ½ eᵀ A e` (stiffness-weighted;
+  same as `data_l2` with `A` in place of `M`). The prediction is projected to zero on the
+  boundary first, so the error lies in `H₀¹` where the seminorm is a genuine norm (otherwise
+  the constant/boundary mode is unconstrained); the boundary is likewise projected at eval.
 - **`deepritz` (penalty BC)** — Deep Ritz energy, **label-free**, soft boundary penalty
   (`λ_bc=100`), no preconditioner.
 - **`deepritz` (hard BC)** — Deep Ritz energy, **label-free**, hard boundary projection, no
