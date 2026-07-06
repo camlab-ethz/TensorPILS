@@ -21,7 +21,7 @@ from .physics import PoissonProblem, apply_zero_boundary
 from .preconditioners import Preconditioner
 
 __all__ = [
-    "DataLoss", "DataL2Loss", "GalerkinLoss", "DeepRitzLoss",
+    "DataLoss", "DataL2Loss", "DataH1Loss", "GalerkinLoss", "DeepRitzLoss",
     "PreconditionedLSLoss", "PreconditionedDeepRitzLoss", "build_loss",
 ]
 
@@ -64,6 +64,25 @@ class DataL2Loss(nn.Module):
         e = u_pred_node - u_true_node
         Me = self.problem._spmm(self.problem.M, e)      # M e
         return 0.5 * (e * Me).sum(dim=-1).mean()        # ½ mean_B(eᵀ M e)
+
+
+class DataH1Loss(nn.Module):
+    r"""Supervised ``H¹₀``-seminorm loss ``½‖u−u★‖²_{H¹₀} = ½ eᵀ A e`` on node values ``[B, N]``.
+
+    Identical to :class:`DataL2Loss` but with the stiffness matrix ``A`` (``∫∇φ·∇φ``) in place
+    of the mass matrix, i.e. the error is measured in the energy / ``H¹₀`` seminorm
+    ``½∫|∇e|²``. Requires labels ``u_true``.
+    """
+
+    def __init__(self, problem: PoissonProblem):
+        super().__init__()
+        self.problem = problem
+
+    def forward(self, u_pred_node: torch.Tensor, f_node: torch.Tensor,
+                u_true_node: torch.Tensor = None) -> torch.Tensor:
+        e = u_pred_node - u_true_node
+        Ae = self.problem._spmm(self.problem.A, e)      # A e
+        return 0.5 * (e * Ae).sum(dim=-1).mean()        # ½ mean_B(eᵀ A e)
 
 
 class GalerkinLoss(nn.Module):
@@ -167,6 +186,8 @@ def build_loss(loss_type: str, problem: PoissonProblem,
         return DataLoss(bc_mode=bc_mode)
     if loss_type == "data_l2":
         return DataL2Loss(problem)
+    if loss_type == "data_h1":
+        return DataH1Loss(problem)
     if loss_type == "galerkin":
         return GalerkinLoss(problem)
     if loss_type == "deepritz":

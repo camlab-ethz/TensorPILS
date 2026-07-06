@@ -17,7 +17,7 @@ from .trainer import Trainer
 def build_parser() -> ArgumentParser:
     p = ArgumentParser(description="FNO training for 2D Poisson "
                                    "(data / Galerkin / Deep Ritz / PLS losses).")
-    p.add_argument("--loss", choices=["data", "data_l2", "galerkin", "deepritz", "pls"],
+    p.add_argument("--loss", choices=["data", "data_l2", "data_h1", "galerkin", "deepritz", "pls"],
                    default="galerkin")
     p.add_argument("--n_train", type=int, default=1024)
     p.add_argument("--n_val", type=int, default=128)

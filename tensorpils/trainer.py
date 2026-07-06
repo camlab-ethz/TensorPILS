@@ -307,6 +307,8 @@ class Trainer:
         record = {
             "prefix": self._file_prefix(),
             "loss_type": self.loss_type,
+            "bc_mode": self.bc_mode,
+            "precondition": self.precondition,
             "precond_kind": self.precond_kind,
             "precond_strength": self.precond_strength,
             "K": self.K,

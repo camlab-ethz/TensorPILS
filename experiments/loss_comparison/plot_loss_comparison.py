@@ -17,11 +17,27 @@ import matplotlib
 matplotlib.use("Agg")            # headless: render to file, no display needed
 import matplotlib.pyplot as plt
 
-LABELS = {
-    "data_l2": r"true $L^2$ (data)",
+DATA_LABELS = {
     "data": "MSE (data)",
-    "deepritz": "Deep Ritz",
+    "data_l2": r"true $L^2$ (data)",
+    "data_h1": r"$H^1_0$ (data)",
 }
+
+# order for a stable legend / colour assignment
+ORDER = ["data", "data_l2", "data_h1", "deepritz-penalty", "deepritz-hard"]
+
+
+def label_for(run):
+    lt = run.get("loss_type", "?")
+    if lt == "deepritz":
+        return f"Deep Ritz ({run.get('bc_mode', 'penalty')} BC)"
+    return DATA_LABELS.get(lt, lt)
+
+
+def sort_key(run):
+    lt = run.get("loss_type", "?")
+    key = f"deepritz-{run.get('bc_mode', 'penalty')}" if lt == "deepritz" else lt
+    return ORDER.index(key) if key in ORDER else len(ORDER)
 
 
 def main():
@@ -40,12 +56,11 @@ def main():
     print(f"Loaded {len(runs)} runs.")
 
     fig, ax = plt.subplots(figsize=(7, 5))
-    for r in sorted(runs, key=lambda r: r.get("loss_type", "")):
+    for r in sorted(runs, key=sort_key):
         rl2 = r["stats"]["val_rel_l2_errors"]
         if not rl2:
             continue
-        lt = r.get("loss_type", "?")
-        ax.plot(range(1, len(rl2) + 1), rl2, lw=1.6, label=LABELS.get(lt, lt))
+        ax.plot(range(1, len(rl2) + 1), rl2, lw=1.6, label=label_for(r))
     ax.set_xlabel("epoch")
     ax.set_ylabel("validation relative $L^2$")
     ax.set_yscale("log")
