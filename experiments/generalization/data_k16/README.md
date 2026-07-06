@@ -29,7 +29,7 @@ As in `../pls_k16`, read the K=20 curves *relative to each other*, not against z
 | OOD eval sets | `K=20`, `n=128`, `seed=123` |
 | FNO modes | `16×16` (**below** K=20 — deliberate truncation) |
 | Optimizer | `adam`, default cosine lr `1e-3 → 1e-4` |
-| Epochs / batch | `1000` / `32` |
+| Epochs / batch | `5000` / `32` |
 | Output dir | `output/generalization/data_k16/` (git-ignored) |
 | Recorded | per-epoch relative-L2 on `K=16` (val) and OOD `K=20` (`stats.ood_rel_l2`) |
 
@@ -39,7 +39,7 @@ Single loss (with OOD eval):
 
 ```bash
 python -m tensorpils.cli --loss data_h1 --n_train 1024 --n_val 128 --n_test 256 \
-    -k 16 --ood_k 20 --ood_n_val 128 --epochs 1000 --batch_size 32 \
+    -k 16 --ood_k 20 --ood_n_val 128 --epochs 5000 --batch_size 32 \
     --device cuda --output_dir output/generalization/data_k16
 ```
 
