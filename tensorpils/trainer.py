@@ -111,13 +111,12 @@ class Trainer:
                 strength=precond_strength, device=device,
             )
 
-        # Project boundary to 0 at eval time whenever it was unconstrained during training.
-        self.eval_project_bc = (
-            (loss_type == "deepritz" and bc_mode == "hard")
-            or (loss_type == "deepritz" and precondition)
-            or (loss_type == "data" and bc_mode == "hard")
-            or (loss_type == "data_h1")   # H¹₀ loss imposes zero boundary in the loss
-        )
+        # The homogeneous Dirichlet BC (u=0 on the boundary) is known data, so we always
+        # enforce it at eval by projecting the prediction's boundary to zero — for every
+        # loss, so the reported error never counts a boundary the BC already fixes.
+        # (Assumes homogeneous BC; a non-zero Dirichlet problem would project to the known
+        # boundary values instead.)
+        self.eval_project_bc = True
 
         self.criterion = build_loss(loss_type, self.problem, lambda_bc,
                                     bc_mode=bc_mode, precond=self.precond,
@@ -176,9 +175,8 @@ class Trainer:
         return total / nb
 
     def _apply_eval_bc(self, u_grid: torch.Tensor) -> torch.Tensor:
-        """Project the prediction onto the zero Dirichlet BC at eval time when the boundary
-        was unconstrained during training. Accepts ``[H, W]`` or ``[B, H, W]``; pass-through
-        otherwise."""
+        """Project the prediction onto the (known) zero Dirichlet BC at eval time. Enabled
+        for all losses via ``eval_project_bc``. Accepts ``[H, W]`` or ``[B, H, W]``."""
         if not self.eval_project_bc:
             return u_grid
         mask = self.problem.boundary_mask.to(u_grid.device)
