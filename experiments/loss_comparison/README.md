@@ -1,7 +1,10 @@
 # Experiment: loss comparison (supervised metrics vs Deep Ritz)
 
 Compare several training objectives on the same problem, all evaluated by the same
-finite-element relative-L2 error on the validation set:
+finite-element relative-L2 error on the validation set. **Eval enforces the known zero
+Dirichlet BC for every loss** (the prediction's boundary is projected to zero before scoring;
+see `Trainer.eval_project_bc`), so the comparison reflects the losses' *interior* behaviour
+and no curve is penalised for a boundary the BC already fixes.
 
 - **`data`** — supervised **MSE**, a flat average of squared nodal errors on the grid (no
   geometry / mass weighting).
@@ -9,12 +12,12 @@ finite-element relative-L2 error on the validation set:
   trains in *exactly* the metric used for evaluation.
 - **`data_h1`** — supervised **H¹₀ norm** loss `½‖u−u★‖²_{H¹₀} = ½ eᵀ A e` (stiffness-weighted;
   same as `data_l2` with `A` in place of `M`). The prediction is projected to zero on the
-  boundary first, so the error lies in `H₀¹` where the seminorm is a genuine norm (otherwise
-  the constant/boundary mode is unconstrained); the boundary is likewise projected at eval.
+  boundary inside the loss, so the error lies in `H₀¹` where the seminorm is a genuine norm.
+  *[plot flag `h1`]*
 - **`deepritz` (penalty BC)** — Deep Ritz energy, **label-free**, soft boundary penalty
-  (`λ_bc=100`), no preconditioner.  *[plot flag `dr_penalty`]*
-- **`deepritz` (hard BC)** — Deep Ritz energy, **label-free**, hard boundary projection, no
-  preconditioner. Mathematically the `t=0` preconditioned Deep Ritz.  *[flag `dr_t0`]*
+  (`λ_bc=100`) *during training*, no preconditioner.  *[plot flag `dr_penalty`]*
+- **`deepritz` (hard BC)** — Deep Ritz energy, **label-free**, hard boundary projection during
+  training, no preconditioner. Mathematically the `t=0` preconditioned Deep Ritz.  *[flag `dr_t0`]*
 - **preconditioned Deep Ritz, `t=1`** — Deep Ritz gradient preconditioned by the convex
   blend `P=(1−t)I+tA⁻¹` at `t=1` (`P=A⁻¹`).  *[flag `dr_t1`]*
 - **preconditioned least-squares (PLS), `t=1`** — `½‖P(Au−b)‖²` with the blend at `t=1`
@@ -24,9 +27,13 @@ finite-element relative-L2 error on the validation set:
 The data losses (`data`/`data_l2`/`data_h1`, plot flags `mse`/`l2`/`h1`) differ by their
 weighting matrix (identity / mass / stiffness). The questions: does training in the correct
 L² metric beat plain MSE? How does H¹₀ compare? How do the label-free Deep Ritz variants
-compare to the supervised losses — including hard vs penalty BC (hard BC = the `t=0`
-preconditioned Deep Ritz)? And where do the preconditioned physics losses (PLS / Deep Ritz)
-at `t=0.5, 1` land relative to all of these?
+compare to the supervised losses? And where do the preconditioned physics losses (PLS / Deep
+Ritz) at `t=0.5, 1` land relative to all of these?
+
+Because eval now enforces the BC uniformly, the `dr_penalty` vs `dr_t0` difference is purely
+the *training* boundary treatment (soft penalty vs hard projection), and `mse` is expected to
+track `dr_t1` closely — both are identity-metric supervised objectives toward (nearly) the
+same target, once the boundary artifact is removed from the score.
 
 ## Facts
 
@@ -38,7 +45,7 @@ at `t=0.5, 1` land relative to all of these?
 | Epochs / batch | `1000` / `32` |
 | FNO modes | `16×16` |
 | Output dir | `output/loss_comparison/` (git-ignored; files keyed by loss tag) |
-| Recorded | per-epoch validation relative-L2 (`stats.val_rel_l2_errors`) |
+| Recorded | per-epoch validation relative-L2 (`stats.val_rel_l2_errors`), BC enforced at eval |
 
 ## Run
 
