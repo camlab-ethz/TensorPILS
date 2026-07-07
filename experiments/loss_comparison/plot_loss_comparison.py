@@ -1,11 +1,23 @@
 """Overlay validation relative-L2 vs epoch for the loss-comparison experiment.
 
-Reads the per-run ``results/*.json`` written by ``Trainer._save_results_json`` and draws one
-curve per loss (identified by each run's ``loss_type``).
+Reads the per-run ``results/*.json`` written by ``Trainer._save_results_json``, classifies
+each run into one of the known curve keys, and draws one curve per key. Which curves are
+shown is configurable with per-curve flags (default: all present are shown):
+
+    mse       supervised MSE (--loss data)
+    l2        supervised true-L2 (--loss data_l2)
+    h1        supervised H^1_0 (--loss data_h1)
+    dr_penalty  Deep Ritz, penalty BC
+    dr_t0       Deep Ritz, hard BC  (== preconditioned Deep Ritz at t=0)
+    dr_t1       preconditioned Deep Ritz, blend t=1
+    pls_t1      preconditioned least-squares, blend t=1
+    pls_t0.5    preconditioned least-squares, blend t=0.5
 
 Usage (after pulling the output back from the cluster):
     python experiments/loss_comparison/plot_loss_comparison.py \
-        --results_dir output/loss_comparison/results
+        --results_dir output/loss_comparison/results            # all curves
+    python experiments/loss_comparison/plot_loss_comparison.py \
+        --results_dir output/loss_comparison/results --mse --h1 --pls_t1   # subset
 """
 
 import argparse
@@ -17,50 +29,84 @@ import matplotlib
 matplotlib.use("Agg")            # headless: render to file, no display needed
 import matplotlib.pyplot as plt
 
-DATA_LABELS = {
-    "data": "MSE (data)",
-    "data_l2": r"true $L^2$ (data)",
-    "data_h1": r"$H^1_0$ (data)",
+# curve keys, in stable legend / colour order
+KEYS = ["mse", "l2", "h1", "dr_penalty", "dr_t0", "dr_t1", "pls_t1", "pls_t0.5"]
+
+LABELS = {
+    "mse": "MSE (data)",
+    "l2": r"true $L^2$ (data)",
+    "h1": r"$H^1_0$ (data)",
+    "dr_penalty": "Deep Ritz (penalty BC)",
+    "dr_t0": "Deep Ritz (hard BC, $t=0$)",
+    "dr_t1": "Deep Ritz precond ($t=1$)",
+    "pls_t1": "PLS ($t=1$)",
+    "pls_t0.5": "PLS ($t=0.5$)",
 }
 
-# order for a stable legend / colour assignment
-ORDER = ["data", "data_l2", "data_h1", "deepritz-penalty", "deepritz-hard"]
+
+def _is(t, value):
+    return t == t and abs(t - value) < 1e-6      # NaN-safe float match
 
 
-def label_for(run):
-    lt = run.get("loss_type", "?")
+def classify(run):
+    """Map a run's metadata to a curve key (or None if it is not one of the known curves)."""
+    lt = run.get("loss_type")
+    t = run.get("precond_strength", float("nan"))
+    if lt == "data":
+        return "mse"
+    if lt == "data_l2":
+        return "l2"
+    if lt == "data_h1":
+        return "h1"
+    if lt == "pls":
+        if _is(t, 1.0):
+            return "pls_t1"
+        if _is(t, 0.5):
+            return "pls_t0.5"
+        return None
     if lt == "deepritz":
-        return f"Deep Ritz ({run.get('bc_mode', 'penalty')} BC)"
-    return DATA_LABELS.get(lt, lt)
-
-
-def sort_key(run):
-    lt = run.get("loss_type", "?")
-    key = f"deepritz-{run.get('bc_mode', 'penalty')}" if lt == "deepritz" else lt
-    return ORDER.index(key) if key in ORDER else len(ORDER)
+        if run.get("precondition"):
+            if _is(t, 1.0):
+                return "dr_t1"
+            if _is(t, 0.0):
+                return "dr_t0"
+            return None
+        return "dr_t0" if run.get("bc_mode") == "hard" else "dr_penalty"
+    return None
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__)
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--results_dir", default="output/loss_comparison/results")
     ap.add_argument("--out_dir", default=None,
                     help="Where to write the figure (default: alongside results_dir).")
+    for k in KEYS:
+        ap.add_argument(f"--{k}", dest=k, action="store_true", help=f"show the '{k}' curve")
     args = ap.parse_args()
 
-    runs = []
+    selected = [k for k in KEYS if getattr(args, k)] or KEYS   # no flags -> show all
+
+    by_key = {}
     for path in sorted(glob.glob(os.path.join(args.results_dir, "*.json"))):
         with open(path) as fh:
-            runs.append(json.load(fh))
-    if not runs:
-        raise SystemExit(f"No results found in {args.results_dir}")
-    print(f"Loaded {len(runs)} runs.")
+            run = json.load(fh)
+        key = classify(run)
+        if key is not None:
+            by_key[key] = run
+    if not by_key:
+        raise SystemExit(f"No recognized runs found in {args.results_dir}")
+    print(f"Found curves: {', '.join(k for k in KEYS if k in by_key)}")
+    print(f"Showing: {', '.join(k for k in selected if k in by_key)}")
 
     fig, ax = plt.subplots(figsize=(7, 5))
-    for r in sorted(runs, key=sort_key):
-        rl2 = r["stats"]["val_rel_l2_errors"]
+    for k in KEYS:
+        if k not in selected or k not in by_key:
+            continue
+        rl2 = by_key[k]["stats"]["val_rel_l2_errors"]
         if not rl2:
             continue
-        ax.plot(range(1, len(rl2) + 1), rl2, lw=1.6, label=label_for(r))
+        ax.plot(range(1, len(rl2) + 1), rl2, lw=1.6, label=LABELS[k])
     ax.set_xlabel("epoch")
     ax.set_ylabel("validation relative $L^2$")
     ax.set_yscale("log")

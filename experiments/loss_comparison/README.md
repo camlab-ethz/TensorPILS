@@ -12,22 +12,27 @@ finite-element relative-L2 error on the validation set:
   boundary first, so the error lies in `H₀¹` where the seminorm is a genuine norm (otherwise
   the constant/boundary mode is unconstrained); the boundary is likewise projected at eval.
 - **`deepritz` (penalty BC)** — Deep Ritz energy, **label-free**, soft boundary penalty
-  (`λ_bc=100`), no preconditioner.
+  (`λ_bc=100`), no preconditioner.  *[plot flag `dr_penalty`]*
 - **`deepritz` (hard BC)** — Deep Ritz energy, **label-free**, hard boundary projection, no
-  preconditioner.
+  preconditioner. Mathematically the `t=0` preconditioned Deep Ritz.  *[flag `dr_t0`]*
+- **preconditioned Deep Ritz, `t=1`** — Deep Ritz gradient preconditioned by the convex
+  blend `P=(1−t)I+tA⁻¹` at `t=1` (`P=A⁻¹`).  *[flag `dr_t1`]*
+- **preconditioned least-squares (PLS), `t=1`** — `½‖P(Au−b)‖²` with the blend at `t=1`
+  (`P=A⁻¹`, the supervised anchor).  *[flag `pls_t1`]*
+- **preconditioned least-squares (PLS), `t=0.5`** — same, blend at `t=0.5`.  *[flag `pls_t0.5`]*
 
-The questions: does training in the correct L² metric (`data_l2`) beat plain MSE (`data`)?
-How does the H¹₀ metric (`data_h1`) compare? And how do the label-free Deep Ritz variants
-compare to the supervised losses — including the effect of **hard vs penalty boundary
-conditions** (hard BC is the fair analogue of the `t=0` preconditioned Deep Ritz)? MSE, L²,
-and H¹₀ differ by their weighting matrix (identity, mass, stiffness), so they are genuinely
-different objectives.
+The data losses (`data`/`data_l2`/`data_h1`, plot flags `mse`/`l2`/`h1`) differ by their
+weighting matrix (identity / mass / stiffness). The questions: does training in the correct
+L² metric beat plain MSE? How does H¹₀ compare? How do the label-free Deep Ritz variants
+compare to the supervised losses — including hard vs penalty BC (hard BC = the `t=0`
+preconditioned Deep Ritz)? And where do the preconditioned physics losses (PLS / Deep Ritz)
+at `t=0.5, 1` land relative to all of these?
 
 ## Facts
 
 | | |
 |---|---|
-| Losses | `data`, `data_l2`, `data_h1`, `deepritz` (penalty BC), `deepritz --bc_mode hard` (all Deep Ritz without preconditioner) |
+| Losses (8) | `data`, `data_l2`, `data_h1`, `deepritz` (penalty), `deepritz --bc_mode hard`, `deepritz --precondition` blend `t=1`, `pls` blend `t=1`, `pls` blend `t=0.5` |
 | Dataset | 2D Poisson, `K=4`, grid `64²`, `n_train=1024`, `n_val=128`, `n_test=256`, `seed=42` |
 | Optimizer | `adam`, default cosine lr `1e-3 → 1e-4` (all defaults) |
 | Epochs / batch | `1000` / `32` |
@@ -44,19 +49,28 @@ python -m tensorpils.cli --loss data_l2 --n_train 1024 --n_val 128 --n_test 256 
     -k 4 --epochs 1000 --batch_size 32 --device cuda --output_dir output/loss_comparison
 ```
 
-All five on Euler (SLURM array over the losses; submit from `~/TensorPILS`):
+All eight on Euler (SLURM array over the configs; submit from `~/TensorPILS`):
 
 ```bash
 mkdir -p logs
-sbatch experiments/loss_comparison/sweep.sbatch
+sbatch experiments/loss_comparison/sweep.sbatch      # array 0-7
 ```
 
 ## Plot
 
 ```bash
+# all present curves:
 python experiments/loss_comparison/plot_loss_comparison.py \
     --results_dir output/loss_comparison/results
 ```
 
-Produces `output/loss_comparison/loss_comparison.png` — validation relative-L2 vs epoch,
-one curve per loss.
+By default every present curve is drawn. To declutter, pass per-curve flags — only the
+listed ones are shown:
+
+```bash
+python experiments/loss_comparison/plot_loss_comparison.py \
+    --results_dir output/loss_comparison/results --mse --h1 --pls_t1 --pls_t0.5
+```
+
+Flags: `--mse --l2 --h1 --dr_penalty --dr_t0 --dr_t1 --pls_t1 --pls_t0.5`.
+Produces `output/loss_comparison/loss_comparison.png` — validation relative-L2 vs epoch.
