@@ -1,0 +1,144 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{mathtools}
+\usepackage{hyperref}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\dt}{\Delta t}
+\newcommand{\uhat}{\hat u}
+\DeclareMathOperator{\diag}{diag}
+
+\title{Autoregressive Galerkin training for Allen--Cahn\\
+\large (how the FNO time-stepper and its loss are built)}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+The Allen--Cahn model trains a Fourier Neural Operator (FNO) as a \emph{one-step} time
+integrator $u^{n}\mapsto u^{n+1}$ on the FEM node grid. At train time the one-step map is
+applied \emph{autoregressively} over a short rollout, and the loss sums the fully-implicit
+backward-Euler weak-form residual over the rollout (optionally plus a supervised trajectory
+MSE against a Newton FEM reference). This note fixes the discrete equations and points to the
+code.
+\end{abstract}
+
+\section{Continuous problem and time discretisation}
+
+On $\Omega=(0,1)^2$ with zero Dirichlet boundary conditions,
+\begin{equation}
+  \partial_t u \;=\; a^2\,\Delta u \;+\; \epsilon^2\, u\,(1-u^2),
+  \label{eq:ac}
+\end{equation}
+i.e.\ diffusion with coefficient $a^2$ and a double-well reaction $\epsilon^2 u(1-u^2)
+= -\epsilon^2(u^3-u)$. Equation~\eqref{eq:ac} is the $L^2$ gradient flow of the
+Ginzburg--Landau energy $E(u)=\tfrac12 a^2\!\int|\nabla u|^2 + \epsilon^2\!\int \tfrac14(u^2-1)^2$.
+
+Let $A,M$ be the $Q_1$ stiffness and (consistent) mass matrices on the structured grid
+(the \emph{same} matrices as the Poisson/Wave operators), and let vectors be nodal values with
+the Dirichlet nodes held at $0$. A \textbf{fully-implicit backward-Euler} step with the reaction
+taken at the new level gives the weak-form nodal residual
+\begin{equation}
+  \boxed{\;
+  R(u^{n},u^{n+1}) \;=\; M\,\frac{u^{n+1}-u^{n}}{\dt}
+     \;+\; a^2 A\,u^{n+1}
+     \;-\; \epsilon^2 M\big(u^{n+1}-(u^{n+1})^3\big).
+  \;}
+  \label{eq:res}
+\end{equation}
+A time step is \emph{exact} when $R(u^n,u^{n+1})=0$. Both arguments are projected to zero on
+the boundary and $R$ is zeroed there too.
+
+\section{What the FNO learns}
+
+The network is a \textbf{single-step operator}
+\begin{equation}
+  \mathcal G_\theta:\ u^{n}\ \longmapsto\ u^{n+1},
+\end{equation}
+a grid$\to$grid map with \textbf{one} input channel and one output channel (Allen--Cahn is
+first order in time, so a single previous frame suffices; the wave equation, second order, uses
+two input channels). It does \emph{not} predict a whole trajectory in one shot: it advances time
+by exactly one $\dt$. Longer horizons are produced by \textbf{feeding the prediction back in}:
+\begin{equation}
+  \uhat^{\,1}=\mathcal G_\theta(u^0),\quad
+  \uhat^{\,2}=\mathcal G_\theta(\uhat^{\,1}),\ \dots,\quad
+  \uhat^{\,R}=\mathcal G_\theta(\uhat^{\,R-1}),
+\end{equation}
+seeded by the ground-truth initial frame $u^0$ and rolled forward $R=\texttt{rollout\_steps}$
+times. Every predicted frame is projected onto the zero Dirichlet boundary. Collect the rollout
+as the sequence
+\begin{equation}
+  s \;=\; \big(u^0,\ \uhat^{\,1},\ \dots,\ \uhat^{\,R}\big),\qquad \text{length } L=R+1 .
+\end{equation}
+
+\section{The loss}
+
+The training loss is a weighted sum of a label-free \emph{physics} term and an optional
+\emph{data} term,
+\begin{equation}
+  \mathcal L \;=\; \lambda_{\mathrm{gal}}\,\mathcal L_{\mathrm{gal}}(s)
+    \;+\; \lambda_{\mathrm{data}}\,\mathcal L_{\mathrm{data}}(s).
+\end{equation}
+
+\paragraph{Physics (Galerkin residual over the rollout).}
+Impose that \emph{each consecutive pair} in the rollout satisfies the discrete step
+\eqref{eq:res}, with a geometric discount $\gamma=\texttt{discount}$ that can down-weight the
+later (more error-prone) steps:
+\begin{equation}
+  \mathcal L_{\mathrm{gal}}(s)
+  \;=\; \frac{1}{\sum_{k=0}^{L-2}\gamma^{k}}
+        \sum_{k=0}^{L-2}\gamma^{k}\;
+        \big\langle R(s^{k},s^{k+1})^2\big\rangle,
+  \label{eq:lgal}
+\end{equation}
+where $\langle\cdot\rangle$ is the mean over batch and nodes. The $k=0$ term couples the seed to
+the first prediction, $u^0\!\to\!\uhat^{\,1}$; the $k\ge1$ terms couple prediction to prediction.
+No labels are used.
+
+\paragraph{Data (supervised trajectory MSE).}
+Against the reference frames $u^{1},\dots,u^{R}$ of the FEM trajectory (\S\ref{sec:ref}),
+\begin{equation}
+  \mathcal L_{\mathrm{data}}(s)\;=\;\big\langle (\uhat^{\,k}-u^{k})^2\big\rangle_{k=1,\dots,R}.
+\end{equation}
+
+\paragraph{Presets.} \texttt{--loss galerkin} sets $(\lambda_{\mathrm{gal}},\lambda_{\mathrm{data}})=(1,0)$
+(fully label-free); \texttt{--loss data} sets $(0,1)$ (fully supervised); the two weights can also
+be set explicitly to blend them.
+
+\section{The FEM reference (discrete target)}
+\label{sec:ref}
+
+Ground-truth trajectories are generated once at dataset-build time by solving
+$R(u^{n+1};u^{n})=0$ at each step with Newton's method on the interior DOFs, Jacobian
+\begin{equation}
+  J \;=\; \frac{M}{\dt} + a^2 A - \epsilon^2 M\,\diag\!\big(1-3\,(u^{n+1})^2\big),
+\end{equation}
+whose constant part $L=M/\dt+a^2A$ is factored once. Since the label-free loss
+\eqref{eq:lgal} drives the \emph{same} residual \eqref{eq:res} to zero, a perfectly trained
+physics model reproduces this FEM reference; evaluation reports the rollout MSE of the
+predicted frames against it.
+
+\section{Code pointers}
+
+\begin{itemize}\itemsep2pt
+  \item Discrete residual \eqref{eq:res}, energy, and Newton reference/Jacobian:
+        \texttt{tensorpils/physics.py} $\to$ \texttt{ACProblem.residual / energy / fem\_reference}.
+  \item One-step map $\mathcal G_\theta$ and the autoregressive rollout $s$:
+        \texttt{tensorpils/trainer.py} $\to$ \texttt{RolloutTrainer.\_rollout}
+        (\texttt{n\_seed\_frames}$=1$ for AC, set by \texttt{ACTrainer}).
+  \item Discounted residual sum \eqref{eq:lgal}:
+        \texttt{tensorpils/losses.py} $\to$ \texttt{ACGalerkinLoss.forward} / \texttt{build\_ac\_loss}.
+  \item Total loss ($\lambda_{\mathrm{gal}}\mathcal L_{\mathrm{gal}}+\lambda_{\mathrm{data}}\mathcal L_{\mathrm{data}}$)
+        and rollout-MSE eval:
+        \texttt{tensorpils/trainer.py} $\to$ \texttt{RolloutTrainer.train\_epoch / \_eval\_loader}.
+  \item $\lambda$ presets and CLI wiring:
+        \texttt{tensorpils/cli.py} $\to$ \texttt{run\_ac}.
+  \item Reference trajectories as data:
+        \texttt{tensorpils/data.py} $\to$ \texttt{ACDataset / create\_ac\_datasets}.
+\end{itemize}
+
+\end{document}
