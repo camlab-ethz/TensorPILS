@@ -1,4 +1,4 @@
-"""Geometric multigrid V-cycle preconditioner for the structured-grid Poisson stiffness.
+r"""Geometric multigrid V-cycle preconditioner for the structured-grid Poisson stiffness.
 
 Provides :math:`P \approx A^{-1}` as one V-cycle, used by the preconditioned losses
 (``pls`` and preconditioned Deep Ritz). The hierarchy coarsens the structured grid by
@@ -14,10 +14,10 @@ autograd flows through it: for the symmetric ``M`` produced by symmetric Jacobi 
 
 import numpy as np
 import torch
-import torch.nn as nn
 
 from tensormesh import LaplaceElementAssembler
-from .meshing import structured_quad_mesh
+from ..meshing import structured_quad_mesh
+from .base import Preconditioner
 
 __all__ = ["GeometricMultigrid"]
 
@@ -48,7 +48,7 @@ def _build_2d_prolongation(nx_f: int, ny_f: int, nx_c: int, ny_c: int) -> np.nda
     return np.kron(P_y, P_x)
 
 
-class GeometricMultigrid(nn.Module):
+class GeometricMultigrid(Preconditioner):
     """Geometric multigrid V-cycle preconditioner :math:`M \\approx A^{-1}`.
 
     Each coarser level uses ``((nx+1)//2, (ny+1)//2)`` (floored at 3). Prolongation is
@@ -142,6 +142,16 @@ class GeometricMultigrid(nn.Module):
     def v_cycle(self, r: torch.Tensor) -> torch.Tensor:
         """One V-cycle: ``e ≈ A⁻¹ r``. ``r``: ``[B, N_fine]`` with zero-boundary entries."""
         return self._v_cycle_rec(0, r)
+
+    # -------------------- Preconditioner interface --------------------
+    def forward(self, r: torch.Tensor) -> torch.Tensor:
+        """Apply the preconditioner (one V-cycle). Alias of :meth:`v_cycle`."""
+        return self.v_cycle(r)
+
+    def report(self) -> None:
+        print(f"[multigrid precond] n_levels={self.n_levels}  "
+              f"pre/post={self.pre_smooth}/{self.post_smooth}  omega={self.omega:.3f}  "
+              f"dims={self.dims}")
 
     def _v_cycle_rec(self, level: int, r: torch.Tensor) -> torch.Tensor:
         if level == self.n_levels - 1:

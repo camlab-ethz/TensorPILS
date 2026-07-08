@@ -14,7 +14,8 @@ from argparse import ArgumentParser
 import numpy as np
 import torch
 
-from .data import create_datasets, create_wave_datasets, create_ac_datasets
+from .data import (create_datasets, PoissonDataset,
+                   create_wave_datasets, create_ac_datasets)
 from .models import FNOModel
 from .trainer import PoissonTrainer, WaveTrainer, ACTrainer
 
@@ -24,9 +25,11 @@ def build_parser() -> ArgumentParser:
                                    "(data / Galerkin / Deep Ritz / PLS losses).")
     p.add_argument("--pde", choices=["poisson", "wave", "ac"], default="poisson",
                    help="Which PDE to train on. 'poisson' (static), 'wave' or 'ac' (time-dependent).")
-    p.add_argument("--loss", choices=["data", "galerkin", "deepritz", "pls"], default="galerkin",
-                   help="poisson: data/galerkin/deepritz/pls. wave/ac: data or galerkin "
-                        "(preset for the lambda_galerkin/lambda_data mix).")
+    p.add_argument("--loss",
+                   choices=["data", "data_l2", "data_h1", "galerkin", "deepritz", "pls"],
+                   default="galerkin",
+                   help="poisson: data/data_l2/data_h1/galerkin/deepritz/pls. wave/ac: data or "
+                        "galerkin (preset for the lambda_galerkin/lambda_data mix).")
     p.add_argument("--n_train", type=int, default=1024)
     p.add_argument("--n_val", type=int, default=128)
     p.add_argument("--n_test", type=int, default=256)
@@ -50,7 +53,18 @@ def build_parser() -> ArgumentParser:
                         "(M~A^-1). Flattens the A-norm dynamics toward the supervised/Newton "
                         "direction. Implies hard-BC.")
 
-    # -------- Multigrid preconditioner (PLS, or preconditioned Deep Ritz) --------
+    # -------- Preconditioner selection (PLS, or preconditioned Deep Ritz) --------
+    p.add_argument("--precond_kind", choices=["multigrid", "blend", "power"],
+                   default="multigrid",
+                   help="Preconditioner P≈A^-1. 'multigrid' (default): geometric-multigrid "
+                        "V-cycle (computational path). 'blend': convex mix (1-t)I+tA^-1. "
+                        "'power': fractional power A^-s. blend/power are exact spectral "
+                        "operators for illustrating the residual->supervised transition.")
+    p.add_argument("--precond_strength", type=float, default=1.0,
+                   help="Strength for blend (t) / power (s) in [0,1]. 0 -> P=I "
+                        "(no preconditioning); 1 -> P=A^-1 (supervised). Ignored for multigrid.")
+
+    # -------- Multigrid preconditioner settings (used when --precond_kind multigrid) --------
     p.add_argument("--mg_levels", type=int, default=4,
                    help="Number of GMG levels for PLS (incl. finest).")
     p.add_argument("--mg_pre_smooth", type=int, default=2,
@@ -92,6 +106,15 @@ def build_parser() -> ArgumentParser:
     p.add_argument("--optimizer", type=str, default="adam",
                    help="adam | adamw | sgd | <register-yours-in build_optimizer>")
 
+    # -------- Out-of-distribution generalization eval (poisson): relative-L2 each epoch on
+    #          datasets with different source complexity K (same grid). E.g. --ood_k 6 8. --------
+    p.add_argument("--ood_k", type=int, nargs="+", default=[],
+                   help="Extra K values to evaluate each epoch (out-of-distribution sources).")
+    p.add_argument("--ood_n_val", type=int, default=128,
+                   help="Number of samples per OOD eval dataset.")
+    p.add_argument("--ood_seed", type=int, default=123,
+                   help="Seed for the OOD eval datasets (fixed across runs for fair comparison).")
+
     # -------- FNO model --------
     p.add_argument("--hidden_dim", type=int, default=64)
     p.add_argument("--num_layers", type=int, default=5)
@@ -119,8 +142,11 @@ def run_poisson(args, device):
         print(f"bc_mode     : {args.bc_mode}"
               + ("  (interior-only MSE)" if args.bc_mode == "hard" else "  (full-grid MSE)"))
     if args.loss == "pls" or (args.loss == "deepritz" and args.precondition):
-        print(f"mg          : levels={args.mg_levels}  "
-              f"smooth={args.mg_pre_smooth}/{args.mg_post_smooth}  omega={args.mg_omega:.3f}")
+        if args.precond_kind == "multigrid":
+            print(f"precond     : multigrid  levels={args.mg_levels}  "
+                  f"smooth={args.mg_pre_smooth}/{args.mg_post_smooth}  omega={args.mg_omega:.3f}")
+        else:
+            print(f"precond     : {args.precond_kind}  strength={args.precond_strength:.3f}")
     _print_common(args, device)
 
     print("Building datasets...")
@@ -130,6 +156,16 @@ def run_poisson(args, device):
     )
     print(f"  train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}, "
           f"grid={train_ds.grid_size}\n")
+
+    # Out-of-distribution eval datasets (higher source complexity K, same grid).
+    eval_datasets = {
+        f"K{k}": PoissonDataset(num_samples=args.ood_n_val, K=k, seed=args.ood_seed,
+                                grid_resolution=args.grid_resolution)
+        for k in args.ood_k
+    }
+    if eval_datasets:
+        print(f"  OOD eval sets: {', '.join(eval_datasets)} "
+              f"(n={args.ood_n_val} each, seed={args.ood_seed})\n")
 
     model = _build_model(args, in_channels=1)
     trainer = PoissonTrainer(
@@ -141,8 +177,10 @@ def run_poisson(args, device):
         batch_size=args.batch_size, epochs=args.epochs,
         device=device, output_dir=args.output_dir,
         lambda_bc=args.lambda_bc, bc_mode=args.bc_mode, precondition=args.precondition,
+        precond_kind=args.precond_kind, precond_strength=args.precond_strength,
         mg_levels=args.mg_levels, mg_pre_smooth=args.mg_pre_smooth,
         mg_post_smooth=args.mg_post_smooth, mg_omega=args.mg_omega,
+        eval_datasets=eval_datasets,
     )
     _run(trainer, train_ds, test_ds, args)
 
@@ -265,8 +303,7 @@ def _run(trainer, train_ds, test_ds, args):
     if args.eval_only:
         if not trainer.load_checkpoint(args.checkpoint):
             return
-        test_err = trainer.test()
-        print(f"Test MSE: {test_err:.2e}")
+        _report_test(trainer.test())
         for idx in args.sample_idx:
             if idx < len(train_ds):
                 trainer.visualize_sample(train_ds, "train", idx)
@@ -274,12 +311,21 @@ def _run(trainer, train_ds, test_ds, args):
                 trainer.visualize_sample(test_ds, "test", idx)
         trainer.compute_error_distribution()
     else:
-        test_err = trainer.train()
+        result = trainer.train()
         print("\n" + "=" * 60)
         print("Done.")
-        print(f"  best val MSE : {trainer.stats.best_val_error:.2e}")
-        print(f"  final test MSE: {test_err:.2e}")
+        print(f"  best val       : {trainer.stats.best_val_error:.2e}")
+        _report_test(result)
         print("=" * 60)
+
+
+def _report_test(result):
+    """Poisson trainers return (mse, l2, rel_l2); rollout trainers return a single rollout MSE."""
+    if isinstance(result, tuple):
+        mse, l2, rl2 = result
+        print(f"  final test     : MSE {mse:.2e}  FEM-L2 {l2:.2e}  rel-L2 {rl2:.2%}")
+    else:
+        print(f"  final test     : rollout MSE {result:.2e}")
 
 
 def main():

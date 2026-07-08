@@ -23,7 +23,7 @@ from tqdm import tqdm
 
 from .meshing import node_to_grid, grid_to_node
 from .physics import apply_zero_boundary
-from .multigrid import GeometricMultigrid
+from .preconditioners import Preconditioner, GeometricMultigrid, build_preconditioner
 from .losses import build_loss, build_wave_loss, build_ac_loss
 from .optim import build_optimizer
 from . import viz
@@ -36,9 +36,18 @@ __all__ = ["BaseTrainer", "Trainer", "PoissonTrainer", "RolloutTrainer",
 class TrainingStats:
     train_losses: List[float] = field(default_factory=list)
     val_errors: List[float] = field(default_factory=list)
+    val_l2_errors: List[float] = field(default_factory=list)
+    val_rel_l2_errors: List[float] = field(default_factory=list)
     learning_rates: List[float] = field(default_factory=list)
+    # Per-epoch relative-L2 on extra (out-of-distribution) eval sets, keyed by label.
+    ood_rel_l2: dict = field(default_factory=dict)
     best_epoch: int = 0
     best_val_error: float = float("inf")
+    # Preconditioner identity + conditioning (for the sweep / collapse plot).
+    precond_kind: str = ""
+    precond_strength: float = float("nan")
+    precond_cond_pa: float = float("nan")
+    precond_cond_h: float = float("nan")
 
 
 class BaseTrainer:
@@ -197,10 +206,13 @@ class PoissonTrainer(BaseTrainer):
         lambda_bc: float = 100.0,
         bc_mode: str = "penalty",
         precondition: bool = False,
+        precond_kind: str = "multigrid",
+        precond_strength: float = 1.0,
         mg_levels: int = 4,
         mg_pre_smooth: int = 2,
         mg_post_smooth: int = 2,
         mg_omega: float = 2.0 / 3.0,
+        eval_datasets: Optional[dict] = None,
     ):
         super().__init__(model, loss_type, train_dataset.K, optimizer_name,
                          lr, lr_min, weight_decay, epochs, device, output_dir)
@@ -219,30 +231,51 @@ class PoissonTrainer(BaseTrainer):
         self.test_loader = DataLoader(test_dataset, batch_size=batch_size,
                                       shuffle=False, collate_fn=self._collate)
 
+        # Extra (out-of-distribution) eval loaders, scored each epoch. Same grid as the
+        # training set, so self.problem.M is the correct metric for their relative-L2.
+        self.eval_loaders = {
+            label: DataLoader(ds, batch_size=batch_size, shuffle=False,
+                              collate_fn=self._collate)
+            for label, ds in (eval_datasets or {}).items()
+        }
+
         self.bc_mode = bc_mode
         self.precondition = precondition
 
-        # Multigrid preconditioner for PLS or preconditioned Deep Ritz.
-        self.mg: Optional[GeometricMultigrid] = None
+        # Preconditioner for PLS or preconditioned Deep Ritz (multigrid or spectral).
+        self.precond: Optional[Preconditioner] = None
+        self.precond_kind = precond_kind
+        self.precond_strength = precond_strength
         self.mg_settings = (mg_levels, mg_pre_smooth, mg_post_smooth, mg_omega)
-        needs_mg = (loss_type == "pls") or (loss_type == "deepritz" and precondition)
-        if needs_mg:
-            nx, ny = self.grid_size
-            self.mg = GeometricMultigrid(
-                nx_fine=nx, ny_fine=ny, n_levels=mg_levels,
-                pre_smooth=mg_pre_smooth, post_smooth=mg_post_smooth, omega=mg_omega,
-            ).to(device)
+        needs_precond = (loss_type == "pls") or (loss_type == "deepritz" and precondition)
+        if needs_precond:
+            self.precond = build_preconditioner(
+                kind=precond_kind, problem=self.problem, grid_size=self.grid_size,
+                mg_levels=mg_levels, mg_pre_smooth=mg_pre_smooth,
+                mg_post_smooth=mg_post_smooth, mg_omega=mg_omega,
+                strength=precond_strength, device=device,
+            )
 
-        # Project boundary to 0 at eval time whenever it was unconstrained during training.
-        self.eval_project_bc = (
-            (loss_type == "deepritz" and bc_mode == "hard")
-            or (loss_type == "deepritz" and precondition)
-            or (loss_type == "data" and bc_mode == "hard")
-        )
+        # The homogeneous Dirichlet BC (u=0 on the boundary) is known data, so we always
+        # enforce it at eval by projecting the prediction's boundary to zero — for every
+        # loss, so the reported error never counts a boundary the BC already fixes.
+        # (Assumes homogeneous BC; a non-zero Dirichlet problem would project to the known
+        # boundary values instead.)
+        self.eval_project_bc = True
 
         self.criterion = build_loss(loss_type, self.problem, lambda_bc,
-                                    bc_mode=bc_mode, mg=self.mg,
+                                    bc_mode=bc_mode, precond=self.precond,
                                     precondition=precondition)
+
+        # OOD histories + preconditioner diagnostics on the shared stats object
+        # (BaseTrainer.__init__ already built optimizer/scheduler/stats/best_state).
+        self.stats.ood_rel_l2 = {label: [] for label in self.eval_loaders}
+        if self.precond is not None:
+            self.stats.precond_kind = self.precond_kind
+            self.stats.precond_strength = self.precond_strength
+            self.stats.precond_cond_pa = getattr(self.precond, "cond_PA", float("nan"))
+            self.stats.precond_cond_h = getattr(self.precond, "cond_H", float("nan"))
+        os.makedirs(f"{self.output_dir}/results", exist_ok=True)
 
     @staticmethod
     def _collate(batch):
@@ -279,18 +312,27 @@ class PoissonTrainer(BaseTrainer):
         return total / nb
 
     @torch.no_grad()
-    def _eval_loader(self, loader) -> float:
+    def _eval_loader(self, loader):
         self.model.eval()
-        total_mse, n = 0.0, 0
+        total_mse, total_l2, total_rel_l2, n = 0.0, 0.0, 0.0, 0
+        nx, ny = self.grid_size
         for batch_data, us in loader:
-            fs_grid, _, _, _ = batch_data
+            fs_grid, _, _, us_node = batch_data
             fs_grid, us = fs_grid.to(self.device), us.to(self.device)
+            us_node = us_node.to(self.device)
             u_pred = self.model(fs_grid).squeeze(1)                      # [B, H, W]
             u_pred = self._apply_eval_bc(u_pred)
             mse = ((u_pred - us) ** 2).mean().item()
             total_mse += mse * fs_grid.shape[0]
+            e = grid_to_node(u_pred, nx, ny) - us_node                  # [B, N]
+            Me = self.problem._spmm(self.problem.M, e)                   # [B, N]
+            l2_per_sample = (e * Me).sum(dim=1).sqrt()                   # [B]
+            total_l2 += l2_per_sample.sum().item()
+            Mu = self.problem._spmm(self.problem.M, us_node)             # [B, N]
+            u_norm = (us_node * Mu).sum(dim=1).sqrt()                    # [B]
+            total_rel_l2 += (l2_per_sample / u_norm.clamp(min=1e-12)).sum().item()
             n += fs_grid.shape[0]
-        return total_mse / n
+        return total_mse / n, total_l2 / n, total_rel_l2 / n
 
     def validate(self):
         return self._eval_loader(self.val_loader)
@@ -298,12 +340,12 @@ class PoissonTrainer(BaseTrainer):
     def test(self):
         return self._eval_loader(self.test_loader)
 
-    # -------------------- multigrid sanity check (PLS only) --------------------
+    # -------------------- multigrid sanity check (GMG only) --------------------
     @torch.no_grad()
     def _check_mg(self, n_samples: int = 4, n_cycles: int = 3):
         """Apply V-cycles to random zero-boundary residuals and report ‖r−A V(r)‖/‖r‖.
         A healthy GMG reduces the residual by ~0.05–0.2 per cycle (mesh-independent)."""
-        if self.mg is None:
+        if not isinstance(self.precond, GeometricMultigrid):
             return
         nx, ny = self.grid_size
         N = nx * ny
@@ -312,16 +354,17 @@ class PoissonTrainer(BaseTrainer):
         torch.manual_seed(0)
         r0 = torch.randn(n_samples, N, device=self.device)
         r0 = apply_zero_boundary(r0, mask)
-        A_sp = self.mg._A_sparse(0).to(self.device)
+        A_sp = self.precond._A_sparse(0).to(self.device)
 
-        print(f"\n[MG sanity] n_levels={self.mg.n_levels}, "
-              f"pre/post={self.mg.pre_smooth}/{self.mg.post_smooth}, omega={self.mg.omega:.3f}")
-        print(f"[MG sanity] level dims: {self.mg.dims}")
+        print(f"\n[MG sanity] n_levels={self.precond.n_levels}, "
+              f"pre/post={self.precond.pre_smooth}/{self.precond.post_smooth}, "
+              f"omega={self.precond.omega:.3f}")
+        print(f"[MG sanity] level dims: {self.precond.dims}")
         r = r0.clone()
         e_total = torch.zeros_like(r)
         norms = [r.norm(dim=1).mean().item()]
         for _ in range(n_cycles):
-            e_total = e_total + self.mg.v_cycle(r)
+            e_total = e_total + self.precond.v_cycle(r)
             Ae = torch.sparse.mm(A_sp, e_total.T).T
             r = r0 - Ae
             norms.append(r.norm(dim=1).mean().item())
@@ -330,19 +373,95 @@ class PoissonTrainer(BaseTrainer):
                   f"(reduction this cycle: {norms[k+1]/max(norms[k],1e-30):.3e})")
         print()
 
-    def _before_train(self):
-        if self.mg is not None:
+    # -------------------- training loop --------------------
+    def train(self) -> float:
+        print(f"Training FNO with {self.loss_type} loss")
+        print(f"  Train: {len(self.train_dataset)}  Val: {len(self.val_dataset)}  "
+              f"Test: {len(self.test_dataset)}  Device: {self.device}\n")
+        if self.precond is not None:
+            self.precond.report()
             self._check_mg()
 
-    # -------------------- checkpointing / viz --------------------
+        with tqdm(range(self.epochs), desc="Training", unit="epoch", colour="green") as bar:
+            for epoch in bar:
+                tr = self.train_epoch()
+                vl, l2, rl2 = self.validate()
+                self.scheduler.step()
+                lr = self.scheduler.get_last_lr()[0]
+
+                self.stats.train_losses.append(tr)
+                self.stats.val_errors.append(vl)
+                self.stats.val_l2_errors.append(l2)
+                self.stats.val_rel_l2_errors.append(rl2)
+                self.stats.learning_rates.append(lr)
+
+                # Out-of-distribution generalization: relative-L2 on each extra eval set.
+                for label, loader in self.eval_loaders.items():
+                    self.stats.ood_rel_l2[label].append(self._eval_loader(loader)[2])
+
+                if vl < self.stats.best_val_error:
+                    self.stats.best_val_error = vl
+                    self.stats.best_epoch = epoch
+                    self.best_state = deepcopy(self.model.state_dict())
+                    self._save_checkpoint(epoch, vl)
+
+                bar.set_postfix(loss=f"{tr:.2e}", val=f"{vl:.2e}",
+                                l2=f"{l2:.2e}", rl2=f"{rl2:.2%}",
+                                best=f"{self.stats.best_val_error:.2e}", lr=f"{lr:.2e}")
+
+        if self.best_state is not None:
+            self.model.load_state_dict(self.best_state, strict=False)
+            print(f"\nRestored best model from epoch {self.stats.best_epoch} "
+                  f"(val={self.stats.best_val_error:.2e})")
+
+        test_mse, test_l2, test_rl2 = self.test()
+        print(f"Test MSE: {test_mse:.2e}  Test FEM-L2: {test_l2:.2e}  Test rel-L2: {test_rl2:.2%}")
+        self.plot_loss_curve()
+        self.visualize_sample(self.train_dataset, "train", 0)
+        self.visualize_sample(self.test_dataset, "test", 0)
+        self.compute_error_distribution()
+        self._save_results_json((test_mse, test_l2, test_rl2))
+        return test_mse, test_l2, test_rl2
+
+    def _save_results_json(self, test_metrics) -> None:
+        """Dump full stats + config to ``results/{prefix}.json`` for cross-run aggregation."""
+        import json
+        from dataclasses import asdict
+
+        test_mse, test_l2, test_rl2 = test_metrics
+        record = {
+            "prefix": self._file_prefix(),
+            "loss_type": self.loss_type,
+            "bc_mode": self.bc_mode,
+            "precondition": self.precondition,
+            "precond_kind": self.precond_kind,
+            "precond_strength": self.precond_strength,
+            "K": self.K,
+            "n_train": len(self.train_dataset),
+            "epochs": self.epochs,
+            "test_mse": test_mse, "test_l2": test_l2, "test_rl2": test_rl2,
+            "stats": asdict(self.stats),
+        }
+        path = f"{self.output_dir}/results/{self._file_prefix()}.json"
+        with open(path, "w") as fh:
+            json.dump(record, fh)
+        print(f"Results -> {path}")
+
+    # -------------------- checkpointing --------------------
+    def _precond_tag(self) -> str:
+        """Short tag describing the active preconditioner (for run file names)."""
+        if self.precond_kind == "multigrid":
+            L, pre, post, _ = self.mg_settings
+            return f"mg-L{L}-s{pre}{post}"
+        return f"{self.precond_kind}-{self.precond_strength:.2f}"
+
     def _file_prefix(self) -> str:
         if self.loss_type == "deepritz":
-            tag = "_precond" if self.precondition else f"_bc-{self.bc_mode}"
+            tag = f"_precond-{self._precond_tag()}" if self.precondition else f"_bc-{self.bc_mode}"
         elif self.loss_type == "data":
             tag = "_bc-hard" if self.bc_mode == "hard" else ""
         elif self.loss_type == "pls":
-            L, pre, post, _ = self.mg_settings
-            tag = f"_mg-L{L}-s{pre}{post}"
+            tag = f"_{self._precond_tag()}"
         else:
             tag = ""
         return (f"fno_{self.loss_type}{tag}_K{self.K}_"

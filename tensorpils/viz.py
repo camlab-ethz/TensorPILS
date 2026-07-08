@@ -15,8 +15,11 @@ __all__ = ["plot_loss_curve", "visualize_sample", "compute_error_distribution",
 
 
 def plot_loss_curve(stats, loss_type: str, K: int, save_path: str):
-    """Two-panel figure: training loss (log / symlog) and validation MSE (log)."""
-    fig, axes = plt.subplots(2, 1, figsize=(10, 8))
+    """Three-panel figure: training loss, validation MSE, and validation FEM-L2."""
+    has_l2 = bool(getattr(stats, "val_l2_errors", []))
+    has_rel_l2 = bool(getattr(stats, "val_rel_l2_errors", []))
+    n_panels = 2 + has_l2 + has_rel_l2
+    fig, axes = plt.subplots(n_panels, 1, figsize=(10, 4 * n_panels))
     epochs = range(len(stats.train_losses))
 
     axes[0].plot(epochs, stats.train_losses, label="Train Loss", linewidth=2)
@@ -37,8 +40,26 @@ def plot_loss_curve(stats, loss_type: str, K: int, save_path: str):
                     label=f"best val={stats.best_val_error:.2e}")
     axes[1].set_yscale("log")
     axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("MSE")
-    axes[1].set_title("Validation Error")
+    axes[1].set_title("Validation MSE")
     axes[1].legend(); axes[1].grid(alpha=0.4)
+
+    panel = 2
+    if has_l2:
+        axes[panel].plot(epochs, stats.val_l2_errors, label="Val FEM-L2", linewidth=2, color="purple")
+        axes[panel].axvline(stats.best_epoch, color="r", linestyle="--")
+        axes[panel].set_yscale("log")
+        axes[panel].set_xlabel("Epoch"); axes[panel].set_ylabel("FEM-L2")
+        axes[panel].set_title("Validation FEM-L2  (√eᵀMe)")
+        axes[panel].legend(); axes[panel].grid(alpha=0.4)
+        panel += 1
+    if has_rel_l2:
+        pct = [v * 100 for v in stats.val_rel_l2_errors]
+        axes[panel].plot(epochs, pct, label="Val rel-L2 (%)", linewidth=2, color="teal")
+        axes[panel].axvline(stats.best_epoch, color="r", linestyle="--")
+        axes[panel].set_yscale("log")
+        axes[panel].set_xlabel("Epoch"); axes[panel].set_ylabel("rel-L2 (%)")
+        axes[panel].set_title("Validation relative FEM-L2  (√eᵀMe / √uᵀMu)")
+        axes[panel].legend(); axes[panel].grid(alpha=0.4)
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=200, bbox_inches="tight"); plt.close()
