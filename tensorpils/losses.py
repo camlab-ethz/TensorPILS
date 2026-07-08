@@ -43,8 +43,8 @@ class DataLoss(nn.Module):
     def forward(self, u_pred: torch.Tensor, u_true: torch.Tensor,
                 f_node: torch.Tensor = None) -> torch.Tensor:
         if self.bc_mode == "hard":
-            return ((u_pred[..., 1:-1, 1:-1] - u_true[..., 1:-1, 1:-1]) ** 2).mean()
-        return ((u_pred - u_true) ** 2).mean()
+            return ((u_pred[..., 1:-1, 1:-1] - u_true[..., 1:-1, 1:-1]) ** 2).mean(dim=0).sum()
+        return ((u_pred - u_true) ** 2).mean(dim=0).sum()
 
 
 class DataL2Loss(nn.Module):
@@ -89,7 +89,7 @@ class DataH1Loss(nn.Module):
 
 
 class GalerkinLoss(nn.Module):
-    """``‖A u − b‖²`` on node values ``[B, N]`` (no labels needed)."""
+    """``0.5 ‖A u − b‖²`` on node values ``[B, N]`` (no labels needed)."""
 
     def __init__(self, problem: PoissonProblem):
         super().__init__()
@@ -98,7 +98,7 @@ class GalerkinLoss(nn.Module):
     def forward(self, u_pred_node: torch.Tensor, f_node: torch.Tensor,
                 u_true_node: torch.Tensor = None) -> torch.Tensor:
         residual = self.problem.residual(u_pred_node, f_node)
-        return (residual ** 2).mean()
+        return 0.5 * (residual ** 2).sum(dim=-1).mean()
 
 
 class DeepRitzLoss(nn.Module):
@@ -152,7 +152,7 @@ class PreconditionedLSLoss(nn.Module):
         if r.dim() == 1:
             r = r.unsqueeze(0)
         Pr = self.precond(r)                    # ≈ A⁻¹ r
-        return 0.5 * (Pr * Pr).mean()
+        return 0.5 * (Pr * Pr).sum(dim=-1).mean()    # changed to sum, not mean.
 
 
 class PreconditionedDeepRitzLoss(nn.Module):
