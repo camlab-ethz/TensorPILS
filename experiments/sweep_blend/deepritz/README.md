@@ -13,12 +13,15 @@ metric, where the relevant conditioning is `κ(PA)` (running from `κ(A)` at `t=
 **morally correct** conditioning per case: `κ(PA)` for this Deep Ritz surrogate (vs `κ(H)=κ(PA)²`
 for the squared PLS loss). So the collapse x-axis here is `κ(PA)`, not the squared `κ(H)`.
 
+A **multigrid (GMG)** run in default setup is included as a practical reference (dashed black
+on the overlay; omitted from the collapse as it has no single closed-form `κ`).
+
 ## Facts
 
 | | |
 |---|---|
 | Loss | `deepritz` with `--precondition` (surrogate `∂L/∂u = P r`, hard BC) |
-| Preconditioner | `blend`, `t ∈ {0.0, 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.99, 1.0}` |
+| Preconditioner | `blend`, `t ∈ {0.0, 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.99, 1.0}` + `multigrid` reference |
 | Dataset | 2D Poisson, `K=4`, grid `64²`, `n_train=1024`, `n_val=128`, `n_test=256`, `seed=42` |
 | Optimizer | `adam`, default cosine lr `1e-3 → 1e-4` |
 | Epochs / batch | `500` / `32` |
@@ -35,19 +38,22 @@ python -m tensorpils.cli --loss deepritz --precondition --precond_kind blend \
     --epochs 500 --batch_size 32 --device cuda --output_dir output/sweep_blend/deepritz
 ```
 
-Full sweep on Euler (SLURM array over all 10 strengths; submit from `~/TensorPILS`):
+Full sweep on Euler (SLURM array `0-10`: 10 strengths + multigrid; submit from `~/TensorPILS`):
 
 ```bash
 mkdir -p logs
 sbatch experiments/sweep_blend/deepritz/sweep.sbatch
+# or, to add only the multigrid reference to an existing sweep:
+sbatch --array=10 experiments/sweep_blend/deepritz/sweep.sbatch
 ```
 
 ## Plot
 
 ```bash
 python experiments/sweep_blend/plot_sweep.py --results_dir output/sweep_blend/deepritz/results
+# optional: --smooth (centered moving average) / --no-annotate
 ```
 
 Produces, in `output/sweep_blend/deepritz/`:
-- `sweep_overlay.png` — validation relative-L2 vs epoch, one curve per `t`.
-- `sweep_collapse.png` — best relative-L2 vs conditioning `κ(H)`.
+- `sweep_overlay.png` — validation relative-L2 vs epoch, one curve per `t` (+ dashed GMG reference).
+- `sweep_collapse.png` — best relative-L2 vs conditioning `κ(PA)` (GMG omitted).
