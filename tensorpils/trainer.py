@@ -617,6 +617,38 @@ class RolloutTrainer(BaseTrainer):
     def test(self):
         return self._eval_loader(self.test_loader)
 
+    def train(self) -> float:
+        """Run the base training loop, then persist per-epoch stats + config to a results JSON
+        (the plottable record; the ``.pth`` checkpoint also holds stats but is excluded from
+        cross-run sync)."""
+        result = super().train()
+        self._save_results_json()
+        return result
+
+    def _save_results_json(self) -> None:
+        """Dump stats + config to ``results/{prefix}.json`` for cross-run aggregation. Metric is
+        the rollout MSE (mean over batch, rollout steps, and grid) recorded per epoch in
+        ``stats.val_errors``."""
+        import json
+        from dataclasses import asdict
+        record = {
+            "prefix": self._file_prefix(),
+            "loss_type": self.loss_type,
+            "ac_loss_form": getattr(self, "ac_loss_form", None),
+            "ac_integrator": getattr(self, "ac_integrator", None),
+            "lambda_galerkin": self.lambda_galerkin,
+            "lambda_data": self.lambda_data,
+            "dt": self.dt, "n_steps": self.n_steps, "rollout_steps": self.rollout_steps,
+            "K": self.K, "n_train": len(self.train_dataset), "epochs": self.epochs,
+            "best_val_mse": self.stats.best_val_error, "best_epoch": self.stats.best_epoch,
+            "stats": asdict(self.stats),
+        }
+        os.makedirs(f"{self.output_dir}/results", exist_ok=True)
+        path = f"{self.output_dir}/results/{self._file_prefix()}.json"
+        with open(path, "w") as fh:
+            json.dump(record, fh)
+        print(f"Results -> {path}")
+
     # -------------------- viz --------------------
     def visualize_sample(self, dataset, split: str, sample_idx: int = 0):
         suffix = "" if sample_idx == 0 else f"_sample{sample_idx}"

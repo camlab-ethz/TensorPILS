@@ -109,6 +109,11 @@ def build_parser() -> ArgumentParser:
                    help="Form of the AC label-free physics loss: 'galerkin' (½‖R‖² least-squares "
                         "residual) or 'min_movement' (convex–concave JKO objective J; Deep-Ritz "
                         "analogue). Default: galerkin.")
+    p.add_argument("--ac_loss_integrator", choices=["convex_concave", "backward_euler"],
+                   default=None,
+                   help="Override the residual integrator used by the Galerkin physics loss, "
+                        "decoupled from the reference data (--ac_integrator). Default: follow the "
+                        "data. Lets a BE-residual loss train on convex_concave reference data.")
 
     # -------- Optimizer (the place to plug in Shampoo via build_optimizer) --------
     p.add_argument("--optimizer", type=str, default="adam",
@@ -252,7 +257,8 @@ def run_ac(args, device):
     print(f"loss        : {args.loss}  (lambda_galerkin={lg}, lambda_data={ld})")
     print(f"allen-cahn  : a={args.ac_a}  eps={args.ac_eps}  r={args.ac_r}  dt={args.dt}  "
           f"n_steps={args.n_steps}  rollout={args.rollout_steps}")
-    print(f"integrator  : {args.ac_integrator}  (reference data + physics-loss residual)")
+    loss_integ = args.ac_loss_integrator or args.ac_integrator
+    print(f"integrator  : data={args.ac_integrator}  loss-residual={loss_integ}")
     print(f"phys loss   : {args.ac_loss_form}  "
           f"({'least-squares residual ½‖R‖²' if args.ac_loss_form == 'galerkin' else 'minimizing-movement objective J'})")
     print(f"reference   : FEM {args.ac_integrator} + Newton (build cost ~ {total}x{args.n_steps} steps; "
@@ -281,7 +287,7 @@ def run_ac(args, device):
         device=device, output_dir=args.output_dir,
         lambda_galerkin=lg, lambda_data=ld,
         rollout_steps=args.rollout_steps, discount_factor=args.discount_factor,
-        ac_loss_form=args.ac_loss_form,
+        ac_loss_form=args.ac_loss_form, ac_integrator=args.ac_loss_integrator,
     )
     _run(trainer, train_ds, test_ds, args)
 
