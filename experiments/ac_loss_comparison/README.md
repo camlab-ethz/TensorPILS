@@ -27,7 +27,7 @@ reference — an intentional test of whether the physics-loss integrator matters
 | Grid / horizon | `64²`, `dt=0.0025`, `n_steps=rollout_steps=10` (`T=0.025`, ≈2–3 decay times) |
 | Dataset | `n_train=1024`, `n_val=128`, `n_test=256`, `seed=42` (identical across all arms) |
 | Optimizer / epochs | `adam`, default cosine lr `1e-3→1e-4`, `1000` epochs, batch `32` |
-| Metric | per-epoch **validation rollout MSE** (mean over batch, rollout steps, and grid) |
+| Metrics | per-epoch grid rollout **MSE**; **space-time** and **final-time** relative FEM-`L²`; and the per-timestep relative-`L²` series (`stats.val_rel_l2_steps`) |
 | Output dir | `output/ac_loss_comparison/` (git-ignored) |
 
 Each arm regenerates the reference dataset from `seed=42` (deterministic ⇒ identical data); the
@@ -36,8 +36,7 @@ Each arm regenerates the reference dataset from `seed=42` (deterministic ⇒ ide
 
 > Caveat: at `eps=2` and this IC amplitude (~0.15) the dynamics are diffusion-dominated (the
 > double-well barely engages), so the physics losses may land close together. Larger IC amplitude
-> or `eps` would sharpen the differences — a follow-up. A mass-weighted (true `L²`) metric is also
-> a planned addition.
+> or `eps` would sharpen the differences — a follow-up.
 
 ## Run (Euler)
 
@@ -51,8 +50,11 @@ squeue --me
 
 ```bash
 python experiments/ac_loss_comparison/plot_ac_loss_comparison.py \
-    --results_dir output/ac_loss_comparison/results     # optional: --smooth
+    --results_dir output/ac_loss_comparison/results     # --metric {auto,mse,st_rel_l2,final_rel_l2}, --smooth
 ```
 
-Produces `output/ac_loss_comparison/ac_loss_comparison.png` — validation rollout-MSE vs epoch,
-one curve per training loss.
+Produces (in `output/ac_loss_comparison/`):
+- `ac_loss_comparison.png` — chosen metric vs epoch, one curve per training loss (`--metric auto`
+  prefers space-time relative `L²`; falls back to MSE for runs predating the `L²` metric).
+- `ac_error_growth.png` — test-set relative `L²` vs rollout step (best model): how error
+  accumulates along the rollout, one curve per loss.

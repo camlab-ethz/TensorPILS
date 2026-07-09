@@ -39,6 +39,12 @@ class TrainingStats:
     val_l2_errors: List[float] = field(default_factory=list)
     val_rel_l2_errors: List[float] = field(default_factory=list)
     learning_rates: List[float] = field(default_factory=list)
+    # Rollout (time-dependent) FEM-L2 diagnostics, per epoch. ``val_rel_l2_steps`` is the
+    # per-timestep relative L2 series over the rollout (len = rollout_steps); the two scalars are
+    # the space-time aggregate and the final-time value derived from it.
+    val_rel_l2_steps: List[List[float]] = field(default_factory=list)
+    val_st_rel_l2: List[float] = field(default_factory=list)
+    val_final_rel_l2: List[float] = field(default_factory=list)
     # Per-epoch relative-L2 on extra (out-of-distribution) eval sets, keyed by label.
     ood_rel_l2: dict = field(default_factory=dict)
     best_epoch: int = 0
@@ -597,25 +603,48 @@ class RolloutTrainer(BaseTrainer):
         return total / nb
 
     @torch.no_grad()
-    def _eval_loader(self, loader) -> float:
-        """Rollout MSE vs the reference trajectory over the ``rollout_steps`` window."""
+    def _eval_full(self, loader):
+        """One rollout pass over ``loader`` returning ``(mse, rel_l2_steps, st_rel_l2)``:
+
+        * ``mse``          — grid rollout MSE (mean over batch, rollout steps, grid);
+        * ``rel_l2_steps`` — per-timestep **relative FEM-L2** over the rollout window, a list of
+          ``rollout_steps`` values ``√(Σ‖ê^k−u^k‖²_M / Σ‖u^k‖²_M)`` (dataset-level, so robust to
+          late frames whose reference norm decays toward zero);
+        * ``st_rel_l2``    — the space-time aggregate ``√(Σ_k Σ‖ê^k−u^k‖²_M / Σ_k Σ‖u^k‖²_M)``.
+
+        The final-time relative L2 is simply ``rel_l2_steps[-1]``."""
         self.model.eval()
         ns, R = self.n_seed_frames, self.rollout_steps
+        M = self.problem.M
         total_mse, n = 0.0, 0
-        for trajs_grid, _ in loader:
+        num = torch.zeros(R)          # Σ_samples ‖ê^k − u^k‖²_M   per step
+        den = torch.zeros(R)          # Σ_samples ‖u^k‖²_M          per step
+        for trajs_grid, trajs_node in loader:
             trajs_grid = trajs_grid.to(self.device)
-            preds_grid, _ = self._rollout(trajs_grid)                    # [B, R, H, W]
-            ref = trajs_grid[:, ns:ns + R]
-            mse = ((preds_grid - ref) ** 2).mean().item()
-            total_mse += mse * trajs_grid.shape[0]
+            preds_grid, seq_node = self._rollout(trajs_grid)
+            ref_grid = trajs_grid[:, ns:ns + R]
+            total_mse += ((preds_grid - ref_grid) ** 2).mean().item() * trajs_grid.shape[0]
+            preds_node = seq_node[:, ns:ns + R]                          # [B, R, N]
+            ref_node = trajs_node[:, ns:ns + R].to(self.device)          # [B, R, N]
+            for k in range(R):
+                e = preds_node[:, k] - ref_node[:, k]                    # [B, N]
+                num[k] += (e * self.problem._spmm(M, e)).sum(-1).clamp_min(0).sum().item()
+                u = ref_node[:, k]
+                den[k] += (u * self.problem._spmm(M, u)).sum(-1).clamp_min(0).sum().item()
             n += trajs_grid.shape[0]
-        return total_mse / n
+        rel_l2_steps = (num / den.clamp_min(1e-30)).sqrt().tolist()
+        st_rel_l2 = float((num.sum() / den.sum().clamp_min(1e-30)).sqrt())
+        return total_mse / n, rel_l2_steps, st_rel_l2
 
     def validate(self):
-        return self._eval_loader(self.val_loader)
+        mse, rel_l2_steps, st_rel_l2 = self._eval_full(self.val_loader)
+        self.stats.val_rel_l2_steps.append(rel_l2_steps)
+        self.stats.val_st_rel_l2.append(st_rel_l2)
+        self.stats.val_final_rel_l2.append(rel_l2_steps[-1])
+        return mse                                                       # best-model selection stays on MSE
 
     def test(self):
-        return self._eval_loader(self.test_loader)
+        return self._eval_full(self.test_loader)[0]
 
     def train(self) -> float:
         """Run the base training loop, then persist per-epoch stats + config to a results JSON
@@ -631,6 +660,7 @@ class RolloutTrainer(BaseTrainer):
         ``stats.val_errors``."""
         import json
         from dataclasses import asdict
+        test_mse, test_rel_l2_steps, test_st_rel_l2 = self._eval_full(self.test_loader)
         record = {
             "prefix": self._file_prefix(),
             "loss_type": self.loss_type,
@@ -641,6 +671,11 @@ class RolloutTrainer(BaseTrainer):
             "dt": self.dt, "n_steps": self.n_steps, "rollout_steps": self.rollout_steps,
             "K": self.K, "n_train": len(self.train_dataset), "epochs": self.epochs,
             "best_val_mse": self.stats.best_val_error, "best_epoch": self.stats.best_epoch,
+            # test-set (best model): rollout MSE + FEM-L2 space-time / final / per-step series
+            "test_mse": test_mse,
+            "test_st_rel_l2": test_st_rel_l2,
+            "test_final_rel_l2": test_rel_l2_steps[-1],
+            "test_rel_l2_steps": test_rel_l2_steps,
             "stats": asdict(self.stats),
         }
         os.makedirs(f"{self.output_dir}/results", exist_ok=True)
