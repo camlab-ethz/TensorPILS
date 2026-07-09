@@ -288,7 +288,9 @@ def visualize_data_trajectory(dataset, sample_idx: int = 0, n_frames: int = 5,
     axr.plot(tvec, l2, "s--", color="#2c3e50", lw=1.4, ms=3)
     axr.set_ylabel(r"$\|u\|_2$", color="#2c3e50"); axr.tick_params(axis="y", labelcolor="#2c3e50")
 
-    sup = title or f"Reference trajectory (sample #{sample_idx}, T={T1 - 1} steps)"
+    integ = getattr(dataset, "integrator", None)
+    itag = f", integrator={integ}" if integ else ""
+    sup = title or f"Reference trajectory (sample #{sample_idx}, T={T1 - 1} steps{itag})"
     fig.suptitle(f"{sup}   |   boundary max$|u|$ = {bmax:.1e}", fontsize=12)
     fig.savefig(save_path, dpi=150, bbox_inches="tight"); plt.close(fig)
     print(f"Data trajectory -> {save_path}")

@@ -58,18 +58,52 @@ def test_ac_residual_forward_backward(ac17):
 
 
 def test_ac_reference_self_consistency():
-    """The FEM Newton reference zeroes the AC residual on every consecutive frame pair."""
+    """The backward-Euler reference zeroes the (backward-Euler) AC residual on every pair.
+
+    ``ACProblem.residual`` is the fully-implicit residual, so this checks the reference built
+    with the matching ``integrator="backward_euler"`` (not the convex_concave default)."""
     mesh = structured_quad_mesh(17, 17)
     prob = ACProblem(mesh)
     u0 = _ic(mesh, K=3, dtype=torch.float64).unsqueeze(0)          # [1, N]
     a, eps, dt, n_steps = 1.0, 2.0, 1e-3, 5
     traj = prob.fem_reference(u0, a=a, eps=eps, dt=dt, n_steps=n_steps,
-                              newton_tol=1e-10, newton_max=50)      # [1, T+1, N]
+                              newton_tol=1e-10, newton_max=50,
+                              integrator="backward_euler")          # [1, T+1, N]
     worst = 0.0
     for k in range(n_steps):
         r = prob.residual(traj[:, k], traj[:, k + 1], a=a, eps=eps, dt=dt)
         worst = max(worst, r.norm().item())
     assert worst < 1e-5, f"reference should zero the discrete residual, got {worst:.2e}"
+
+
+def _cc_residual(prob, u_prev, u_next, a, eps, dt):
+    """Eyre convex-splitting AC residual: M(uⁿ⁺¹-uⁿ)/dt + a²A uⁿ⁺¹ + ε²M((uⁿ⁺¹)³ - uⁿ).
+
+    Cubic implicit, linear reaction explicit at uⁿ; boundary-masked like ``ACProblem.residual``."""
+    from tensorpils.physics import apply_zero_boundary
+    mask = prob.boundary_mask
+    up = apply_zero_boundary(u_prev, mask)
+    un = apply_zero_boundary(u_next, mask)
+    r = prob._spmm(prob.M, (un - up) / dt) \
+        + (a * a) * prob._spmm(prob.A, un) \
+        + (eps * eps) * prob._spmm(prob.M, un ** 3 - up)
+    return apply_zero_boundary(r, mask)
+
+
+def test_ac_reference_self_consistency_convex_concave():
+    """The convex_concave reference (the default) zeroes the convex-splitting residual."""
+    mesh = structured_quad_mesh(17, 17)
+    prob = ACProblem(mesh)
+    u0 = _ic(mesh, K=3, dtype=torch.float64).unsqueeze(0)          # [1, N]
+    a, eps, dt, n_steps = 1.0, 2.0, 1e-3, 5
+    traj = prob.fem_reference(u0, a=a, eps=eps, dt=dt, n_steps=n_steps,
+                              newton_tol=1e-10, newton_max=50,
+                              integrator="convex_concave")         # [1, T+1, N]
+    worst = 0.0
+    for k in range(n_steps):
+        r = _cc_residual(prob, traj[:, k], traj[:, k + 1], a=a, eps=eps, dt=dt)
+        worst = max(worst, r.norm().item())
+    assert worst < 1e-5, f"CC reference should zero the CC residual, got {worst:.2e}"
 
 
 def test_ac_reference_sanity():

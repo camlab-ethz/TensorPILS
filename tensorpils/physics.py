@@ -234,18 +234,30 @@ class ACProblem(FEMOperator):
     @torch.no_grad()
     def fem_reference(self, u0: torch.Tensor, a: float, eps: float, dt: float,
                       n_steps: int, newton_tol: float = 1e-8, newton_max: int = 20,
-                      chunk: int = 64) -> torch.Tensor:
-        r"""Batched implicit-Euler + Newton reference trajectory (build-time ground truth).
+                      chunk: int = 64, integrator: str = "convex_concave") -> torch.Tensor:
+        r"""Batched implicit + Newton reference trajectory (build-time ground truth).
 
-        Solves ``R(u^{n+1}; u^n) = 0`` (the :meth:`residual` above) each step by Newton on the
-        interior DOFs (Dirichlet nodes held at 0). Uses dense linear algebra on the interior
-        block — appropriate for structured grids up to a few thousand nodes; process ``chunk``
-        samples at a time to bound memory. ``u0``: ``[N]`` or ``[B, N]``. Returns the trajectory
-        ``[B, n_steps+1, N]`` (or ``[n_steps+1, N]`` for a single sample).
+        Solves ``R(u^{n+1}; u^n) = 0`` each step by Newton on the interior DOFs (Dirichlet nodes
+        held at 0). Uses dense linear algebra on the interior block — appropriate for structured
+        grids up to a few thousand nodes; process ``chunk`` samples at a time to bound memory.
+        ``u0``: ``[N]`` or ``[B, N]``. Returns the trajectory ``[B, n_steps+1, N]`` (or
+        ``[n_steps+1, N]`` for a single sample).
 
-        The Jacobian is :math:`J = M/\Delta t + a^2 A - \epsilon^2 M\,\mathrm{diag}(1-3u^2)`;
-        the constant part ``L = M/\Delta t + a^2 A`` is formed once and the reaction Jacobian
-        is a per-iterate column scaling of ``M``."""
+        ``integrator`` selects the time discretisation of the reaction ε²(u−u³):
+
+        * ``"convex_concave"`` (default) — Eyre convex splitting: the convex quartic (cubic term
+          ε²u³) is implicit, the concave part (linear term ε²u) is explicit at ``u^n``. Residual
+          :math:`(M+\Delta t\,a^2A)u+\Delta t\,\varepsilon^2 M u^3-(I+\Delta t\,\varepsilon^2)Mu^n`,
+          Jacobian :math:`J = M/\Delta t + a^2A + 3\varepsilon^2 M\,\mathrm{diag}(u^2)`, which is
+          SPD for every ``u`` and ``Δt`` — unconditionally energy-stable.
+        * ``"backward_euler"`` — fully implicit; the whole reaction is at the new level. Jacobian
+          :math:`J = M/\Delta t + a^2A - \varepsilon^2 M\,\mathrm{diag}(1-3u^2)`.
+
+        The constant part ``L = M/\Delta t + a^2 A`` is formed once; the reaction Jacobian is a
+        per-iterate column scaling of ``M``."""
+        if integrator not in ("convex_concave", "backward_euler"):
+            raise ValueError(f"unknown integrator {integrator!r}; "
+                             "expected 'convex_concave' or 'backward_euler'")
         single = (u0.dim() == 1)
         if single:
             u0 = u0.unsqueeze(0)
@@ -271,16 +283,22 @@ class ACProblem(FEMOperator):
             for step in range(1, n_steps + 1):
                 u = u_old.clone()                                 # Newton initial guess
                 for _ in range(newton_max):
-                    # residual on interior: M(u-u_old)/dt + a²A u - ε²M(u-u³)
-                    reac = (eps * eps) * (u - u ** 3)             # [b, Ni]
+                    # Reaction term and its Jacobian column-scale w (so J = L_ii + M_ii·diag(w)),
+                    # per integrator. Both share the diffusion+mass block L_ii = M/dt + a²A.
+                    if integrator == "backward_euler":
+                        reac = (eps * eps) * (u - u ** 3)         # ε²(u-u³) fully implicit
+                        r_sign = -1.0                             # residual: ... - M·reac
+                        w = (eps * eps) * (3.0 * u * u - 1.0)     # J = L - ε²M diag(1-3u²)
+                    else:                                         # convex_concave (Eyre split)
+                        reac = (eps * eps) * (u ** 3 - u_old)     # cubic implicit, linear explicit
+                        r_sign = +1.0                             # residual: ... + M·reac
+                        w = 3.0 * (eps * eps) * (u * u)           # J = L + 3ε²M diag(u²)  (SPD)
                     r = (M_ii @ ((u - u_old) / dt).T).T \
                         + (a * a) * (A_ii @ u.T).T \
-                        - (M_ii @ reac.T).T                       # [b, Ni]
+                        + r_sign * (M_ii @ reac.T).T              # [b, Ni]
                     if r.norm(dim=1).max() < newton_tol:
                         break
-                    # J = L_ii - ε² M_ii diag(1-3u²)  (column-scale M_ii per sample)
-                    d = 1.0 - 3.0 * u * u                          # [b, Ni]
-                    J = L_ii.unsqueeze(0) - (eps * eps) * (M_ii.unsqueeze(0) * d.unsqueeze(1))
+                    J = L_ii.unsqueeze(0) + (M_ii.unsqueeze(0) * w.unsqueeze(1))   # column-scale
                     du = torch.linalg.solve(J, -r.unsqueeze(-1)).squeeze(-1)   # [b, Ni]
                     u = u + du
                 traj[lo:hi, step, idx] = u

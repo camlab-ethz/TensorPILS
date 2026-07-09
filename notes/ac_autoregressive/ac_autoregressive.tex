@@ -122,11 +122,55 @@ whose constant part $L=M/\dt+a^2A$ is factored once. Since the label-free loss
 physics model reproduces this FEM reference; evaluation reports the rollout MSE of the
 predicted frames against it.
 
+\section{Reference integrator: convex--concave splitting}
+\label{sec:cc}
+
+The reaction $\epsilon^2 u(1-u^2)=-F'(u)$ comes from the double-well potential
+$F(u)=\tfrac{\epsilon^2}{4}(u^2-1)^2$. Following Eyre, split it into convex minus convex,
+\begin{equation}
+  F = F_c - F_e,\qquad
+  F_c(u)=\tfrac{\epsilon^2}{4}\big(u^4+1\big),\quad
+  F_e(u)=\tfrac{\epsilon^2}{2}u^2 ,
+\end{equation}
+both convex ($F_c''=3\epsilon^2u^2\ge0$, $F_e''=\epsilon^2\ge0$). Taking the convex part
+implicitly and the concave contribution $-F_e$ explicitly at $u^n$ — i.e.\
+$F_c'(u^{n+1})=\epsilon^2(u^{n+1})^3$ implicit, $F_e'(u^{n})=\epsilon^2 u^{n}$ explicit —
+gives the \textbf{convex--concave} step
+\begin{equation}
+  \boxed{\;
+  R^{\mathrm{cc}}(u^{n},u^{n+1}) \;=\;
+  (M+\dt\,a^2 A)\,u^{n+1} \;+\; \dt\,\epsilon^2 M (u^{n+1})^3
+  \;-\; (I+\dt\,\epsilon^2)\,M u^{n} \;=\; 0 .
+  \;}
+  \label{eq:cc}
+\end{equation}
+The cubic is still implicit, so each step is a Newton solve with a nodal/collocated
+nonlinearity ($(u^3)_i=u_i^3$) and Jacobian
+\begin{equation}
+  J^{\mathrm{cc}}(u) \;=\; \frac{M}{\dt} + a^2 A + 3\,\epsilon^2 M\,\diag(u^2),
+  \label{eq:cc-jac}
+\end{equation}
+which is \textbf{symmetric positive definite for every $u$ and every $\dt$} (each summand is
+PSD, $M$ is SPD). That is the scheme's \emph{unconditional energy stability}: the
+Ginzburg--Landau energy $E$ is non-increasing along the discrete trajectory at any step size.
+Contrast the fully-implicit backward--Euler Jacobian
+$J^{\mathrm{be}}(u)=M/\dt + a^2A - \epsilon^2 M\,\diag(1-3u^2)$, whose $-\epsilon^2 M$ term can
+make it indefinite once $\dt\,\epsilon^2$ is large.
+
+\paragraph{Which residual the loss uses.} Data generation defaults to convex--concave
+\eqref{eq:cc}; backward--Euler \eqref{eq:res} stays available through the integrator flag
+(\texttt{ACProblem.fem\_reference(\dots, integrator="convex\_concave"|"backward\_euler")}). The
+label-free training loss \eqref{eq:lgal} still drives the backward--Euler residual
+\eqref{eq:res}; the two discrete solutions agree to $O(\dt)$, so a physics-trained model matches
+the convex--concave reference up to the time-discretisation error.
+
 \section{Code pointers}
 
 \begin{itemize}\itemsep2pt
-  \item Discrete residual \eqref{eq:res}, energy, and Newton reference/Jacobian:
-        \texttt{tensorpils/physics.py} $\to$ \texttt{ACProblem.residual / energy / fem\_reference}.
+  \item Discrete residual \eqref{eq:res}, energy, and Newton reference/Jacobian for both
+        integrators \eqref{eq:cc}/\eqref{eq:res}:
+        \texttt{tensorpils/physics.py} $\to$ \texttt{ACProblem.residual / energy / fem\_reference}
+        (the latter takes \texttt{integrator="convex\_concave"} (default) or \texttt{"backward\_euler"}).
   \item One-step map $\mathcal G_\theta$ and the autoregressive rollout $s$:
         \texttt{tensorpils/trainer.py} $\to$ \texttt{RolloutTrainer.\_rollout}
         (\texttt{n\_seed\_frames}$=1$ for AC, set by \texttt{ACTrainer}).
