@@ -19,9 +19,14 @@
 #SBATCH --job-name=pils-ac-losscmp
 #SBATCH --time=12:00:00
 #SBATCH --gpus=1
+#SBATCH --gres=gpumem:20g
 #SBATCH --mem-per-cpu=8G
 #SBATCH --output=logs/ac_losscmp_%A_%a.out
 #SBATCH --array=0-3
+
+# gpumem:20g -- the 10-step autoregressive rollout does BPTT through 10 FNO forwards, so a
+# batch of 32 at grid 64 overruns a small (~10 GB) card. Request >=20 GB. (Fallback if a big
+# GPU is scarce: drop --batch_size to 8-16 below, which cuts the unrolled activation memory.)
 
 source ~/env_tensorpils.sh
 set -eo pipefail
