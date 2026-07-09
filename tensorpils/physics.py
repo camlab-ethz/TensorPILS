@@ -197,16 +197,34 @@ class ACProblem(FEMOperator):
 
     # ------------------------------------------------------------------ residual
     def residual(self, u_curr: torch.Tensor, u_next: torch.Tensor,
-                 a: float, eps: float, dt: float) -> torch.Tensor:
-        r"""Boundary-masked fully-implicit backward-Euler Allen–Cahn residual.
+                 a: float, eps: float, dt: float,
+                 integrator: str = "backward_euler") -> torch.Tensor:
+        r"""Boundary-masked weak-form Allen–Cahn step residual (``/dt`` scaling), by integrator.
 
-        ``u_curr``/``u_next`` are :math:`u^n, u^{n+1}` in ``[N]`` or ``[B, N]``. Both are
-        projected to zero on the Dirichlet boundary before use and the returned residual is
-        also zeroed there. Fully differentiable in the inputs."""
+        ``u_curr``/``u_next`` are :math:`u^n, u^{n+1}` in ``[N]`` or ``[B, N]``. Both are projected
+        to zero on the Dirichlet boundary before use and the returned residual is also zeroed
+        there. Fully differentiable in the inputs. The two schemes differ only in the *linear*
+        reaction term (the cubic is implicit in both):
+
+        * ``"backward_euler"`` — fully implicit:
+          :math:`M\frac{u^{n+1}-u^n}{\dt} + a^2Au^{n+1} - \epsilon^2 M(u^{n+1}-(u^{n+1})^3)`.
+        * ``"convex_concave"`` — Eyre split, linear term explicit at :math:`u^n`:
+          :math:`M\frac{u^{n+1}-u^n}{\dt} + a^2Au^{n+1} + \epsilon^2 M((u^{n+1})^3-u^n)`.
+
+        Both are the ``/dt``-scaled residual (matching :meth:`fem_reference`), so a least-squares
+        loss built on either has a ``dt``-independent gradient scale. This is the same residual
+        the reference solve zeros, so the ``convex_concave`` reference exactly zeros the
+        ``convex_concave`` residual (and likewise for backward Euler)."""
         mask = self.boundary_mask
         uc = apply_zero_boundary(u_curr, mask)
         un = apply_zero_boundary(u_next, mask)
-        reaction = (eps * eps) * (un - un ** 3)                    # ε² u(1-u²) at new level
+        if integrator == "backward_euler":
+            reaction = (eps * eps) * (un - un ** 3)               # linear term implicit (uⁿ⁺¹)
+        elif integrator == "convex_concave":
+            reaction = (eps * eps) * (uc - un ** 3)               # linear term explicit (uⁿ)
+        else:
+            raise ValueError(f"unknown integrator {integrator!r}; "
+                             "expected 'backward_euler' or 'convex_concave'")
         r = self._spmm(self.M, (un - uc) / dt) \
             + (a * a) * self._spmm(self.A, un) \
             - self._spmm(self.M, reaction)

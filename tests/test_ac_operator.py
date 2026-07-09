@@ -91,7 +91,11 @@ def _cc_residual(prob, u_prev, u_next, a, eps, dt):
 
 
 def test_ac_reference_self_consistency_convex_concave():
-    """The convex_concave reference (the default) zeroes the convex-splitting residual."""
+    """The convex_concave reference (the default) zeroes the convex-splitting residual.
+
+    Uses the production ``ACProblem.residual(integrator="convex_concave")`` — the exact residual
+    the least-squares physics loss is built on — and cross-checks it against an independent
+    hand-derived formula."""
     mesh = structured_quad_mesh(17, 17)
     prob = ACProblem(mesh)
     u0 = _ic(mesh, K=3, dtype=torch.float64).unsqueeze(0)          # [1, N]
@@ -101,7 +105,11 @@ def test_ac_reference_self_consistency_convex_concave():
                               integrator="convex_concave")         # [1, T+1, N]
     worst = 0.0
     for k in range(n_steps):
-        r = _cc_residual(prob, traj[:, k], traj[:, k + 1], a=a, eps=eps, dt=dt)
+        r = prob.residual(traj[:, k], traj[:, k + 1], a=a, eps=eps, dt=dt,
+                          integrator="convex_concave")
+        # production residual must match the independent hand-derived one
+        r_ref = _cc_residual(prob, traj[:, k], traj[:, k + 1], a=a, eps=eps, dt=dt)
+        assert torch.allclose(r, r_ref, atol=1e-10), "production CC residual != hand-derived formula"
         worst = max(worst, r.norm().item())
     assert worst < 1e-5, f"CC reference should zero the CC residual, got {worst:.2e}"
 

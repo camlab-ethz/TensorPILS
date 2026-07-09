@@ -251,21 +251,29 @@ def build_wave_loss(problem: WaveProblem, c: float, dt: float, discount: float =
 # ============================ Allen–Cahn losses ============================
 
 class ACGalerkinLoss(nn.Module):
-    r"""Backward-Euler weak-form residual loss for Allen–Cahn (no labels).
+    r"""Least-squares weak-form residual loss for Allen–Cahn (no labels).
 
     Given a node-space trajectory ``seq`` of shape ``[B, L, N]`` — the ground-truth seed frame
-    followed by the model's autoregressive predictions — this sums the squared boundary-masked
-    residual over every consecutive pair :math:`(u^k, u^{k+1})`, weighted by ``discount**k`` so
-    later (more error-prone) rollout steps can be down-weighted. See :meth:`ACProblem.residual`.
+    followed by the model's autoregressive predictions — this penalises the boundary-masked step
+    residual over every consecutive pair :math:`(u^k, u^{k+1})` as ``½‖R‖²`` (sum over nodes,
+    mean over batch), weighted by ``discount**k`` so later (more error-prone) rollout steps can be
+    down-weighted. Summing over nodes (rather than averaging) keeps the gradient magnitude
+    :math:`O(1)` instead of :math:`O(1/N)`.
+
+    ``integrator`` selects the residual form (see :meth:`ACProblem.residual`): ``"backward_euler"``
+    (fully implicit) or ``"convex_concave"`` (Eyre split). Both use the ``/dt`` scaling, so the
+    loss is ``dt``-independent in gradient scale.
     """
 
-    def __init__(self, problem: ACProblem, a: float, eps: float, dt: float, discount: float = 1.0):
+    def __init__(self, problem: ACProblem, a: float, eps: float, dt: float, discount: float = 1.0,
+                 integrator: str = "backward_euler"):
         super().__init__()
         self.problem = problem
         self.a = a
         self.eps = eps
         self.dt = dt
         self.discount = discount
+        self.integrator = integrator
 
     def forward(self, seq_node: torch.Tensor) -> torch.Tensor:
         L = seq_node.shape[1]
@@ -275,14 +283,16 @@ class ACGalerkinLoss(nn.Module):
         wsum = 0.0
         for k in range(L - 1):
             r = self.problem.residual(seq_node[:, k], seq_node[:, k + 1],
-                                      self.a, self.eps, self.dt)
+                                      self.a, self.eps, self.dt, integrator=self.integrator)
             w = self.discount ** k
-            total = total + w * (r ** 2).mean()
+            total = total + w * (0.5 * (r ** 2).sum(dim=-1).mean())   # ½‖R‖²: sum nodes, mean batch
             wsum += w
         return total / wsum
 
 
-def build_ac_loss(problem: ACProblem, a: float, eps: float, dt: float, discount: float = 1.0):
-    """Factory for the Allen–Cahn physics (Galerkin) criterion. The supervised data term is a
-    plain trajectory MSE handled by the trainer; only the residual loss is assembled here."""
-    return ACGalerkinLoss(problem, a=a, eps=eps, dt=dt, discount=discount)
+def build_ac_loss(problem: ACProblem, a: float, eps: float, dt: float, discount: float = 1.0,
+                  integrator: str = "backward_euler"):
+    """Factory for the Allen–Cahn physics (Galerkin least-squares) criterion. The supervised data
+    term is a plain trajectory MSE handled by the trainer; only the residual loss is assembled
+    here. ``integrator`` picks the residual scheme (``backward_euler`` | ``convex_concave``)."""
+    return ACGalerkinLoss(problem, a=a, eps=eps, dt=dt, discount=discount, integrator=integrator)

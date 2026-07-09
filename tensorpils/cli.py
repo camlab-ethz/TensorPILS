@@ -101,6 +101,10 @@ def build_parser() -> ArgumentParser:
                    help="Max Newton iterations per step for the FEM reference solver.")
     p.add_argument("--ac_ref_chunk", type=int, default=64,
                    help="Sample chunk size for the batched FEM reference solve (memory control).")
+    p.add_argument("--ac_integrator", choices=["convex_concave", "backward_euler"],
+                   default="convex_concave",
+                   help="Allen–Cahn time integrator for BOTH the reference data and the physics "
+                        "(Galerkin) residual loss (kept coherent). Default: convex_concave (Eyre).")
 
     # -------- Optimizer (the place to plug in Shampoo via build_optimizer) --------
     p.add_argument("--optimizer", type=str, default="adam",
@@ -244,7 +248,8 @@ def run_ac(args, device):
     print(f"loss        : {args.loss}  (lambda_galerkin={lg}, lambda_data={ld})")
     print(f"allen-cahn  : a={args.ac_a}  eps={args.ac_eps}  r={args.ac_r}  dt={args.dt}  "
           f"n_steps={args.n_steps}  rollout={args.rollout_steps}")
-    print(f"reference   : FEM implicit-Euler + Newton (build cost ~ {total}x{args.n_steps} steps; "
+    print(f"integrator  : {args.ac_integrator}  (reference data + physics-loss residual)")
+    print(f"reference   : FEM {args.ac_integrator} + Newton (build cost ~ {total}x{args.n_steps} steps; "
           f"no analytical solution exists for AC)")
     _print_common(args, device)
 
@@ -254,7 +259,7 @@ def run_ac(args, device):
         K=args.k, grid_resolution=args.grid_resolution,
         dt=args.dt, n_steps=args.n_steps, a=args.ac_a, eps=args.ac_eps, r=args.ac_r,
         newton_tol=args.ac_newton_tol, newton_max=args.ac_newton_max,
-        ref_chunk=args.ac_ref_chunk, seed=args.seed,
+        ref_chunk=args.ac_ref_chunk, integrator=args.ac_integrator, seed=args.seed,
     )
     print(f"  train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}, "
           f"grid={train_ds.grid_size}, frames/sample={args.n_steps + 1}\n")

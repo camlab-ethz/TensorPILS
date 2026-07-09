@@ -84,20 +84,26 @@ The training loss is a weighted sum of a label-free \emph{physics} term and an o
     \;+\; \lambda_{\mathrm{data}}\,\mathcal L_{\mathrm{data}}(s).
 \end{equation}
 
-\paragraph{Physics (Galerkin residual over the rollout).}
-Impose that \emph{each consecutive pair} in the rollout satisfies the discrete step
-\eqref{eq:res}, with a geometric discount $\gamma=\texttt{discount}$ that can down-weight the
-later (more error-prone) steps:
+\paragraph{Physics (Galerkin least-squares residual over the rollout).}
+Impose that \emph{each consecutive pair} in the rollout satisfies the discrete step, as a
+\emph{least-squares} penalty on its residual, with a geometric discount $\gamma=\texttt{discount}$
+that can down-weight the later (more error-prone) steps:
 \begin{equation}
   \mathcal L_{\mathrm{gal}}(s)
   \;=\; \frac{1}{\sum_{k=0}^{L-2}\gamma^{k}}
         \sum_{k=0}^{L-2}\gamma^{k}\;
-        \big\langle R(s^{k},s^{k+1})^2\big\rangle,
+        \Big\langle\, \tfrac12\big\| R(s^{k},s^{k+1})\big\|_2^2 \,\Big\rangle_{\!\mathrm{batch}} ,
   \label{eq:lgal}
 \end{equation}
-where $\langle\cdot\rangle$ is the mean over batch and nodes. The $k=0$ term couples the seed to
-the first prediction, $u^0\!\to\!\uhat^{\,1}$; the $k\ge1$ terms couple prediction to prediction.
-No labels are used.
+where $\tfrac12\|\cdot\|_2^2$ \emph{sums} the squared residual over nodes and $\langle\cdot
+\rangle_{\mathrm{batch}}$ averages over the batch. Summing (not averaging) over nodes keeps the
+gradient magnitude $O(1)$ rather than $O(1/N)$, which matters under Adam. The residual $R$ is
+either the backward--Euler \eqref{eq:res} or the convex--concave \eqref{eq:cc} form, both in the
+$/\dt$ scaling of \S\ref{sec:cc} so the penalty is $\dt$-independent; the integrator is chosen by
+a flag (\texttt{ACProblem.residual(\dots, integrator=\dots)}, wired through
+\texttt{ACGalerkinLoss} and \texttt{--ac\_integrator}). The $k=0$ term couples the seed to the
+first prediction $u^0\!\to\!\uhat^{\,1}$; the $k\ge1$ terms couple prediction to prediction. No
+labels are used.
 
 \paragraph{Data (supervised trajectory MSE).}
 Against the reference frames $u^{1},\dots,u^{R}$ of the FEM trajectory (\S\ref{sec:ref}),
@@ -144,8 +150,12 @@ gives the \textbf{convex--concave} step
   \;}
   \label{eq:cc}
 \end{equation}
-The cubic is still implicit, so each step is a Newton solve with a nodal/collocated
-nonlinearity ($(u^3)_i=u_i^3$) and Jacobian
+Equation~\eqref{eq:cc} is written in the ``$\times\dt$'' algebraic form; the reference solve, the
+Jacobian below, and the least-squares loss \eqref{eq:lgal} all use the equivalent
+\textbf{$/\dt$-scaled} residual $R^{\mathrm{cc}}/\dt = M\frac{u^{n+1}-u^n}{\dt}+a^2Au^{n+1}
++\epsilon^2 M((u^{n+1})^3-u^n)$ (same root, but $O(1)$ rather than $O(\dt)$, so gradients do not
+vanish with $\dt$). The cubic is still implicit, so each step is a Newton solve with a
+nodal/collocated nonlinearity ($(u^3)_i=u_i^3$) and Jacobian
 \begin{equation}
   J^{\mathrm{cc}}(u) \;=\; \frac{M}{\dt} + a^2 A + 3\,\epsilon^2 M\,\diag(u^2),
   \label{eq:cc-jac}
@@ -174,8 +184,10 @@ the convex--concave reference up to the time-discretisation error.
   \item One-step map $\mathcal G_\theta$ and the autoregressive rollout $s$:
         \texttt{tensorpils/trainer.py} $\to$ \texttt{RolloutTrainer.\_rollout}
         (\texttt{n\_seed\_frames}$=1$ for AC, set by \texttt{ACTrainer}).
-  \item Discounted residual sum \eqref{eq:lgal}:
-        \texttt{tensorpils/losses.py} $\to$ \texttt{ACGalerkinLoss.forward} / \texttt{build\_ac\_loss}.
+  \item Discounted least-squares residual sum \eqref{eq:lgal} (integrator-selectable):
+        \texttt{tensorpils/losses.py} $\to$ \texttt{ACGalerkinLoss.forward} / \texttt{build\_ac\_loss}
+        (residual scheme from \texttt{ACProblem.residual(\dots, integrator)}, exposed as
+        \texttt{--ac\_integrator}).
   \item Total loss ($\lambda_{\mathrm{gal}}\mathcal L_{\mathrm{gal}}+\lambda_{\mathrm{data}}\mathcal L_{\mathrm{data}}$)
         and rollout-MSE eval:
         \texttt{tensorpils/trainer.py} $\to$ \texttt{RolloutTrainer.train\_epoch / \_eval\_loader}.
