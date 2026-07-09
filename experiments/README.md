@@ -25,4 +25,25 @@ the boundary during training.
 > projected), but the `data`/`data_l2`/`deepritz`-penalty/`pls` curves must be re-run to
 > pick up the boundary projection.
 
-Theory write-up for the spectral preconditioners: `../preconditioner_notes/`.
+Theory write-up for the spectral preconditioners: `../notes/preconditioner_notes/`.
+
+## Inspecting generated data (Wave / Allen–Cahn)
+
+Before training a time-dependent experiment — or when changing the data generator itself (e.g.
+swapping the Allen–Cahn integrator for a convex–concave splitting) — eyeball the reference
+trajectories straight from the dataset, with **no model** involved:
+
+```python
+from tensorpils.data import ACDataset          # or WaveDataset
+from tensorpils import viz
+
+ds = ACDataset(num_samples=4, K=4, seed=0, n_steps=20, dt=1e-3, a=1.0, eps=2.0)
+viz.visualize_data_trajectory(ds, sample_idx=0)   # -> output/data_viz/traj_sample0.png
+```
+
+`viz.visualize_data_trajectory(dataset, sample_idx=0, n_frames=5, save_path=None, title=None)`
+renders a filmstrip of the trajectory (shared colour scale) plus a `max|u|` / `‖u‖₂`-vs-time
+panel and a boundary-leak readout, and returns the resolved save path. It defaults to
+`output/data_viz/traj_sample{idx}.png` (git-ignored). To compare two integrators, give each a
+distinct `save_path=`/`title=`; the same `sample_idx`+`seed` share one initial condition, so any
+difference in the filmstrip or the `max|u|`/`‖u‖₂` curves is purely the integrator.
