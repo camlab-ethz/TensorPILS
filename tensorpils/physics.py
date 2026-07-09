@@ -230,6 +230,48 @@ class ACProblem(FEMOperator):
             - self._spmm(self.M, reaction)
         return apply_zero_boundary(r, mask)
 
+    # ---------------------------------------------- minimizing-movement objective
+    def mm_objective(self, u_curr: torch.Tensor, u_next: torch.Tensor,
+                     a: float, eps: float, dt: float) -> torch.Tensor:
+        r"""Convex–concave minimizing-movement (JKO) objective for one Allen–Cahn step.
+
+        With the Ginzburg–Landau energy split :math:`E = E_{\mathrm{cvx}} + E_{\mathrm{ccv}}`
+        (:math:`E_{\mathrm{cvx}}=\tfrac{a^2}{2}\!\int|\nabla u|^2+\tfrac{\epsilon^2}{4}\!\int u^4
+        + \tfrac{\epsilon^2}{4}|\Omega|`, :math:`E_{\mathrm{ccv}}=-\tfrac{\epsilon^2}{2}\!\int u^2`,
+        so :math:`DE_{\mathrm{ccv}}(u^n)=-\epsilon^2 u^n`), the convex–concave step is the unique
+        minimiser of
+
+        .. math::
+            J(u) = E_{\mathrm{cvx}}(u) + \langle DE_{\mathrm{ccv}}(u^n), u\rangle
+                   + \tfrac{1}{2\dt}\|u-u^n\|_{L^2}^2 .
+
+        Discretised (nodal quartic :math:`\int u^4 \approx (u^4)^\top M\mathbf 1`, lumped mass
+        :math:`M\mathbf 1`), for ``u_next``:math:`=u`, ``u_curr``:math:`=u^n`:
+
+        .. math::
+            J = \tfrac{a^2}{2}u^\top A u + \tfrac{\epsilon^2}{4}\big[(u^4)^\top M\mathbf 1+|\Omega|\big]
+                - \epsilon^2 (u^n)^\top M u + \tfrac{1}{2\dt}(u-u^n)^\top M (u-u^n).
+
+        Its gradient is the convex–concave step residual with the *lumped* mass on the cubic
+        (:math:`\nabla_u J = M\frac{u-u^n}{\dt}+a^2Au+\epsilon^2\operatorname{diag}(M\mathbf 1)u^3
+        -\epsilon^2 M u^n`); minimising :math:`J` is the Deep-Ritz analogue of the least-squares
+        residual loss. Returns ``[B]`` (or scalar for ``[N]``). ``|\Omega|`` is a `u`-independent
+        constant, kept for fidelity to the objective. Boundary-projected like :meth:`residual`."""
+        mask = self.boundary_mask
+        uc = apply_zero_boundary(u_curr, mask)
+        un = apply_zero_boundary(u_next, mask)
+        ones = torch.ones(self.n_nodes, dtype=un.dtype, device=un.device)
+        m1 = self._spmm(self.M, ones)                     # lumped mass vector M·1  [N]
+        omega = m1.sum()                                  # |Ω| = 1ᵀM1
+        Aun = self._spmm(self.A, un)
+        Mun = self._spmm(self.M, un)
+        Muc = self._spmm(self.M, uc)
+        grad_term = 0.5 * (a * a) * (un * Aun).sum(dim=-1)              # a²/2 uᵀA u
+        quartic = 0.25 * (eps * eps) * ((un ** 4) * m1).sum(dim=-1)     # ε²/4 (u⁴)ᵀM1
+        concave = -(eps * eps) * (uc * Mun).sum(dim=-1)                 # -ε² (uⁿ)ᵀM u
+        prox = (0.5 / dt) * ((un - uc) * (Mun - Muc)).sum(dim=-1)       # 1/(2dt)‖u-uⁿ‖²_M
+        return grad_term + quartic + concave + prox + 0.25 * (eps * eps) * omega
+
     # -------------------------------------------------------------------- energy
     def energy(self, u: torch.Tensor, a: float, eps: float,
                reduce: str = "mean") -> torch.Tensor:

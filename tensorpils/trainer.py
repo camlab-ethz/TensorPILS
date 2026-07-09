@@ -670,7 +670,8 @@ class ACTrainer(RolloutTrainer):
                  loss_type="galerkin", optimizer_name="adam", lr=1e-3, lr_min=1e-6,
                  weight_decay=0.0, batch_size=32, epochs=500, device="cuda",
                  output_dir="output", lambda_galerkin=1.0, lambda_data=0.0,
-                 rollout_steps=4, discount_factor=1.0, ac_integrator=None):
+                 rollout_steps=4, discount_factor=1.0, ac_integrator=None,
+                 ac_loss_form="galerkin"):
         super().__init__(model, train_dataset, val_dataset, test_dataset, loss_type,
                          n_seed_frames=1, optimizer_name=optimizer_name, lr=lr, lr_min=lr_min,
                          weight_decay=weight_decay, batch_size=batch_size, epochs=epochs,
@@ -682,11 +683,14 @@ class ACTrainer(RolloutTrainer):
         # Default the physics-loss residual to the same integrator the reference data was built
         # with (kept coherent), unless explicitly overridden.
         self.ac_integrator = ac_integrator or getattr(train_dataset, "integrator", "backward_euler")
+        self.ac_loss_form = ac_loss_form
         self.criterion = build_ac_loss(self.problem, a=self.a, eps=self.eps, dt=self.dt,
-                                       discount=discount_factor, integrator=self.ac_integrator)
+                                       discount=discount_factor, integrator=self.ac_integrator,
+                                       form=ac_loss_form)
 
     def _file_prefix(self) -> str:
         itag = {"convex_concave": "cc", "backward_euler": "be"}.get(self.ac_integrator, self.ac_integrator)
-        return (f"fno_ac_{self.loss_type}_{itag}_a{self.a:g}_eps{self.eps:g}_dt{self.dt:g}_"
+        ftag = {"galerkin": "ls", "min_movement": "mm"}.get(self.ac_loss_form, self.ac_loss_form)
+        return (f"fno_ac_{self.loss_type}_{ftag}_{itag}_a{self.a:g}_eps{self.eps:g}_dt{self.dt:g}_"
                 f"T{self.n_steps}_R{self.rollout_steps}_K{self.K}_"
                 f"samples-{len(self.train_dataset)}-{len(self.val_dataset)}-{len(self.test_dataset)}")

@@ -105,6 +105,10 @@ def build_parser() -> ArgumentParser:
                    default="convex_concave",
                    help="Allen–Cahn time integrator for BOTH the reference data and the physics "
                         "(Galerkin) residual loss (kept coherent). Default: convex_concave (Eyre).")
+    p.add_argument("--ac_loss_form", choices=["galerkin", "min_movement"], default="galerkin",
+                   help="Form of the AC label-free physics loss: 'galerkin' (½‖R‖² least-squares "
+                        "residual) or 'min_movement' (convex–concave JKO objective J; Deep-Ritz "
+                        "analogue). Default: galerkin.")
 
     # -------- Optimizer (the place to plug in Shampoo via build_optimizer) --------
     p.add_argument("--optimizer", type=str, default="adam",
@@ -249,6 +253,8 @@ def run_ac(args, device):
     print(f"allen-cahn  : a={args.ac_a}  eps={args.ac_eps}  r={args.ac_r}  dt={args.dt}  "
           f"n_steps={args.n_steps}  rollout={args.rollout_steps}")
     print(f"integrator  : {args.ac_integrator}  (reference data + physics-loss residual)")
+    print(f"phys loss   : {args.ac_loss_form}  "
+          f"({'least-squares residual ½‖R‖²' if args.ac_loss_form == 'galerkin' else 'minimizing-movement objective J'})")
     print(f"reference   : FEM {args.ac_integrator} + Newton (build cost ~ {total}x{args.n_steps} steps; "
           f"no analytical solution exists for AC)")
     _print_common(args, device)
@@ -275,6 +281,7 @@ def run_ac(args, device):
         device=device, output_dir=args.output_dir,
         lambda_galerkin=lg, lambda_data=ld,
         rollout_steps=args.rollout_steps, discount_factor=args.discount_factor,
+        ac_loss_form=args.ac_loss_form,
     )
     _run(trainer, train_ds, test_ds, args)
 

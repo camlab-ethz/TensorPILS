@@ -114,6 +114,42 @@ def test_ac_reference_self_consistency_convex_concave():
     assert worst < 1e-5, f"CC reference should zero the CC residual, got {worst:.2e}"
 
 
+def test_ac_mm_objective_gradient():
+    """∇J of the minimizing-movement objective equals the convex-concave step residual with the
+    lumped mass diag(M·1) on the cubic — so J's minimiser is the convex-concave step."""
+    from tensorpils.physics import apply_zero_boundary
+    mesh = structured_quad_mesh(11, 11)
+    prob = ACProblem(mesh)
+    mask = prob.boundary_mask
+    a, eps, dt = 1.0, 2.0, 0.01
+    torch.manual_seed(0)
+    N = prob.n_nodes
+    uc = apply_zero_boundary(torch.randn(N, dtype=torch.float64), mask)
+    un = apply_zero_boundary(torch.randn(N, dtype=torch.float64), mask).requires_grad_(True)
+
+    J = prob.mm_objective(uc, un, a=a, eps=eps, dt=dt)
+    g, = torch.autograd.grad(J, un)
+    g = apply_zero_boundary(g, mask)
+
+    m1 = prob._spmm(prob.M, torch.ones(N, dtype=torch.float64))       # lumped mass M·1
+    analytic = apply_zero_boundary(
+        prob._spmm(prob.M, (un.detach() - uc) / dt) + (a * a) * prob._spmm(prob.A, un.detach())
+        + (eps * eps) * (m1 * un.detach() ** 3) - (eps * eps) * prob._spmm(prob.M, uc), mask)
+    assert torch.allclose(g, analytic, atol=1e-9), "grad(J) != lumped-mass convex-concave residual"
+
+
+def test_ac_min_movement_loss_runs():
+    """ACMinMovementLoss returns a finite scalar and is differentiable over a rollout."""
+    from tensorpils.losses import build_ac_loss
+    mesh = structured_quad_mesh(11, 11)
+    prob = ACProblem(mesh)
+    crit = build_ac_loss(prob, a=1.0, eps=2.0, dt=0.005, discount=0.9, form="min_movement")
+    seq = torch.randn(3, 4, prob.n_nodes, dtype=torch.float64, requires_grad=True)
+    loss = crit(seq)
+    loss.backward()
+    assert torch.isfinite(loss) and seq.grad is not None and torch.isfinite(seq.grad).all()
+
+
 def test_ac_reference_sanity():
     """Reference trajectory: zero on boundary, finite/bounded, and net energy non-increasing."""
     mesh = structured_quad_mesh(21, 21)

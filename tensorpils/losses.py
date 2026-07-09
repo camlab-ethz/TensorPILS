@@ -290,9 +290,54 @@ class ACGalerkinLoss(nn.Module):
         return total / wsum
 
 
+class ACMinMovementLoss(nn.Module):
+    r"""Convex–concave minimizing-movement (JKO) objective loss for Allen–Cahn (no labels).
+
+    The Deep-Ritz analogue of :class:`ACGalerkinLoss` for time-stepping: rather than penalising
+    the squared residual ``‖R‖²``, it minimises the convex incremental objective
+    ``J(u^k, u^{k+1})`` (see :meth:`ACProblem.mm_objective`) whose unique minimiser is the
+    convex–concave step. Over a trajectory ``seq`` of shape ``[B, L, N]`` it sums
+    ``discount**k · J(u^k, u^{k+1})`` across consecutive pairs (mean over batch). ``J`` is already
+    a full spatial functional, so no per-node reduction is applied. This is intrinsically the
+    convex–concave scheme (the split is what makes ``J`` convex), so there is no integrator flag.
+    """
+
+    def __init__(self, problem: ACProblem, a: float, eps: float, dt: float, discount: float = 1.0):
+        super().__init__()
+        self.problem = problem
+        self.a = a
+        self.eps = eps
+        self.dt = dt
+        self.discount = discount
+
+    def forward(self, seq_node: torch.Tensor) -> torch.Tensor:
+        L = seq_node.shape[1]
+        if L < 2:
+            raise ValueError(f"AC min-movement loss needs at least 2 frames, got L={L}")
+        total = seq_node.new_zeros(())
+        wsum = 0.0
+        for k in range(L - 1):
+            Jk = self.problem.mm_objective(seq_node[:, k], seq_node[:, k + 1],
+                                           self.a, self.eps, self.dt)   # [B]
+            w = self.discount ** k
+            total = total + w * Jk.mean()                               # mean over batch
+            wsum += w
+        return total / wsum
+
+
 def build_ac_loss(problem: ACProblem, a: float, eps: float, dt: float, discount: float = 1.0,
-                  integrator: str = "backward_euler"):
-    """Factory for the Allen–Cahn physics (Galerkin least-squares) criterion. The supervised data
-    term is a plain trajectory MSE handled by the trainer; only the residual loss is assembled
-    here. ``integrator`` picks the residual scheme (``backward_euler`` | ``convex_concave``)."""
-    return ACGalerkinLoss(problem, a=a, eps=eps, dt=dt, discount=discount, integrator=integrator)
+                  integrator: str = "backward_euler", form: str = "galerkin"):
+    """Factory for the Allen–Cahn physics criterion. The supervised data term is a plain
+    trajectory MSE handled by the trainer; only the label-free physics loss is assembled here.
+
+    ``form`` picks the physics loss:
+      * ``"galerkin"`` — least-squares residual ``½‖R‖²`` (:class:`ACGalerkinLoss`); ``integrator``
+        selects the residual scheme (``backward_euler`` | ``convex_concave``).
+      * ``"min_movement"`` — convex–concave minimizing-movement objective ``J``
+        (:class:`ACMinMovementLoss`); intrinsically convex–concave, ``integrator`` is ignored.
+    """
+    if form == "galerkin":
+        return ACGalerkinLoss(problem, a=a, eps=eps, dt=dt, discount=discount, integrator=integrator)
+    if form == "min_movement":
+        return ACMinMovementLoss(problem, a=a, eps=eps, dt=dt, discount=discount)
+    raise ValueError(f"unknown AC loss form {form!r}; expected 'galerkin' or 'min_movement'")

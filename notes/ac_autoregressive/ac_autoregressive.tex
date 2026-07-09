@@ -105,6 +105,32 @@ a flag (\texttt{ACProblem.residual(\dots, integrator=\dots)}, wired through
 first prediction $u^0\!\to\!\uhat^{\,1}$; the $k\ge1$ terms couple prediction to prediction. No
 labels are used.
 
+\paragraph{Physics variant: minimizing-movement (JKO) objective.}
+The convex--concave step \eqref{eq:cc} is also the unique minimiser of an \emph{incremental}
+(minimizing-movement) objective, giving a Deep-Ritz-style alternative to the least-squares
+residual \eqref{eq:lgal}. With the energy split $E=E_{\mathrm{cvx}}+E_{\mathrm{ccv}}$,
+$E_{\mathrm{cvx}}(u)=\tfrac{a^2}{2}\!\int|\nabla u|^2+\tfrac{\epsilon^2}{4}\!\int u^4+\tfrac{\epsilon^2}{4}|\Omega|$
+and $E_{\mathrm{ccv}}(u)=-\tfrac{\epsilon^2}{2}\!\int u^2$ (so $DE_{\mathrm{ccv}}(u^k)=-\epsilon^2 u^k$),
+the step is $u^{k+1}=\arg\min_u J(u^k,u)$ with $J=E_{\mathrm{cvx}}(u)+\langle DE_{\mathrm{ccv}}(u^k),u\rangle_{L^2}
++\tfrac{1}{2\dt}\|u-u^k\|_{L^2}^2$. Discretised (mass matrix for the $L^2$ inner products, nodal
+quartic $\int u^4\approx(u^4)^\top M\mathbf 1$),
+\begin{equation}
+  J(u^{k},u^{k+1}) = \tfrac{a^2}{2}(u^{k+1})^\top A u^{k+1}
+    + \tfrac{\epsilon^2}{4}\big[((u^{k+1})^4)^\top M\mathbf 1 + |\Omega|\big]
+    - \epsilon^2 (u^{k})^\top M u^{k+1}
+    + \tfrac{1}{2\dt}(u^{k+1}-u^{k})^\top M(u^{k+1}-u^{k}),
+  \label{eq:mm}
+\end{equation}
+with $|\Omega|=\mathbf 1^\top M\mathbf 1$. The loss uses $J$ in place of $\tfrac12\|R\|^2$:
+$\mathcal L_{\mathrm{mm}}(s)=\big(\sum_k\gamma^k\big)^{-1}\sum_k\gamma^k\,\langle J(s^k,s^{k+1})\rangle_{\mathrm{batch}}$.
+Its gradient is the convex--concave residual with the \emph{lumped} mass on the cubic,
+$\nabla_{u^{k+1}}J = M\tfrac{u^{k+1}-u^{k}}{\dt}+a^2Au^{k+1}
++\epsilon^2\operatorname{diag}(M\mathbf 1)(u^{k+1})^3-\epsilon^2 M u^{k}$, so its minimiser is the
+step \eqref{eq:cc} up to consistent-vs-lumped mass on the reaction — hence a \emph{variant} of $R$.
+Being convex, $J$ is \emph{minimised} rather than driven to zero (the Deep-Ritz analogue for the
+gradient flow). Selected by \texttt{--ac\_loss\_form min\_movement}
+(\texttt{ACProblem.mm\_objective} / \texttt{ACMinMovementLoss}).
+
 \paragraph{Data (supervised trajectory MSE).}
 Against the reference frames $u^{1},\dots,u^{R}$ of the FEM trajectory (\S\ref{sec:ref}),
 \begin{equation}
@@ -184,10 +210,12 @@ the convex--concave reference up to the time-discretisation error.
   \item One-step map $\mathcal G_\theta$ and the autoregressive rollout $s$:
         \texttt{tensorpils/trainer.py} $\to$ \texttt{RolloutTrainer.\_rollout}
         (\texttt{n\_seed\_frames}$=1$ for AC, set by \texttt{ACTrainer}).
-  \item Discounted least-squares residual sum \eqref{eq:lgal} (integrator-selectable):
-        \texttt{tensorpils/losses.py} $\to$ \texttt{ACGalerkinLoss.forward} / \texttt{build\_ac\_loss}
-        (residual scheme from \texttt{ACProblem.residual(\dots, integrator)}, exposed as
-        \texttt{--ac\_integrator}).
+  \item Discounted least-squares residual sum \eqref{eq:lgal} (integrator-selectable) and the
+        minimizing-movement objective \eqref{eq:mm}:
+        \texttt{tensorpils/losses.py} $\to$ \texttt{ACGalerkinLoss} / \texttt{ACMinMovementLoss}
+        / \texttt{build\_ac\_loss} (residual scheme from \texttt{ACProblem.residual(\dots, integrator)}
+        and objective from \texttt{ACProblem.mm\_objective}, exposed as \texttt{--ac\_integrator} /
+        \texttt{--ac\_loss\_form}).
   \item Total loss ($\lambda_{\mathrm{gal}}\mathcal L_{\mathrm{gal}}+\lambda_{\mathrm{data}}\mathcal L_{\mathrm{data}}$)
         and rollout-MSE eval:
         \texttt{tensorpils/trainer.py} $\to$ \texttt{RolloutTrainer.train\_epoch / \_eval\_loader}.
