@@ -11,6 +11,11 @@
 #     sbatch experiments/ac_loss_comparison/sweep.sbatch
 # Watch:   squeue --me      Logs: logs/ac_losscmp_<jobid>_<task>.out
 #
+# NOTE: --ac_ref_chunk 1. At grid 64 the interior system is 3844x3844; MAGMA's *batched* LU
+# (magma_sgetrf_batched, used by torch.linalg.solve for batch>1) hits an illegal memory access
+# at this size, so the reference solve must run one sample at a time (non-batched path). Same
+# result, ~serial solves. (Proper fix later: iterative CG on the SPD convex-concave Jacobian.)
+#
 #SBATCH --job-name=pils-ac-losscmp
 #SBATCH --time=12:00:00
 #SBATCH --gpus=1
@@ -43,6 +48,8 @@ python -m tensorpils.cli --pde ac \
     --grid_resolution 64 \
     --dt 0.0025 --n_steps 10 --rollout_steps 10 \
     --ac_newton_tol 1e-6 \
+    --ac_ref_chunk 1 \
+
     --n_train 1024 --n_val 128 --n_test 256 \
     --epochs 1000 \
     --batch_size 32 \
