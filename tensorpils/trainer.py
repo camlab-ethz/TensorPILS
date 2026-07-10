@@ -668,6 +668,7 @@ class RolloutTrainer(BaseTrainer):
             "ac_integrator": getattr(self, "ac_integrator", None),
             "lambda_galerkin": self.lambda_galerkin,
             "lambda_data": self.lambda_data,
+            "a": getattr(self, "a", None), "eps": getattr(self, "eps", None),
             "dt": self.dt, "n_steps": self.n_steps, "rollout_steps": self.rollout_steps,
             "K": self.K, "n_train": len(self.train_dataset), "epochs": self.epochs,
             "best_val_mse": self.stats.best_val_error, "best_epoch": self.stats.best_epoch,
