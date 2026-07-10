@@ -150,6 +150,20 @@ def test_ac_min_movement_loss_runs():
     assert torch.isfinite(loss) and seq.grad is not None and torch.isfinite(seq.grad).all()
 
 
+def test_ac_min_movement_detaches_proximal_centre():
+    """The previous frame u^k is the fixed proximal centre of u^{k+1}=argmin_u J(u^k;u), so the
+    loss must not backprop into it. Otherwise every rollout frame receives a spurious ∂J/∂u^k
+    gradient that does NOT vanish at the correct dynamics, distorting the trained trajectory."""
+    from tensorpils.losses import build_ac_loss
+    prob = ACProblem(structured_quad_mesh(11, 11))
+    crit = build_ac_loss(prob, a=1.0, eps=2.0, dt=0.0025, discount=0.9, form="min_movement")
+    seq = torch.randn(2, 4, prob.n_nodes, dtype=torch.float64, requires_grad=True)  # [B, L=4, N]
+    crit(seq).backward()
+    g = seq.grad.reshape(2, 4, -1).norm(dim=(0, 2))          # per-frame gradient norm, frames 0..3
+    assert g[0].item() == 0.0, "seed frame (pure proximal centre) must receive no gradient"
+    assert (g[1:] > 0).all(), "model-predicted frames must still be trained"
+
+
 def test_ac_reference_sanity():
     """Reference trajectory: zero on boundary, finite/bounded, and net energy non-increasing."""
     mesh = structured_quad_mesh(21, 21)

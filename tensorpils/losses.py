@@ -317,7 +317,13 @@ class ACMinMovementLoss(nn.Module):
         total = seq_node.new_zeros(())
         wsum = 0.0
         for k in range(L - 1):
-            Jk = self.problem.mm_objective(seq_node[:, k], seq_node[:, k + 1],
+            # u^k is the FIXED proximal centre of the minimizing-movement step
+            # u^{k+1}=argmin_u J(u^k; u): detach it so backprop trains only the new frame. Without
+            # this, in the autoregressive rollout every intermediate frame also receives ∂J/∂u^k,
+            # which does NOT vanish at the correct dynamics (unlike the self-balancing ½‖R‖²),
+            # so the summed objective's minimiser is a distorted trajectory. (Also the standard
+            # "pushforward" trick for stable autoregressive training.)
+            Jk = self.problem.mm_objective(seq_node[:, k].detach(), seq_node[:, k + 1],
                                            self.a, self.eps, self.dt)   # [B]
             w = self.discount ** k
             total = total + w * Jk.mean()                               # mean over batch

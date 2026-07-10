@@ -131,6 +131,16 @@ Being convex, $J$ is \emph{minimised} rather than driven to zero (the Deep-Ritz 
 gradient flow). Selected by \texttt{--ac\_loss\_form min\_movement}
 (\texttt{ACProblem.mm\_objective} / \texttt{ACMinMovementLoss}).
 
+\paragraph{Detaching the proximal centre (important).} The step is $u^{k+1}=\arg\min_u J(u^k;u)$
+with $u^k$ \emph{given}: the argmin is over the new frame only, and $u^k$ is the fixed proximal
+centre. Crucially $\nabla_{u^k}J = -\epsilon^2 M u^{k+1}-\tfrac{1}{\dt}M(u^{k+1}-u^k)\neq 0$ even
+at the correct step. So in the autoregressive rollout, where each intermediate frame is also the
+$u^k$ of the next step, backpropagating through $u^k$ injects a spurious gradient that does
+\emph{not} vanish at the true dynamics, and the summed objective's minimiser is a distorted
+trajectory. The loss therefore \textbf{detaches} $u^k$ (trains only the new frame; the standard
+``pushforward'' trick). The least-squares residual \eqref{eq:lgal} needs no such care because
+$\nabla\tfrac12\|R\|^2=J_R^\top R$ vanishes in \emph{both} arguments when $R=0$.
+
 \paragraph{Data (supervised trajectory MSE).}
 Against the reference frames $u^{1},\dots,u^{R}$ of the FEM trajectory (\S\ref{sec:ref}),
 \begin{equation}
