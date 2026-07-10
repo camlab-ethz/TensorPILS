@@ -1,9 +1,11 @@
 # Experiment: Allen-Cahn loss stress-test (sweep in reaction strength eps)
 
-In `ac_loss_comparison/` all four losses converged together in the easy (diffusion-dominated)
-regime. This experiment pushes toward a **hard** regime by increasing the reaction strength
-`eps` — recall the reaction coefficient is `eps^2`, so `eps=256` means `65536`. As `eps` grows the
-double-well engages, interfaces sharpen (`delta ~ a/eps`), and the problem stiffens.
+**Story: physics-informed learning with the *correct* physics loss helps for Allen-Cahn.** In
+`ac_loss_comparison/` all losses tied in the easy (diffusion-dominated) regime. Here we increase
+the reaction strength `eps` (reaction coefficient `eps^2`), so the double-well engages, interfaces
+sharpen (`delta ~ a/eps`), and the problem stiffens. As it does, the **minimizing-movement** loss
+(the well-conditioned convex-concave objective) stays accurate while the **data-driven** and
+**least-squares residual** losses fall apart.
 
 Three losses (backward-Euler Galerkin dropped — it targets the BE operator, which drifts from the
 CC reference), on the **same convex-concave reference** at each `eps`:
@@ -14,8 +16,9 @@ CC reference), on the **same convex-concave reference** at each `eps`:
 | 1 | Galerkin (convex-concave) | `--loss galerkin --ac_loss_integrator convex_concave` |
 | 2 | minimizing-movement | `--loss galerkin --ac_loss_form min_movement` |
 
-Sweep: **`eps = 2, 4, 8, 16, 32`** (5) x 3 losses = **15 runs** (2D SLURM array), **100 epochs**
-for fast turnover (run longer / larger `eps` overnight).
+Sweep: **`eps = 4, 8, 12, 16, 20, 24`** (6, equally spaced) x 3 losses = **18 runs** (2D SLURM
+array), **100 epochs** for fast turnover. The `eps=4, 8, 16` runs can be reused from a prior
+100-epoch sweep; only `eps=12, 20, 24` are new (see the submit note in `sweep.sbatch`).
 
 ## Facts
 
@@ -29,7 +32,7 @@ for fast turnover (run longer / larger `eps` overnight).
 | Metric | best-model test space-time / final-time relative FEM-`L^2` (+ MSE), vs `eps` |
 | Output dir | `output/ac_stresstest/` (git-ignored) |
 
-Runs are tagged `fno_ac_{data|galerkin}_{ls|mm}_{cc|be}_..._eps{E}_...` so all 32 coexist.
+Runs are tagged `fno_ac_{data|galerkin}_{ls|mm}_cc_..._eps{E}_...` so all `eps` x loss coexist.
 
 ## What is (and isn't) meaningful at large eps
 
@@ -56,24 +59,27 @@ At the fixed `dt=0.0025`, `n=64`, `a=1` used here:
 
 | `eps` | `dt*eps^2` | `delta=sqrt(2)/eps` | pts/interface (`delta*64`) | resolved? |
 |----:|-------:|-------:|-----:|:--|
-| 2 | 0.01 | 0.71 | 45 | yes |
 | 4 | 0.04 | 0.35 | 23 | yes |
 | 8 | 0.16 | 0.18 | 11 | yes |
+| 12 | 0.36 | 0.12 | 7.5 | yes |
 | 16 | 0.64 | 0.088 | 5.7 | borderline |
-| 32 | 2.6 | 0.044 | 2.8 | under (time) |
-| 64 | 10 | 0.022 | 1.4 | under (both) |
-| 128 | 41 | 0.011 | 0.7 | interface < mesh |
-| 256 | 164 | 0.0055 | 0.35 | far under |
+| 20 | 1.0 | 0.071 | 4.5 | under (time) |
+| 24 | 1.4 | 0.059 | 3.8 | under (time) |
 
-**Well-resolved cutoff ~ `eps=16`** (time binds first); the plot marks it with a dotted line. To
-stay resolved you would scale `dt = 0.0025*(16/eps)^2` and `n = 64*(eps/16)` for `eps>16` — a much
-more expensive experiment left for later. This sweep intentionally holds resolution fixed.
+**Well-resolved cutoff ~ `eps=16`** (time binds first: `dt*eps^2` crosses ~1 near there); the plot
+marks it with a dotted line. To stay resolved you would scale `dt = 0.0025*(16/eps)^2` and
+`n = 64*(eps/16)` for `eps>16` — a more expensive experiment left for later. This sweep
+intentionally holds resolution fixed, so the errors rising past `eps~16` reflect the fixed
+resolution as much as the loss — the *relative* ordering of losses is the point.
 
 ## Run (Euler)
 
 ```bash
 mkdir -p logs
-sbatch experiments/ac_stresstest/sweep.sbatch      # 32-task array (0-31), capped at 8 concurrent
+# only the NEW eps=12,20,24 (reuse eps=4,8,16 from a prior 100-epoch sweep):
+sbatch --array=6-8,12-17 experiments/ac_stresstest/sweep.sbatch
+# ...or the full 18-task array if starting fresh:
+# sbatch experiments/ac_stresstest/sweep.sbatch
 squeue --me
 ```
 
@@ -81,8 +87,11 @@ squeue --me
 
 ```bash
 python experiments/ac_stresstest/plot_ac_stresstest.py \
-    --results_dir output/ac_stresstest/results       # --metric {st_rel_l2,final_rel_l2,mse}
+    --results_dir output/ac_stresstest/results --eps_min 4 --eps_max 24
+    # --metric {st_rel_l2,final_rel_l2,mse}
 ```
 
-Produces `output/ac_stresstest/ac_stresstest_{metric}.png` — test error vs `eps`, one curve per
-training loss (log-log; dotted line at the `eps~16` resolution cutoff).
+`--eps_min/--eps_max` restrict to the equally-spaced grid (dropping any leftover `eps=2, 32` JSONs
+from an earlier sweep). Produces `output/ac_stresstest/ac_stresstest_{metric}.png` — test error vs
+`eps` on a **linear** axis, one curve per training loss (dotted line at the `eps~16` resolution
+cutoff).

@@ -1,17 +1,19 @@
 #!/bin/bash
 # Stress-test three Allen-Cahn training losses across increasing reaction strength eps (eps is
-# squared in the PDE, so eps=32 => reaction coefficient 1024). Reference data is the convex-concave
+# squared in the PDE, so eps=24 => reaction coefficient 576). Reference data is the convex-concave
 # (Eyre) FEM integrator, which is unconditionally energy-stable, so it stays well-defined even
 # where dt/mesh under-resolve the physics (that is the point of the stress).
 #
-# 2D SLURM array of 15 tasks = 5 eps values x 3 losses:
+# 2D SLURM array of 18 tasks = 6 eps values x 3 losses:
 #   task t:  eps = EPS[t / 3],  loss = ARMS[t % 3]
 #     ARMS: 0 data-driven | 1 Galerkin convex-concave | 2 minimizing-movement
 # (backward-Euler dropped: it targets the BE operator, which drifts from the CC reference.)
-# 100 epochs for fast turnover; run longer sweeps overnight. %8 caps concurrency at 8 jobs.
+# 100 epochs for fast turnover. %8 caps concurrency at 8 jobs.
 #
 # Submit from ~/TensorPILS after `mkdir -p logs`:
-#     sbatch experiments/ac_stresstest/sweep.sbatch
+#     sbatch experiments/ac_stresstest/sweep.sbatch                 # all 18
+#     sbatch --array=6-8,12-17 experiments/ac_stresstest/sweep.sbatch   # only NEW eps=12,20,24
+#       (eps=4,8,16 -> tasks 0-2,3-5,9-11 can be reused from a prior 100-epoch run)
 # Watch:   squeue --me      Logs: logs/ac_stress_<jobid>_<task>.out
 #
 #SBATCH --job-name=pils-ac-stress
@@ -20,7 +22,7 @@
 #SBATCH --gres=gpumem:20g
 #SBATCH --mem-per-cpu=8G
 #SBATCH --output=logs/ac_stress_%A_%a.out
-#SBATCH --array=0-14%8
+#SBATCH --array=0-17%8
 
 # --ac_ref_chunk 1: at grid 64 the interior system is 3844x3844 and MAGMA's batched LU
 # (magma_sgetrf_batched, batch>1) throws an illegal memory access at that size on the cluster
@@ -30,7 +32,7 @@
 source ~/env_tensorpils.sh
 set -eo pipefail
 
-EPS=(2 4 8 16 32)
+EPS=(4 8 12 16 20 24)
 ARMS=(
     "--loss data"                                          # 0 data-driven
     "--loss galerkin --ac_loss_integrator convex_concave"  # 1 Galerkin convex-concave
