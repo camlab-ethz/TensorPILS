@@ -151,6 +151,47 @@ Against the reference frames $u^{1},\dots,u^{R}$ of the FEM trajectory (\S\ref{s
 (fully label-free); \texttt{--loss data} sets $(0,1)$ (fully supervised); the two weights can also
 be set explicitly to blend them.
 
+\section{Autoregressive training modes}
+\label{sec:artrain}
+
+The one-step map $\mathcal G_\theta$ is trained over a horizon of $R$ steps, but there are several
+ways to supply its inputs during training. They differ in whether each step is fed the ground-truth
+frame or the model's own prediction, and in whether gradients flow back through earlier steps. The
+central tension is \emph{exposure bias}: a model that only ever sees ground-truth inputs never
+learns to correct its own errors, so its free-running rollout drifts off the training manifold and
+compounds.
+
+\begin{itemize}\itemsep3pt
+  \item \textbf{Teacher forcing (one-step).} Feed the \emph{ground-truth} previous frame at every
+        step: minimise $\sum_k\|\mathcal G_\theta(u^{k})-u^{k+1}\|^2$ over reference pairs. The
+        steps decouple, so the objective is well-conditioned (identity Hessian in $u$) and easy to
+        train --- but exposure bias makes the resulting rollout prone to instability.
+  \item \textbf{Free-running rollout (full BPTT).} Seed with $u^0$, feed the model \emph{its own}
+        predictions $\uhat^{k}$, and backpropagate through the whole unrolled chain (either the data
+        MSE $\sum_k\|\uhat^{k}-u^{k}\|^2$ or the physics residual \eqref{eq:lgal} over the same
+        rollout). This matches deployment and exposes the model to its own error distribution, so it
+        learns to be self-correcting --- but it is badly conditioned in $\theta$ (errors compound
+        through $R$ near-thresholding steps; deep BPTT). At stiff $\epsilon$ the \emph{data-matching}
+        version stalls at the trivial predictor $\uhat\approx 0$, whereas the \emph{physics} version
+        only asks for per-step self-consistency (consecutive frames obey the discrete step),
+        achievable regardless of drift --- which is why the physics losses keep their rollout
+        robustness without the trivial-predictor trap.
+  \item \textbf{Pushforward (detached-input unrolling).} Roll on the model's own predictions but
+        \emph{detach} each step's input, so the gradient is one-step (no backprop through the
+        rollout). The model still sees its own drifted states --- curing exposure bias --- while the
+        objective stays as well-conditioned as teacher forcing (the ``pushforward trick'',
+        Brandstetter, Worrall \& Welling, 2022). The minimizing-movement loss's detached proximal
+        centre is exactly this idea applied to the incremental objective.
+  \item \textbf{Scheduled sampling / curriculum.} Interpolate: with some probability feed the true
+        frame, otherwise the prediction, annealing toward free-running over training (Bengio et
+        al., 2015); or unroll a truncated horizon $k<R$ and grow $k$. Trades optimisation ease for
+        rollout robustness gradually.
+\end{itemize}
+
+\noindent In all cases \emph{evaluation} is the free-running rollout (the deployment metric), so a
+teacher-forced model is judged on a rollout it was never trained to stabilise --- a direct probe of
+exposure bias.
+
 \section{The FEM reference (discrete target)}
 \label{sec:ref}
 
