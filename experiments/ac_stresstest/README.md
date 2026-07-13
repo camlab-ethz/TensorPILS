@@ -17,18 +17,18 @@ CC reference), on the **same convex-concave reference** at each `eps`:
 | 2 | minimizing-movement | `--loss galerkin --ac_loss_form min_movement` |
 
 Sweep: **`eps = 4, 8, 12, 16, 20, 24`** (6, equally spaced) x 3 losses = **18 runs** (2D SLURM
-array), **100 epochs** for fast turnover. The `eps=4, 8, 16` runs can be reused from a prior
-100-epoch sweep; only `eps=12, 20, 24` are new (see the submit note in `sweep.sbatch`).
+array), **500 epochs** for a converged figure. Run the full array — 500-epoch runs are not
+comparable to any earlier 100-epoch sweep.
 
 ## Facts
 
 | | |
 |---|---|
 | PDE | Allen-Cahn, `a=1`, zero Dirichlet; reaction `eps^2 (u - u^3)` |
-| Reference data | convex-concave (Eyre) FEM + Newton (sparse, float64 solve), `--ac_ref_chunk 1` |
+| Reference data | convex-concave (Eyre) FEM + Newton (sparse, float64 solve) |
 | Fixed resolution | grid `64^2`, `dt=0.0025`, `n_steps=rollout_steps=10` (deliberately **not** scaled with `eps`) |
 | Dataset | `K=4`, `n_train=1024`, `n_val=128`, `n_test=256`, `seed=42` |
-| Optimizer / epochs | `adam`, cosine `1e-3->1e-4`, `100` epochs (fast turnover), batch `32` |
+| Optimizer / epochs | `adam`, cosine `1e-3->1e-4`, `500` epochs, batch `32` |
 | Metric | best-model test space-time / final-time relative FEM-`L^2` (+ MSE), vs `eps` |
 | Output dir | `output/ac_stresstest/` (git-ignored) |
 
@@ -76,10 +76,7 @@ resolution as much as the loss — the *relative* ordering of losses is the poin
 
 ```bash
 mkdir -p logs
-# only the NEW eps=12,20,24 (reuse eps=4,8,16 from a prior 100-epoch sweep):
-sbatch --array=6-8,12-17 experiments/ac_stresstest/sweep.sbatch
-# ...or the full 18-task array if starting fresh:
-# sbatch experiments/ac_stresstest/sweep.sbatch
+sbatch experiments/ac_stresstest/sweep.sbatch      # full 18-task array (0-17), 500 epochs
 squeue --me
 ```
 

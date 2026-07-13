@@ -22,7 +22,7 @@ reference — an intentional test of whether the physics-loss integrator matters
 | | |
 |---|---|
 | PDE | Allen–Cahn, `a=1`, `eps=2`, zero Dirichlet |
-| Reference data | convex–concave (Eyre) FEM + Newton (sparse, float64 solve), `--ac_ref_chunk 1` |
+| Reference data | convex–concave (Eyre) FEM + Newton (sparse, float64 solve) |
 | Initial condition | multi-frequency, `K=4` |
 | Grid / horizon | `64²`, `dt=0.0025`, `n_steps=rollout_steps=10` (`T=0.025`, ≈2–3 decay times) |
 | Dataset | `n_train=1024`, `n_val=128`, `n_test=256`, `seed=42` (identical across all arms) |
@@ -33,12 +33,6 @@ reference — an intentional test of whether the physics-loss integrator matters
 Each arm regenerates the reference dataset from `seed=42` (deterministic ⇒ identical data); the
 `n_steps=rollout_steps` choice avoids solving frames the rollout never uses. Runs are tagged
 `fno_ac_{data|galerkin}_{ls|mm}_{cc|be}_...` so they do not collide.
-
-> `--ac_ref_chunk 1` is required at grid `64²`: the interior Newton system is `3844×3844`, and
-> MAGMA's *batched* LU (`magma_sgetrf_batched`, used by `torch.linalg.solve` for batch>1) throws
-> an illegal memory access at that size on the cluster GPUs. `chunk=1` uses the non-batched solve
-> (serial over samples, identical result). The real fix is to move off dense LA (iterative CG on
-> the SPD convex–concave Jacobian) — a later refactor.
 
 > Caveat: at `eps=2` and this IC amplitude (~0.15) the dynamics are diffusion-dominated (the
 > double-well barely engages), so the physics losses may land close together. Larger IC amplitude
