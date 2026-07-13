@@ -137,8 +137,10 @@ centre. Crucially $\nabla_{u^k}J = -\epsilon^2 M u^{k+1}-\tfrac{1}{\dt}M(u^{k+1}
 at the correct step. So in the autoregressive rollout, where each intermediate frame is also the
 $u^k$ of the next step, backpropagating through $u^k$ injects a spurious gradient that does
 \emph{not} vanish at the true dynamics, and the summed objective's minimiser is a distorted
-trajectory. The loss therefore \textbf{detaches} $u^k$ (trains only the new frame; the standard
-``pushforward'' trick). The least-squares residual \eqref{eq:lgal} needs no such care because
+trajectory. The loss therefore \textbf{detaches the proximal centre} $u^k$ inside $J$. This is
+necessary but \emph{not} the same as the pushforward trick (it detaches $u^k$ only where it appears
+\emph{explicitly} in $J$, not where it feeds the model); \S\ref{sec:mm-pf} makes the distinction
+precise. The least-squares residual \eqref{eq:lgal} needs no such care because
 $\nabla\tfrac12\|R\|^2=J_R^\top R$ vanishes in \emph{both} arguments when $R=0$.
 
 \paragraph{Data (supervised trajectory MSE).}
@@ -180,8 +182,9 @@ compounds.
         \emph{detach} each step's input, so the gradient is one-step (no backprop through the
         rollout). The model still sees its own drifted states --- curing exposure bias --- while the
         objective stays as well-conditioned as teacher forcing (the ``pushforward trick'',
-        Brandstetter, Worrall \& Welling, 2022). The minimizing-movement loss's detached proximal
-        centre is exactly this idea applied to the incremental objective.
+        Brandstetter, Worrall \& Welling, 2022). Note the minimizing-movement loss as \emph{currently
+        implemented} detaches the proximal centre but still backpropagates through the rollout, so it
+        is \emph{not} the pushforward --- see \S\ref{sec:mm-pf}.
   \item \textbf{Scheduled sampling / curriculum.} Interpolate: with some probability feed the true
         frame, otherwise the prediction, annealing toward free-running over training (Bengio et
         al., 2015); or unroll a truncated horizon $k<R$ and grow $k$. Trades optimisation ease for
@@ -191,6 +194,76 @@ compounds.
 \noindent In all cases \emph{evaluation} is the free-running rollout (the deployment metric), so a
 teacher-forced model is judged on a rollout it was never trained to stabilise --- a direct probe of
 exposure bias.
+
+\section{Minimizing movement: intended pushforward vs.\ implemented hybrid}
+\label{sec:mm-pf}
+
+Write $G_\theta$ for the one-step map. The free-running rollout produces $G^k_\theta(u_0)$ (the map
+applied $k$ times), which carries the \emph{full} autoregressive graph --- gradients flow through
+all $k$ applications. Let
+\begin{equation}
+  \uhat_k \;:=\; \operatorname{detach}\big(G^k_\theta(u_0)\big)
+\end{equation}
+be the same frame with its gradient stopped. The convex--concave minimizing-movement step
+contributes, for the transition $k\!\to\!k+1$, the incremental objective \eqref{eq:mm}
+\begin{equation}
+  J(\uhat_k;\,u) \;=\; E_{\mathrm{cvx}}(u)
+    \;+\; \big\langle DE_{\mathrm{ccv}}(\uhat_k),\,u\big\rangle
+    \;+\; \tfrac{1}{2\dt}\,\|u-\uhat_k\|_M^2 ,
+  \label{eq:mm-inc}
+\end{equation}
+with $E_{\mathrm{cvx}}(u)=\tfrac{a^2}{2}u^\top A u+\tfrac{\epsilon^2}{4}(u^4)^\top M\mathbf 1$ and
+$DE_{\mathrm{ccv}}(\uhat_k)=-\epsilon^2\uhat_k$. The middle term is the concave linearisation
+$-\epsilon^2\uhat_k^\top M u$ --- it must not be dropped (a plain $E(u)+\tfrac1{2\dt}\|u-\uhat_k\|^2$
+with the \emph{full} energy $E$ would be the non-convex backward-Euler minimizing movement, a
+different scheme). Both the proximal centre and the concave coupling use the detached $\uhat_k$. The
+two variants differ \emph{only} in what plays the role of the new frame $u=u^{k+1}$:
+
+\paragraph{Intended (pushforward).} Feed the model the detached previous frame,
+\begin{equation}
+  \mathcal L^{\mathrm{pf}}_k \;=\; J\big(\uhat_k;\ G_\theta(\uhat_k)\big),
+\end{equation}
+so the gradient flows through the \emph{single} application $G_\theta(\uhat_k)$; the $k$ earlier
+applications are detached. This is precisely the pushforward trick of Brandstetter, Worrall \&
+Welling (2022) --- so \textbf{the write-up is the pushforward}.
+
+\paragraph{Implemented (full BPTT + detached proximal centre).} The shared rollout
+(\texttt{RolloutTrainer.\_rollout}) never detaches its inputs, so the new frame is the live
+$G^{k+1}_\theta(u_0)$ and only the proximal centre inside $J$ is detached:
+\begin{equation}
+  \mathcal L^{\mathrm{impl}}_k \;=\; J\big(\uhat_k;\ G^{k+1}_\theta(u_0)\big).
+\end{equation}
+The gradient now backpropagates through \emph{all} $k+1$ applications of $G_\theta$ (full BPTT).
+
+\paragraph{The one-line difference.} $u^{k+1}=G_\theta(\uhat_k)$ (single step) vs.\
+$u^{k+1}=G^{k+1}_\theta(u_0)$ (full graph). Both have the \emph{same forward value} (detaching does
+not change it) but different gradients --- measured, a $\sim\!34\%$ relative difference on a
+three-step rollout. So the current code is a \textbf{hybrid}, not the pushforward.
+
+\paragraph{Both are well-posed; the naive scheme is not.} Detaching the proximal centre matters for
+correctness: $\nabla_{\uhat_k}J=-\epsilon^2 Mu^{k+1}-\tfrac1{\dt}M(u^{k+1}-\uhat_k)\neq 0$ at the
+correct step (measured $\approx 0.072$, vs.\ $\approx 3\times10^{-8}$ for the least-squares
+residual), so a scheme that backpropagates through the proximal centre --- no detach anywhere ---
+is minimised by a \emph{distorted} trajectory. With the proximal centre detached, $\nabla_u J$
+vanishes at the correct step in both $\mathcal L^{\mathrm{pf}}$ and $\mathcal L^{\mathrm{impl}}$, so
+both share the right fixed point; they differ only in the gradient \emph{away} from it.
+
+\paragraph{Which should perform best?} A prediction, to be A/B-tested (the existing figures used the
+hybrid):
+\begin{itemize}\itemsep2pt
+  \item The \textbf{naive} no-detach scheme is worst (wrong fixed point) --- consistent with the poor
+        minimizing-movement result before the proximal-centre detach was added.
+  \item The \textbf{pushforward} should be the most robust, especially at stiff $\epsilon$ and long
+        horizons: one-step gradients avoid backpropagating through many near-thresholding steps (the
+        same deep-BPTT ill-conditioning that stalled the free-running data loss), feeding detached
+        predictions exposes the model to its own drifted states (curing exposure bias), and it is
+        cheaper. It is also the literature-recommended default.
+  \item The \textbf{hybrid} (current) should be competitive where the rollout is short and benign ---
+        its full multi-step gradient carries more information --- but is expected to degrade faster as
+        $\epsilon$ grows, inheriting the compounding-gradient problems of deep BPTT.
+\end{itemize}
+\noindent Net expectation: \emph{pushforward} $\gtrsim$ \emph{hybrid} $\gg$ \emph{naive}, with the
+gap widening in the hard regime.
 
 \section{The FEM reference (discrete target)}
 \label{sec:ref}
