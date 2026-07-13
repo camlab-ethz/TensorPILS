@@ -53,7 +53,6 @@ python -m tensorpils.cli --pde ac \
     --ac_a 1.0 --ac_eps "${E}" -k 4 \
     --grid_resolution 64 \
     --dt 0.0025 --n_steps 10 --rollout_steps 10 \
-    --ac_newton_tol 1e-6 \
     --ac_ref_chunk 1 \
     --n_train 1024 --n_val 128 --n_test 256 \
     --epochs 100 \

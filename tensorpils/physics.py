@@ -290,12 +290,16 @@ class ACProblem(FEMOperator):
             return e.sum()
         return e
 
-    # ---------------------------------------------------------- FEM reference solve
+    # ------------------------------------------ FEM reference solve (legacy dense, kept for now)
     @torch.no_grad()
-    def fem_reference(self, u0: torch.Tensor, a: float, eps: float, dt: float,
-                      n_steps: int, newton_tol: float = 1e-8, newton_max: int = 20,
-                      chunk: int = 64, integrator: str = "convex_concave") -> torch.Tensor:
-        r"""Batched implicit + Newton reference trajectory (build-time ground truth).
+    def fem_reference_old(self, u0: torch.Tensor, a: float, eps: float, dt: float,
+                          n_steps: int, newton_tol: float = 1e-8, newton_max: int = 20,
+                          chunk: int = 64, integrator: str = "convex_concave") -> torch.Tensor:
+        r"""Legacy dense batched Newton reference (superseded by :meth:`fem_reference`; kept for
+        comparison/benchmarking, to be removed). Dense ``torch.linalg.solve`` on the interior
+        block, solves in the caller's dtype.
+
+        Batched implicit + Newton reference trajectory (build-time ground truth).
 
         Solves ``R(u^{n+1}; u^n) = 0`` each step by Newton on the interior DOFs (Dirichlet nodes
         held at 0). Uses dense linear algebra on the interior block — appropriate for structured
@@ -365,15 +369,15 @@ class ACProblem(FEMOperator):
                 u_old = u
         return traj[0] if single else traj
 
-    # ------------------------------------------------- FEM reference solve (sparse, v2)
+    # ------------------------------------------ FEM reference solve (sparse float64, standard)
     @torch.no_grad()
-    def fem_reference_v2(self, u0: torch.Tensor, a: float, eps: float, dt: float,
-                         n_steps: int, newton_tol: float = 1e-8, newton_max: int = 20,
-                         chunk: int = 64, integrator: str = "convex_concave",
-                         solver_backend: str = "auto") -> torch.Tensor:
-        r"""Sparse-solve reference trajectory --- drop-in replacement for :meth:`fem_reference`.
+    def fem_reference(self, u0: torch.Tensor, a: float, eps: float, dt: float,
+                      n_steps: int, newton_tol: float = 1e-8, newton_max: int = 20,
+                      chunk: int = 64, integrator: str = "convex_concave",
+                      solver_backend: str = "auto") -> torch.Tensor:
+        r"""Sparse-solve Newton reference trajectory --- the standard build-time ground truth.
 
-        Identical contract and output (same residual/Jacobian, same interior Newton), but each
+        Same contract and output as the legacy dense :meth:`fem_reference_old`, but each
         Newton system is solved with a **batched sparse** solve (``SparseMatrix.solve_batch``:
         shared sparsity, per-sample values) instead of a dense ``torch.linalg.solve``. This drops
         the :math:`O(N_i^2)` memory / :math:`O(N_i^3)` factorisation and sidesteps MAGMA's batched

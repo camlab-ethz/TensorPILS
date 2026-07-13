@@ -25,7 +25,7 @@ array), **100 epochs** for fast turnover. The `eps=4, 8, 16` runs can be reused 
 | | |
 |---|---|
 | PDE | Allen-Cahn, `a=1`, zero Dirichlet; reaction `eps^2 (u - u^3)` |
-| Reference data | convex-concave (Eyre) FEM + Newton, `--ac_newton_tol 1e-6`, `--ac_ref_chunk 1` (fp32) |
+| Reference data | convex-concave (Eyre) FEM + Newton (sparse, float64 solve), `--ac_ref_chunk 1` |
 | Fixed resolution | grid `64^2`, `dt=0.0025`, `n_steps=rollout_steps=10` (deliberately **not** scaled with `eps`) |
 | Dataset | `K=4`, `n_train=1024`, `n_val=128`, `n_test=256`, `seed=42` |
 | Optimizer / epochs | `adam`, cosine `1e-3->1e-4`, `100` epochs (fast turnover), batch `32` |

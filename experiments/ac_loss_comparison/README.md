@@ -22,7 +22,7 @@ reference — an intentional test of whether the physics-loss integrator matters
 | | |
 |---|---|
 | PDE | Allen–Cahn, `a=1`, `eps=2`, zero Dirichlet |
-| Reference data | convex–concave (Eyre) FEM + Newton, `--ac_newton_tol 1e-6`, `--ac_ref_chunk 1` (fp32) |
+| Reference data | convex–concave (Eyre) FEM + Newton (sparse, float64 solve), `--ac_ref_chunk 1` |
 | Initial condition | multi-frequency, `K=4` |
 | Grid / horizon | `64²`, `dt=0.0025`, `n_steps=rollout_steps=10` (`T=0.025`, ≈2–3 decay times) |
 | Dataset | `n_train=1024`, `n_val=128`, `n_test=256`, `seed=42` (identical across all arms) |
