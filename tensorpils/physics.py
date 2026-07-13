@@ -394,13 +394,19 @@ class ACProblem(FEMOperator):
         single = (u0.dim() == 1)
         if single:
             u0 = u0.unsqueeze(0)
-        device, dtype = u0.device, u0.dtype
+        device, out_dtype = u0.device, u0.dtype
+        # The reference is build-time ground truth, so always solve in float64 regardless of the
+        # caller's dtype: fp32 cannot reach newton_tol=1e-8 / the solver's inner tolerance (its
+        # residual floor is ~1e-6), which leaves Newton non-converged AND spinning to newton_max
+        # every step. Cast the trajectory back to the caller's dtype only on return.
+        dtype = torch.float64
+        u0 = u0.to(dtype)
         mask = self.boundary_mask.to(device)
         idx = torch.nonzero(~mask, as_tuple=False).squeeze(1)
         idx_np = idx.cpu().numpy()
 
-        # Interior sparse blocks, assembled once, matched to the input dtype/device. L = M/dt+a²A
-        # is the constant template; M_ii shares its layout so the reaction is a value update.
+        # Interior sparse blocks, assembled once, in float64. L = M/dt+a²A is the constant
+        # template; M_ii shares its layout so the reaction is a value update.
         M_csr = self.M.to_scipy_coo().tocsr()[idx_np][:, idx_np].astype(np.float64).tocoo()
         A_csr = self.A.to_scipy_coo().tocsr()[idx_np][:, idx_np].astype(np.float64).tocoo()
         M_ii = SparseMatrix.from_scipy_coo(M_csr).to(dtype=dtype, device=device)
@@ -439,4 +445,5 @@ class ACProblem(FEMOperator):
                     u = u + du
                 traj[lo:hi, step, idx] = u
                 u_old = u
-        return traj[0] if single else traj
+        traj = traj[0] if single else traj
+        return traj.to(out_dtype)                     # cast fp64 solve back to caller's dtype

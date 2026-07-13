@@ -165,20 +165,30 @@ def test_ac_min_movement_detaches_proximal_centre():
 
 
 def test_fem_reference_v2_matches_v1():
-    """The sparse-solve fem_reference_v2 reproduces the dense fem_reference (both integrators).
+    """Sparse fem_reference_v2 reproduces dense fem_reference AND always solves in float64.
 
-    Differential test guarding the future swap: v2 must match v1 to solver tolerance."""
+    Differential test guarding the future swap (v2 must match v1 to solver tolerance), plus a
+    check that the reference precision is decoupled from the caller's dtype: a float32 call still
+    solves in float64 and only casts the result down."""
     mesh = structured_quad_mesh(17, 17)
     prob = ACProblem(mesh)
     u0 = torch.stack([_ic(mesh, K=3, dtype=torch.float64),
-                      _ic(mesh, K=4, dtype=torch.float64)], dim=0)     # B=2
+                      _ic(mesh, K=4, dtype=torch.float64)], dim=0)     # B=2, float64
     for integ in ("convex_concave", "backward_euler"):
-        kw = dict(a=1.0, eps=8.0, dt=0.0025, n_steps=5, newton_tol=1e-12,
+        kw = dict(a=1.0, eps=8.0, dt=0.0025, n_steps=5, newton_tol=1e-10,
                   newton_max=50, integrator=integ)
-        t1 = prob.fem_reference(u0, chunk=2, **kw)
-        t2 = prob.fem_reference_v2(u0, chunk=2, **kw)
+        t1 = prob.fem_reference(u0, chunk=2, **kw)                     # dense, float64
+        t2 = prob.fem_reference_v2(u0, chunk=2, **kw)                  # sparse, float64
+        assert t2.dtype == torch.float64
         assert torch.allclose(t1, t2, atol=1e-6), \
             f"fem_reference_v2 != fem_reference ({integ}): {(t1 - t2).abs().max():.2e}"
+
+        # float32 input: returned in float32 but solved in float64, so (cast up) it matches the
+        # float64 call to ~float32 rounding -- NOT the ~1e-6 floor a genuine float32 solve hits.
+        t32 = prob.fem_reference_v2(u0.float(), chunk=2, **kw)
+        assert t32.dtype == torch.float32
+        assert torch.allclose(t32.double(), t2, atol=1e-5), \
+            f"float32-input v2 lost precision ({integ}): {(t32.double() - t2).abs().max():.2e}"
 
 
 def test_ac_reference_sanity():
