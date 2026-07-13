@@ -364,3 +364,79 @@ class ACProblem(FEMOperator):
                 traj[lo:hi, step, idx] = u
                 u_old = u
         return traj[0] if single else traj
+
+    # ------------------------------------------------- FEM reference solve (sparse, v2)
+    @torch.no_grad()
+    def fem_reference_v2(self, u0: torch.Tensor, a: float, eps: float, dt: float,
+                         n_steps: int, newton_tol: float = 1e-8, newton_max: int = 20,
+                         chunk: int = 64, integrator: str = "convex_concave",
+                         solver_backend: str = "auto") -> torch.Tensor:
+        r"""Sparse-solve reference trajectory --- drop-in replacement for :meth:`fem_reference`.
+
+        Identical contract and output (same residual/Jacobian, same interior Newton), but each
+        Newton system is solved with a **batched sparse** solve (``SparseMatrix.solve_batch``:
+        shared sparsity, per-sample values) instead of a dense ``torch.linalg.solve``. This drops
+        the :math:`O(N_i^2)` memory / :math:`O(N_i^3)` factorisation and sidesteps MAGMA's batched
+        dense LU (which fails at large grids). ``solve_batch`` loops per sample internally, so it is
+        genuinely sparse but not GPU-parallel; SPD is auto-detected for the convex--concave path.
+
+        The interior Jacobian is ``J = M/dt + a^2 A + M diag(w)`` with ``w = 3 eps^2 u^2``
+        (convex_concave) or ``w = eps^2 (3u^2 - 1)`` (backward_euler); its values are assembled per
+        Newton step as ``L.values + M.values * w[:, col]`` on the shared ``(row,col)`` layout of
+        ``L = M/dt + a^2 A``. ``solver_backend`` is passed through (``"auto"`` picks scipy on CPU,
+        cupy/cuDSS on CUDA if installed)."""
+        if integrator not in ("convex_concave", "backward_euler"):
+            raise ValueError(f"unknown integrator {integrator!r}; "
+                             "expected 'convex_concave' or 'backward_euler'")
+        import numpy as np
+        from tensormesh.sparse.matrix import SparseMatrix
+
+        single = (u0.dim() == 1)
+        if single:
+            u0 = u0.unsqueeze(0)
+        device, dtype = u0.device, u0.dtype
+        mask = self.boundary_mask.to(device)
+        idx = torch.nonzero(~mask, as_tuple=False).squeeze(1)
+        idx_np = idx.cpu().numpy()
+
+        # Interior sparse blocks, assembled once, matched to the input dtype/device. L = M/dt+a²A
+        # is the constant template; M_ii shares its layout so the reaction is a value update.
+        M_csr = self.M.to_scipy_coo().tocsr()[idx_np][:, idx_np].astype(np.float64).tocoo()
+        A_csr = self.A.to_scipy_coo().tocsr()[idx_np][:, idx_np].astype(np.float64).tocoo()
+        M_ii = SparseMatrix.from_scipy_coo(M_csr).to(dtype=dtype, device=device)
+        A_ii = SparseMatrix.from_scipy_coo(A_csr).to(dtype=dtype, device=device)
+        L_ii = (M_ii * (1.0 / dt) + A_ii * (a * a)).to(dtype=dtype, device=device)
+        col, L_vals, M_vals = L_ii.col_indices, L_ii.values, M_ii.values
+
+        def matvec(mat, x):                                   # [b, Ni] -> [b, Ni]
+            return (mat @ x.T).T
+
+        B = u0.shape[0]
+        traj = torch.zeros(B, n_steps + 1, self.n_nodes, device=device, dtype=dtype)
+        traj[:, 0] = apply_zero_boundary(u0, mask)
+
+        for lo in range(0, B, chunk):
+            hi = min(lo + chunk, B)
+            u_old = traj[lo:hi, 0, idx].clone()               # [b, Ni]
+            for step in range(1, n_steps + 1):
+                u = u_old.clone()
+                for _ in range(newton_max):
+                    if integrator == "backward_euler":
+                        reac = (eps * eps) * (u - u ** 3)     # ε²(u-u³) fully implicit
+                        r_sign = -1.0
+                        w = (eps * eps) * (3.0 * u * u - 1.0)
+                    else:                                     # convex_concave (Eyre split)
+                        reac = (eps * eps) * (u ** 3 - u_old)
+                        r_sign = +1.0
+                        w = 3.0 * (eps * eps) * (u * u)
+                    r = matvec(M_ii, (u - u_old) / dt) \
+                        + (a * a) * matvec(A_ii, u) \
+                        + r_sign * matvec(M_ii, reac)         # [b, Ni]
+                    if r.norm(dim=1).max() < newton_tol:
+                        break
+                    J_vals = L_vals.unsqueeze(0) + M_vals.unsqueeze(0) * w[:, col]   # [b, nnz]
+                    du = L_ii.solve_batch(J_vals, -r, backend=solver_backend)        # [b, Ni]
+                    u = u + du
+                traj[lo:hi, step, idx] = u
+                u_old = u
+        return traj[0] if single else traj

@@ -164,6 +164,23 @@ def test_ac_min_movement_detaches_proximal_centre():
     assert (g[1:] > 0).all(), "model-predicted frames must still be trained"
 
 
+def test_fem_reference_v2_matches_v1():
+    """The sparse-solve fem_reference_v2 reproduces the dense fem_reference (both integrators).
+
+    Differential test guarding the future swap: v2 must match v1 to solver tolerance."""
+    mesh = structured_quad_mesh(17, 17)
+    prob = ACProblem(mesh)
+    u0 = torch.stack([_ic(mesh, K=3, dtype=torch.float64),
+                      _ic(mesh, K=4, dtype=torch.float64)], dim=0)     # B=2
+    for integ in ("convex_concave", "backward_euler"):
+        kw = dict(a=1.0, eps=8.0, dt=0.0025, n_steps=5, newton_tol=1e-12,
+                  newton_max=50, integrator=integ)
+        t1 = prob.fem_reference(u0, chunk=2, **kw)
+        t2 = prob.fem_reference_v2(u0, chunk=2, **kw)
+        assert torch.allclose(t1, t2, atol=1e-6), \
+            f"fem_reference_v2 != fem_reference ({integ}): {(t1 - t2).abs().max():.2e}"
+
+
 def test_ac_reference_sanity():
     """Reference trajectory: zero on boundary, finite/bounded, and net energy non-increasing."""
     mesh = structured_quad_mesh(21, 21)
