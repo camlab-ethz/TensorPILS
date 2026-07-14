@@ -56,7 +56,7 @@ python -m tensorpils.cli --pde ac \
     --grid_resolution 64 \
     --dt 0.0025 --n_steps 10 --rollout_steps 10 \
     --n_train 1024 --n_val 128 --n_test 256 \
-    --epochs 500 \
+    --epochs 100 \
     --batch_size 32 \
     --optimizer adam \
     --seed 42 \
