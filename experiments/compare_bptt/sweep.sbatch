@@ -6,15 +6,15 @@
 #                  keep full BPTT  -- this is the *current* minimizing-movement default
 #   pushforward  : also detach each rollout input, so gradients are one-step (Brandstetter et al.)
 #
-# One shared sweep over three losses x their modes x eps (48 tasks); plot per-loss afterwards.
-# Config-major layout: task t -> CONFIGS[t/6], EPS[t%6].
+# One shared sweep over three losses x their modes x eps (64 tasks); plot per-loss afterwards.
+# Config-major layout: task t -> CONFIGS[t/NE], EPS[t%NE] with NE = number of eps values.
 #   CONFIGS 0-2  minimizing-movement  x {full_bptt, detach_prev, pushforward}
 #   CONFIGS 3-5  Galerkin (LS, CC)    x {full_bptt, detach_prev, pushforward}
 #   CONFIGS 6-7  data-driven          x {full_bptt, pushforward}   (data has no coupling knob)
 #
 # Submit from ~/TensorPILS after `mkdir -p logs`:
-#     sbatch experiments/compare_bptt/sweep.sbatch          # full 48-task array
-#     sbatch --array=0-17 experiments/compare_bptt/sweep.sbatch   # e.g. minimizing-movement only
+#     sbatch experiments/compare_bptt/sweep.sbatch          # full 64-task array
+#     sbatch --array=0-23 experiments/compare_bptt/sweep.sbatch   # e.g. minimizing-movement only
 # Watch:   squeue --me      Logs: logs/cmp_bptt_<jobid>_<task>.out
 #
 #SBATCH --job-name=pils-cmp-bptt
@@ -23,7 +23,7 @@
 #SBATCH --gres=gpumem:20g
 #SBATCH --mem-per-cpu=8G
 #SBATCH --output=logs/cmp_bptt_%A_%a.out
-#SBATCH --array=0-47%8
+#SBATCH --array=0-63%8
 
 source ~/env_tensorpils.sh
 set -eo pipefail
@@ -38,11 +38,12 @@ CONFIGS=(
     "--loss data --bptt_mode full_bptt"                                    # 6 data full_bptt (current)
     "--loss data --bptt_mode pushforward"                                  # 7 data pushforward
 )
-EPS=(4 8 12 16 20 24)
+EPS=(4 8 12 16 20 24 28 32)
 
 t=$SLURM_ARRAY_TASK_ID
-CFG=${CONFIGS[$((t / 6))]}     # unquoted below on purpose: splits into flags
-E=${EPS[$((t % 6))]}
+NE=${#EPS[@]}                  # eps count; keep --array in sync: 8 configs * NE - 1
+CFG=${CONFIGS[$((t / NE))]}    # unquoted below on purpose: splits into flags
+E=${EPS[$((t % NE))]}
 
 OUT=~/TensorPILS/output/compare_bptt
 
@@ -56,7 +57,7 @@ python -m tensorpils.cli --pde ac \
     --grid_resolution 64 \
     --dt 0.0025 --n_steps 10 --rollout_steps 10 \
     --n_train 1024 --n_val 128 --n_test 256 \
-    --epochs 100 \
+    --epochs 500 \
     --batch_size 32 \
     --optimizer adam \
     --seed 42 \

@@ -23,7 +23,7 @@ value reproduces them; the sweep sets the mode explicitly).
 
 ## Sweep
 
-Three losses × their modes × `eps = 4, 8, 12, 16, 20, 24` = **48 runs** (config-major array):
+Three losses × their modes × `eps = 4, 8, 12, 16, 20, 24, 28, 32` = **64 runs** (config-major array):
 
 | configs | loss | modes |
 |---|---|---|
@@ -48,9 +48,9 @@ Runs are tagged `fno_ac_..._bptt-{full,detach,push}_..._eps{E}_...` so all 48 co
 
 ```bash
 mkdir -p logs
-sbatch experiments/compare_bptt/sweep.sbatch          # full 48-task array (0-47), %8 concurrent
+sbatch experiments/compare_bptt/sweep.sbatch          # full 64-task array (0-63), %8 concurrent
 # or a subset, e.g. minimizing-movement only:
-# sbatch --array=0-17 experiments/compare_bptt/sweep.sbatch
+# sbatch --array=0-23 experiments/compare_bptt/sweep.sbatch
 squeue --me
 ```
 
