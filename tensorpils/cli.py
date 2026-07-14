@@ -303,12 +303,12 @@ def run_ac(args, device):
 
 def _build_model(args, in_channels: int):
     print("Building model...")
-    model = FNOModel(
-        n_modes=tuple(args.n_modes),
-        hidden_channels=args.hidden_dim,
-        in_channels=in_channels, out_channels=1,
-        n_layers=args.num_layers,
-    )
+    cfg = dict(n_modes=tuple(args.n_modes), hidden_channels=args.hidden_dim,
+               in_channels=in_channels, out_channels=1, n_layers=args.num_layers)
+    model = FNOModel(**cfg)
+    # Stash the constructor config so a checkpoint can be reloaded without re-guessing it later
+    # (e.g. the long_rollout analysis rebuilds the model from this).
+    model.build_config = cfg
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  parameters: {n_params:,}\n")
     return model
