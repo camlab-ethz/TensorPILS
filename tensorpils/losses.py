@@ -266,7 +266,7 @@ class ACGalerkinLoss(nn.Module):
     """
 
     def __init__(self, problem: ACProblem, a: float, eps: float, dt: float, discount: float = 1.0,
-                 integrator: str = "backward_euler"):
+                 integrator: str = "backward_euler", detach_coupling=None):
         super().__init__()
         self.problem = problem
         self.a = a
@@ -274,6 +274,10 @@ class ACGalerkinLoss(nn.Module):
         self.dt = dt
         self.discount = discount
         self.integrator = integrator
+        # Whether to detach the previous frame u^k in R(u^k, u^{k+1}). ½‖R‖² is self-balancing
+        # (∇ vanishes in both args at R=0), so the default is False (no detach) — a valid variant
+        # for the bptt-mode study. None -> class default.
+        self.detach_coupling = False if detach_coupling is None else detach_coupling
 
     def forward(self, seq_node: torch.Tensor) -> torch.Tensor:
         L = seq_node.shape[1]
@@ -282,7 +286,8 @@ class ACGalerkinLoss(nn.Module):
         total = seq_node.new_zeros(())
         wsum = 0.0
         for k in range(L - 1):
-            r = self.problem.residual(seq_node[:, k], seq_node[:, k + 1],
+            prev = seq_node[:, k].detach() if self.detach_coupling else seq_node[:, k]
+            r = self.problem.residual(prev, seq_node[:, k + 1],
                                       self.a, self.eps, self.dt, integrator=self.integrator)
             w = self.discount ** k
             total = total + w * (0.5 * (r ** 2).sum(dim=-1).mean())   # ½‖R‖²: sum nodes, mean batch
@@ -302,13 +307,19 @@ class ACMinMovementLoss(nn.Module):
     convex–concave scheme (the split is what makes ``J`` convex), so there is no integrator flag.
     """
 
-    def __init__(self, problem: ACProblem, a: float, eps: float, dt: float, discount: float = 1.0):
+    def __init__(self, problem: ACProblem, a: float, eps: float, dt: float, discount: float = 1.0,
+                 detach_coupling=None):
         super().__init__()
         self.problem = problem
         self.a = a
         self.eps = eps
         self.dt = dt
         self.discount = discount
+        # Whether to detach the proximal centre u^k inside J. Default True: ∇_{u^k}J does NOT
+        # vanish at the correct step, so backpropagating through it distorts the trajectory (see
+        # notes §sec:mm-pf). None -> class default. This is the *coupling* detach only; the
+        # *rollout*-input detach (the full pushforward) is a separate knob on the trainer.
+        self.detach_coupling = True if detach_coupling is None else detach_coupling
 
     def forward(self, seq_node: torch.Tensor) -> torch.Tensor:
         L = seq_node.shape[1]
@@ -317,13 +328,8 @@ class ACMinMovementLoss(nn.Module):
         total = seq_node.new_zeros(())
         wsum = 0.0
         for k in range(L - 1):
-            # u^k is the FIXED proximal centre of the minimizing-movement step
-            # u^{k+1}=argmin_u J(u^k; u): detach it so backprop trains only the new frame. Without
-            # this, in the autoregressive rollout every intermediate frame also receives ∂J/∂u^k,
-            # which does NOT vanish at the correct dynamics (unlike the self-balancing ½‖R‖²),
-            # so the summed objective's minimiser is a distorted trajectory. (Also the standard
-            # "pushforward" trick for stable autoregressive training.)
-            Jk = self.problem.mm_objective(seq_node[:, k].detach(), seq_node[:, k + 1],
+            prev = seq_node[:, k].detach() if self.detach_coupling else seq_node[:, k]
+            Jk = self.problem.mm_objective(prev, seq_node[:, k + 1],
                                            self.a, self.eps, self.dt)   # [B]
             w = self.discount ** k
             total = total + w * Jk.mean()                               # mean over batch
@@ -332,7 +338,8 @@ class ACMinMovementLoss(nn.Module):
 
 
 def build_ac_loss(problem: ACProblem, a: float, eps: float, dt: float, discount: float = 1.0,
-                  integrator: str = "backward_euler", form: str = "galerkin"):
+                  integrator: str = "backward_euler", form: str = "galerkin",
+                  detach_coupling=None):
     """Factory for the Allen–Cahn physics criterion. The supervised data term is a plain
     trajectory MSE handled by the trainer; only the label-free physics loss is assembled here.
 
@@ -343,7 +350,9 @@ def build_ac_loss(problem: ACProblem, a: float, eps: float, dt: float, discount:
         (:class:`ACMinMovementLoss`); intrinsically convex–concave, ``integrator`` is ignored.
     """
     if form == "galerkin":
-        return ACGalerkinLoss(problem, a=a, eps=eps, dt=dt, discount=discount, integrator=integrator)
+        return ACGalerkinLoss(problem, a=a, eps=eps, dt=dt, discount=discount, integrator=integrator,
+                              detach_coupling=detach_coupling)
     if form == "min_movement":
-        return ACMinMovementLoss(problem, a=a, eps=eps, dt=dt, discount=discount)
+        return ACMinMovementLoss(problem, a=a, eps=eps, dt=dt, discount=discount,
+                                 detach_coupling=detach_coupling)
     raise ValueError(f"unknown AC loss form {form!r}; expected 'galerkin' or 'min_movement'")

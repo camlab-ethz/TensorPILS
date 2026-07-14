@@ -219,3 +219,55 @@ def test_ac_galerkin_loss_forward_backward(ac17):
     assert torch.isfinite(loss)
     loss.backward()
     assert seq.grad is not None and torch.isfinite(seq.grad).all()
+
+
+# ------------------------------- bptt-mode knobs ---------------------------------------
+
+def test_ac_loss_coupling_detach():
+    """Knob 2 (loss-side): detach_coupling controls whether the previous frame u^k gets a gradient.
+
+    MM defaults to detaching (proximal centre frozen); Galerkin defaults to not detaching. Setting
+    the flag flips each."""
+    from tensorpils.losses import ACMinMovementLoss, ACGalerkinLoss
+    prob = ACProblem(structured_quad_mesh(11, 11))
+    a, eps, dt = 1.0, 4.0, 0.0025
+
+    def seed_grad(loss_cls, detach):
+        seq = torch.randn(2, 4, prob.n_nodes, dtype=torch.float64, requires_grad=True)  # [B, L=4, N]
+        loss_cls(prob, a, eps, dt, detach_coupling=detach)(seq).backward()
+        return seq.grad.reshape(2, 4, -1).norm(dim=(0, 2))[0].item()   # frame-0 gradient norm
+
+    # frame 0 only ever appears as the previous frame u^0 -> its gradient is exactly the coupling term
+    assert seed_grad(ACMinMovementLoss, True) == 0.0          # detached -> no gradient
+    assert seed_grad(ACMinMovementLoss, False) > 0.0          # coupled  -> gradient
+    assert seed_grad(ACMinMovementLoss, None) == 0.0          # MM default: detach
+    assert seed_grad(ACGalerkinLoss, True) == 0.0
+    assert seed_grad(ACGalerkinLoss, False) > 0.0
+    assert seed_grad(ACGalerkinLoss, None) > 0.0              # Galerkin default: no detach
+
+
+def test_rollout_pushforward_detaches_time():
+    """Knob 1 (rollout-side): detach_rollout (pushforward) makes each frame a one-step function of
+    its input, so backprop through the rollout is truncated -- a different gradient than full BPTT."""
+    from tensorpils.trainer import RolloutTrainer
+    torch.manual_seed(0)
+
+    class Stub:                                               # minimal carrier for RolloutTrainer._rollout
+        grid_size = (8, 8)
+        n_seed_frames = 1
+        rollout_steps = 3
+        def _project_zero_bc(self, x):
+            return x
+    stub = Stub()
+    stub.model = torch.nn.Conv2d(1, 1, 3, padding=1, bias=False).double()
+    traj = torch.randn(2, 4, 8, 8, dtype=torch.float64)      # [B, T+1, H, W]
+
+    grads = {}
+    for name, detach in [("full_bptt", False), ("pushforward", True)]:
+        stub.detach_rollout = detach
+        stub.model.zero_grad()
+        preds, _ = RolloutTrainer._rollout(stub, traj)
+        (preds[:, -1] ** 2).mean().backward()                # loss on the LAST frame only
+        grads[name] = stub.model.weight.grad.clone()
+    rel = (grads["full_bptt"] - grads["pushforward"]).norm() / grads["pushforward"].norm()
+    assert rel > 1e-3, f"pushforward should truncate BPTT and change the gradient (rel diff {rel:.2e})"

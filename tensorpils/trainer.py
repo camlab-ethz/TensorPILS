@@ -528,6 +528,7 @@ class RolloutTrainer(BaseTrainer):
         lambda_galerkin: float = 1.0,
         lambda_data: float = 0.0,
         rollout_steps: int = 4,
+        bptt_mode=None,
     ):
         super().__init__(model, loss_type, train_dataset.K, optimizer_name,
                          lr, lr_min, weight_decay, epochs, device, output_dir)
@@ -544,6 +545,11 @@ class RolloutTrainer(BaseTrainer):
         self.rollout_steps = max(1, min(rollout_steps, self.n_steps - n_seed_frames + 1))
         self.lambda_galerkin = lambda_galerkin
         self.lambda_data = lambda_data
+        # Autodiff/BPTT mode. None -> current behaviour (full BPTT rollout). "pushforward" detaches
+        # each step's rollout input so gradients are one-step; the loss-side "coupling" detach is
+        # resolved separately (see ACTrainer). full_bptt/detach_prev keep the full rollout graph.
+        self.bptt_mode = bptt_mode
+        self.detach_rollout = (bptt_mode == "pushforward")
 
         # Predictions are unconstrained on the boundary during training (the residual masks
         # it), so project to zero-BC at eval — matching the zero-boundary reference.
@@ -581,7 +587,9 @@ class RolloutTrainer(BaseTrainer):
             nxt = self._project_zero_bc(self.model(inp).squeeze(1))      # [B, H, W]
             preds_grid.append(nxt)
             seq_node.append(grid_to_node(nxt, nx, ny))
-            window = window[1:] + [nxt]                                  # slide the window
+            # Slide the window. detach_rollout (pushforward) feeds the next step a detached input,
+            # so each stored frame is a one-step function of its input (no backprop through time).
+            window = window[1:] + [nxt.detach() if self.detach_rollout else nxt]
         return torch.stack(preds_grid, dim=1), torch.stack(seq_node, dim=1)
 
     def train_epoch(self) -> float:
@@ -666,6 +674,7 @@ class RolloutTrainer(BaseTrainer):
             "loss_type": self.loss_type,
             "ac_loss_form": getattr(self, "ac_loss_form", None),
             "ac_integrator": getattr(self, "ac_integrator", None),
+            "bptt_mode": self.bptt_mode,
             "lambda_galerkin": self.lambda_galerkin,
             "lambda_data": self.lambda_data,
             "a": getattr(self, "a", None), "eps": getattr(self, "eps", None),
@@ -739,12 +748,12 @@ class ACTrainer(RolloutTrainer):
                  weight_decay=0.0, batch_size=32, epochs=500, device="cuda",
                  output_dir="output", lambda_galerkin=1.0, lambda_data=0.0,
                  rollout_steps=4, discount_factor=1.0, ac_integrator=None,
-                 ac_loss_form="galerkin"):
+                 ac_loss_form="galerkin", bptt_mode=None):
         super().__init__(model, train_dataset, val_dataset, test_dataset, loss_type,
                          n_seed_frames=1, optimizer_name=optimizer_name, lr=lr, lr_min=lr_min,
                          weight_decay=weight_decay, batch_size=batch_size, epochs=epochs,
                          device=device, output_dir=output_dir, lambda_galerkin=lambda_galerkin,
-                         lambda_data=lambda_data, rollout_steps=rollout_steps)
+                         lambda_data=lambda_data, rollout_steps=rollout_steps, bptt_mode=bptt_mode)
         self.a = train_dataset.a
         self.eps = train_dataset.eps
         self.discount_factor = discount_factor
@@ -752,13 +761,21 @@ class ACTrainer(RolloutTrainer):
         # with (kept coherent), unless explicitly overridden.
         self.ac_integrator = ac_integrator or getattr(train_dataset, "integrator", "backward_euler")
         self.ac_loss_form = ac_loss_form
+        # bptt_mode resolves to the loss-side "coupling" detach (proximal centre / previous frame);
+        # None keeps each loss's own default (MM detaches, Galerkin does not). detach_rollout (the
+        # pushforward) is handled on the base trainer.
+        detach_coupling = None if bptt_mode is None else (bptt_mode in ("detach_prev", "pushforward"))
         self.criterion = build_ac_loss(self.problem, a=self.a, eps=self.eps, dt=self.dt,
                                        discount=discount_factor, integrator=self.ac_integrator,
-                                       form=ac_loss_form)
+                                       form=ac_loss_form, detach_coupling=detach_coupling)
 
     def _file_prefix(self) -> str:
         itag = {"convex_concave": "cc", "backward_euler": "be"}.get(self.ac_integrator, self.ac_integrator)
         ftag = {"galerkin": "ls", "min_movement": "mm"}.get(self.ac_loss_form, self.ac_loss_form)
-        return (f"fno_ac_{self.loss_type}_{ftag}_{itag}_a{self.a:g}_eps{self.eps:g}_dt{self.dt:g}_"
+        # Tag the bptt mode only when set, so existing (mode=None) run filenames are unchanged.
+        btag = "" if self.bptt_mode is None else \
+            "_bptt-" + {"full_bptt": "full", "detach_prev": "detach", "pushforward": "push"}.get(
+                self.bptt_mode, self.bptt_mode)
+        return (f"fno_ac_{self.loss_type}_{ftag}_{itag}{btag}_a{self.a:g}_eps{self.eps:g}_dt{self.dt:g}_"
                 f"T{self.n_steps}_R{self.rollout_steps}_K{self.K}_"
                 f"samples-{len(self.train_dataset)}-{len(self.val_dataset)}-{len(self.test_dataset)}")
