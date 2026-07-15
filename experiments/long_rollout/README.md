@@ -34,6 +34,31 @@ Two per eps — `long_rollout_eps{E}_{energy,error}.png` — each with **8 curve
 flagged `(⊗step)` in the legend; energy is capped and error is log-scaled so a blow-up is visible.
 A dotted vertical line marks the step-10 training horizon.
 
+## Heatmaps (`heatmaps.py`, cluster-only)
+
+The scalar plots above compress each frame to one number. To *see* where a rollout goes wrong,
+`heatmaps.py` renders the 2D fields: one figure per `(eps, sample)`, rows = rollout timesteps,
+columns = `[CC reference | run₁ | run₂ | …]`, so each model is directly comparable to the
+convex-concave **ground truth** at each time. `RdBu_r`, symmetric colour scale shared per row; each
+model panel is annotated with its relative L2 vs CC; diverged panels are drawn grey and flagged.
+
+This needs the actual fields, so unlike the two-stage scalar path it reads the **checkpoints** and
+runs **on Euler**, emitting PNGs directly (download the finished figures for a paper). It reuses the
+IC / CC-reference / rollout code from `compute_long_rollout.py`, so it must be run as a module:
+
+```bash
+# all eps, samples 0 1 2, all 8 runs as columns, 3 snapshots in [0,10] + 3 beyond:
+python -m experiments.long_rollout.heatmaps --steps 20
+
+# a subset — one eps, chosen samples, chosen columns, explicit timepoints:
+python -m experiments.long_rollout.heatmaps --eps 16 --samples 0 3 \
+    --runs mm:pushforward ls:full_bptt data:pushforward --snap_steps 0 5 10 15 20
+```
+
+`--runs` tokens match a `loss:mode` key (`mm:pushforward`), a whole loss (`data`), or any prefix
+substring. `--snap_steps` overrides the default 3-in / 3-beyond rows; `--samples` picks test
+indices; `--eps` restricts which eps to draw.
+
 ## Facts
 
 | | |
