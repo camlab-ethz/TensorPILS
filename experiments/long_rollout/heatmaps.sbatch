@@ -25,6 +25,6 @@ python -m experiments.long_rollout.heatmaps \
     --results_dir output/compare_bptt/results \
     --checkpoints_dir output/compare_bptt/checkpoints \
     --out_dir output/long_rollout/heatmaps \
-    --steps 20 \
+    --steps 40 \
     --samples 0 1 2 \
     --device cuda

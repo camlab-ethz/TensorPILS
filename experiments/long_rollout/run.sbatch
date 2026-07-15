@@ -25,6 +25,11 @@ python experiments/long_rollout/compute_long_rollout.py \
     --results_dir output/compare_bptt/results \
     --checkpoints_dir output/compare_bptt/checkpoints \
     --out output/long_rollout/metrics.json \
-    --steps 20 \
+    --steps 40 \
     --n_samples 256 \
     --device cuda
+
+# Reproduce the energy/error figures right here (headless Agg) so they rsync down with the metrics.
+python experiments/long_rollout/plot_long_rollout.py \
+    --metrics output/long_rollout/metrics.json \
+    --out_dir output/long_rollout
