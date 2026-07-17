@@ -7,12 +7,13 @@ Use :func:`build_preconditioner` to construct one from a config.
 
 from .base import Preconditioner
 from .multigrid import GeometricMultigrid
-from .spectral import SpectralPreconditioner
+from .spectral import SpectralPreconditioner, SineSpectralPreconditioner
 from .factory import build_preconditioner
 
 __all__ = [
     "Preconditioner",
     "GeometricMultigrid",
     "SpectralPreconditioner",
+    "SineSpectralPreconditioner",
     "build_preconditioner",
 ]

@@ -12,7 +12,7 @@ import torch
 
 from tensorpils.meshing import structured_quad_mesh
 from tensorpils.physics import PoissonProblem
-from tensorpils.preconditioners import SpectralPreconditioner
+from tensorpils.preconditioners import SpectralPreconditioner, SineSpectralPreconditioner
 
 DT = torch.float64
 ATOL = 1e-9
@@ -20,6 +20,11 @@ ATOL = 1e-9
 
 def _problem(n: int = 8) -> PoissonProblem:
     return PoissonProblem(structured_quad_mesh(nx=n, ny=n))
+
+
+def _sine(prob, n: int = 8, kind: str = "blend", strength: float = 1.0):
+    return SineSpectralPreconditioner(prob.boundary_mask, nx=n, ny=n,
+                                      kind=kind, strength=strength, dtype=DT)
 
 
 def _interior(problem):
@@ -119,3 +124,72 @@ def test_invalid_args():
         SpectralPreconditioner.from_problem(prob, kind="nope", strength=0.5)
     with pytest.raises(ValueError):
         SpectralPreconditioner.from_problem(prob, kind="blend", strength=1.5)
+
+
+# ============================ sine (fast DST) realization ============================
+
+@pytest.mark.parametrize("kind", ["blend", "power"])
+@pytest.mark.parametrize("strength", [0.0, 0.25, 1.0])
+def test_sine_matches_dense(kind, strength):
+    """The DST realization reproduces the dense eigendecomposition preconditioner exactly."""
+    n = 10
+    prob = _problem(n)
+    P_dense = SpectralPreconditioner.from_problem(prob, kind=kind, strength=strength, dtype=DT)
+    P_sine = _sine(prob, n, kind=kind, strength=strength)
+
+    torch.manual_seed(0)
+    r = torch.randn(4, prob.n_nodes, dtype=DT)
+    r[:, prob.boundary_mask.bool()] = 0.0
+    assert torch.allclose(P_sine(r), P_dense(r), atol=ATOL)
+    if strength > 0:                                    # cond(PA) undefined shape aside, equal here
+        assert P_sine.cond_PA == pytest.approx(P_dense.cond_PA, rel=1e-6)
+
+
+@pytest.mark.parametrize("kind", ["blend", "power"])
+def test_sine_identity_endpoint(kind):
+    """strength=0 => P r = r on the interior (boundary zeroed)."""
+    n = 8
+    prob = _problem(n)
+    P = _sine(prob, n, kind=kind, strength=0.0)
+    mask = prob.boundary_mask.bool()
+    torch.manual_seed(1)
+    r = torch.randn(3, prob.n_nodes, dtype=DT)
+    r[:, mask] = 0.0
+    assert torch.allclose(P(r), r, atol=ATOL)
+
+
+@pytest.mark.parametrize("kind", ["blend", "power"])
+def test_sine_inverse_endpoint(kind):
+    """strength=1 => P (A x) = x on the interior."""
+    n = 8
+    prob = _problem(n)
+    P = _sine(prob, n, kind=kind, strength=1.0)
+    mask, interior, A_II = _interior(prob)
+    N, n_int = prob.n_nodes, interior.numel()
+    torch.manual_seed(2)
+    x_I = torch.randn(3, n_int, dtype=DT)
+    r = torch.zeros(3, N, dtype=DT)
+    r[:, interior] = x_I @ A_II.T
+    out = P(r)
+    assert torch.allclose(out[:, interior], x_I, atol=ATOL)
+    assert torch.all(out[:, mask] == 0)
+
+
+def test_sine_1d_input_and_grad():
+    n = 8
+    prob = _problem(n)
+    P = _sine(prob, n, kind="blend", strength=0.5)
+    _, interior, _ = _interior(prob)
+    r = torch.zeros(prob.n_nodes, dtype=DT, requires_grad=True)
+    out = P(r + 0.0)
+    assert out.shape == (prob.n_nodes,)
+    (P(torch.randn(2, prob.n_nodes, dtype=DT, requires_grad=True)) ** 2).sum().backward()
+
+
+def test_sine_requires_frame_mask():
+    """A mask that is not the outer frame (or wrong size) is rejected."""
+    prob = _problem(8)
+    with pytest.raises(ValueError):                     # all-False mask: interior nodes flagged
+        SineSpectralPreconditioner(torch.zeros(64, dtype=torch.bool), nx=8, ny=8)
+    with pytest.raises(ValueError):                     # wrong length
+        SineSpectralPreconditioner(prob.boundary_mask, nx=8, ny=9)

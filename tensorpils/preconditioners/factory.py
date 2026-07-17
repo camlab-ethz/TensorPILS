@@ -4,7 +4,7 @@ from typing import Optional
 
 from .base import Preconditioner
 from .multigrid import GeometricMultigrid
-from .spectral import SpectralPreconditioner
+from .spectral import SpectralPreconditioner, SineSpectralPreconditioner
 
 __all__ = ["build_preconditioner"]
 
@@ -12,7 +12,7 @@ __all__ = ["build_preconditioner"]
 def build_preconditioner(kind: str, problem, grid_size, *,
                          mg_levels: int = 4, mg_pre_smooth: int = 2,
                          mg_post_smooth: int = 2, mg_omega: float = 2.0 / 3.0,
-                         strength: float = 1.0,
+                         strength: float = 1.0, method: str = "dense",
                          device: Optional[str] = None) -> Preconditioner:
     """Build a preconditioner.
 
@@ -28,6 +28,10 @@ def build_preconditioner(kind: str, problem, grid_size, *,
     mg_* : multigrid V-cycle settings (ignored by spectral kinds).
     strength : float in [0, 1]
         ``t`` (blend) or ``s`` (power); ignored by multigrid.
+    method : {"dense", "sine"}
+        Realization for the ``blend`` / ``power`` spectral kinds: ``"dense"`` (default) is the
+        eigendecomposition; ``"sine"`` is the fast DST equivalent for a uniform grid (needed at
+        128²/256²). Ignored by multigrid.
     device : optional
         If given, move the preconditioner there.
     """
@@ -38,7 +42,14 @@ def build_preconditioner(kind: str, problem, grid_size, *,
             pre_smooth=mg_pre_smooth, post_smooth=mg_post_smooth, omega=mg_omega,
         )
     elif kind in ("blend", "power"):
-        precond = SpectralPreconditioner.from_problem(problem, kind=kind, strength=strength)
+        if method == "sine":
+            nx, ny = grid_size
+            precond = SineSpectralPreconditioner(
+                problem.boundary_mask, nx=nx, ny=ny, kind=kind, strength=strength)
+        elif method == "dense":
+            precond = SpectralPreconditioner.from_problem(problem, kind=kind, strength=strength)
+        else:
+            raise ValueError(f"method must be 'dense' or 'sine', got {method!r}")
     else:
         raise ValueError(f"Unknown preconditioner kind {kind!r} "
                          "(expected 'multigrid', 'blend', or 'power')")

@@ -52,6 +52,7 @@ class TrainingStats:
     # Preconditioner identity + conditioning (for the sweep / collapse plot).
     precond_kind: str = ""
     precond_strength: float = float("nan")
+    precond_method: str = "dense"
     precond_cond_pa: float = float("nan")
     precond_cond_h: float = float("nan")
 
@@ -215,6 +216,7 @@ class PoissonTrainer(BaseTrainer):
         precondition: bool = False,
         precond_kind: str = "multigrid",
         precond_strength: float = 1.0,
+        precond_method: str = "dense",
         mg_levels: int = 4,
         mg_pre_smooth: int = 2,
         mg_post_smooth: int = 2,
@@ -253,6 +255,7 @@ class PoissonTrainer(BaseTrainer):
         self.precond: Optional[Preconditioner] = None
         self.precond_kind = precond_kind
         self.precond_strength = precond_strength
+        self.precond_method = precond_method
         self.mg_settings = (mg_levels, mg_pre_smooth, mg_post_smooth, mg_omega)
         needs_precond = (loss_type == "pls") or (loss_type == "deepritz" and precondition)
         if needs_precond:
@@ -260,7 +263,7 @@ class PoissonTrainer(BaseTrainer):
                 kind=precond_kind, problem=self.problem, grid_size=self.grid_size,
                 mg_levels=mg_levels, mg_pre_smooth=mg_pre_smooth,
                 mg_post_smooth=mg_post_smooth, mg_omega=mg_omega,
-                strength=precond_strength, device=device,
+                strength=precond_strength, method=precond_method, device=device,
             )
 
         # The homogeneous Dirichlet BC (u=0 on the boundary) is known data, so we always
@@ -280,6 +283,7 @@ class PoissonTrainer(BaseTrainer):
         if self.precond is not None:
             self.stats.precond_kind = self.precond_kind
             self.stats.precond_strength = self.precond_strength
+            self.stats.precond_method = self.precond_method
             self.stats.precond_cond_pa = getattr(self.precond, "cond_PA", float("nan"))
             self.stats.precond_cond_h = getattr(self.precond, "cond_H", float("nan"))
         os.makedirs(f"{self.output_dir}/results", exist_ok=True)
@@ -443,6 +447,7 @@ class PoissonTrainer(BaseTrainer):
             "precondition": self.precondition,
             "precond_kind": self.precond_kind,
             "precond_strength": self.precond_strength,
+            "precond_method": self.precond_method,
             "K": self.K,
             "n_train": len(self.train_dataset),
             "epochs": self.epochs,

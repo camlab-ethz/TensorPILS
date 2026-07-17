@@ -376,12 +376,60 @@ The preconditioned spectrum is available in closed form from the cached eigenval
 which provides the exact conditioning of each configuration---the natural common axis when
 comparing the two families or reporting how conditioning varies with the strength parameter.
 
-\begin{remark}[Regular-grid shortcut]
-On the regular grid the eigenvectors of $A$ are the tensor sine modes and $\Lambda$ is given
-in closed form by \eqref{eq:eig2d}. Hence $Q^\top$ and $Q$ in \eqref{eq:apply} are
-two-dimensional discrete sine transforms, and the dense eigendecomposition can be replaced by
-an $O(N\log N)$ transform if larger grids are needed. At the resolutions considered here the
-dense route is simplest and is used throughout.
-\end{remark}
+\subsection{Fast realization on the regular grid via the sine transform}
+\label{sec:sine}
+
+The dense route of \S\ref{sec:numerical} costs $O(N^3)$ to set up and caches the $N\times N$
+eigenvector matrix $Q$; at $128^2$ ($N\approx1.6\cdot10^4$) this is already heavy and at
+$256^2$ ($N\approx6.5\cdot10^4$) the dense $Q$ alone is tens of gigabytes. On the regular grid
+none of it is necessary: the eigenvectors of $A$ are known in closed form, so $Q$ never needs to
+be formed or stored.
+
+\paragraph{Eigenbasis in closed form.}
+The one-dimensional stiffness $K$ and mass $M$ are diagonalised by the discrete sine modes
+$v^{(k)}_j=\sin(k\pi j h)$. Collecting the \emph{normalised} modes as columns gives the
+symmetric orthogonal \emph{DST-I} matrix
+\begin{equation}
+  S(n)_{jk} \;=\; \sqrt{\tfrac{2}{n+1}}\,\sin\!\Big(\frac{\pi j k}{n+1}\Big),
+  \qquad j,k=1,\dots,n,
+  \qquad S = S^\top = S^{-1}.
+  \label{eq:dst}
+\end{equation}
+On the (possibly non-square) tensor-product grid with $n_x,n_y$ interior nodes and
+spacings $h_x,h_y$, the separable stiffness $A=K_y\otimes M_x+M_y\otimes K_x$ therefore
+factorises as
+\begin{equation}
+  A \;=\; (S_y\otimes S_x)\,\Lambda\,(S_y\otimes S_x),
+  \qquad
+  \Lambda_{k,l} \;=\; \mu^{K_y}_k\,\nu^{M_x}_l \;+\; \nu^{M_y}_k\,\mu^{K_x}_l ,
+  \label{eq:sinefact}
+\end{equation}
+with $\mu_k=\tfrac{4}{h}\sin^2(\theta_k/2)$, $\nu_k=\tfrac{h}{3}(2+\cos\theta_k)$ and
+$\theta_k=k\pi/(n+1)$ from \eqref{eq:eig2d}, evaluated per axis. This is exactly the dense
+$A=Q\Lambda Q^\top$ with $Q=S_y\otimes S_x$ read off analytically---no eigensolver.
+
+\paragraph{Application.}
+Store the interior residual as the image $R\in\R^{n_y\times n_x}$. Because $S=S^{-1}$, the same
+transform serves forwards and backwards, and \eqref{eq:apply} becomes three cheap steps,
+\begin{equation}
+  \widehat R = S_y\,R\,S_x,
+  \qquad
+  \widehat E = p(\Lambda)\odot\widehat R,
+  \qquad
+  P r \;\hookleftarrow\; E = S_y\,\widehat E\,S_x,
+  \label{eq:sineapply}
+\end{equation}
+i.e.\ apply $S_y$ along the rows and $S_x$ along the columns, scale each mode by the
+\emph{same} spectral map $p_t(\Lambda)=(1-t)+t/\Lambda$ or $p_s(\Lambda)=\Lambda^{-s}$, and
+transform back. The result is the \emph{identical} operator to the dense construction (it is the
+same function of $A$), so every statement about the spectrum, conditioning and endpoints carries
+over verbatim; the diagnostics $g=\Lambda\,p(\Lambda)$, $\kk(PA)$, $\kk(H)$ are read from the
+same $\Lambda$.
+
+\paragraph{Cost.}
+Each application is two per-axis matrix products, $O\!\big(N(n_x+n_y)\big)=O(N^{3/2})$, with only
+$S_x,S_y$ and the grid $p(\Lambda)$ cached ($O(N)$ memory); an FFT-based DST-I lowers this to
+$O(N\log N)$ if ever needed. There is no $O(N^3)$ setup, which is what makes the $128^2$ and
+$256^2$ grids---out of reach for the dense route---routine.
 
 \end{document}

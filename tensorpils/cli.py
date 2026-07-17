@@ -63,6 +63,10 @@ def build_parser() -> ArgumentParser:
     p.add_argument("--precond_strength", type=float, default=1.0,
                    help="Strength for blend (t) / power (s) in [0,1]. 0 -> P=I "
                         "(no preconditioning); 1 -> P=A^-1 (supervised). Ignored for multigrid.")
+    p.add_argument("--precond_method", choices=["dense", "sine"], default="dense",
+                   help="Realization for blend/power: 'dense' (default) eigendecomposition, or "
+                        "'sine' = fast DST equivalent for a uniform grid (needed at 128²/256², "
+                        "where the dense route is infeasible). Ignored for multigrid.")
 
     # -------- Multigrid preconditioner settings (used when --precond_kind multigrid) --------
     p.add_argument("--mg_levels", type=int, default=4,
@@ -166,7 +170,8 @@ def run_poisson(args, device):
             print(f"precond     : multigrid  levels={args.mg_levels}  "
                   f"smooth={args.mg_pre_smooth}/{args.mg_post_smooth}  omega={args.mg_omega:.3f}")
         else:
-            print(f"precond     : {args.precond_kind}  strength={args.precond_strength:.3f}")
+            print(f"precond     : {args.precond_kind}  strength={args.precond_strength:.3f}"
+                  f"  method={args.precond_method}")
     _print_common(args, device)
 
     print("Building datasets...")
@@ -198,6 +203,7 @@ def run_poisson(args, device):
         device=device, output_dir=args.output_dir,
         lambda_bc=args.lambda_bc, bc_mode=args.bc_mode, precondition=args.precondition,
         precond_kind=args.precond_kind, precond_strength=args.precond_strength,
+        precond_method=args.precond_method,
         mg_levels=args.mg_levels, mg_pre_smooth=args.mg_pre_smooth,
         mg_post_smooth=args.mg_post_smooth, mg_omega=args.mg_omega,
         eval_datasets=eval_datasets,
