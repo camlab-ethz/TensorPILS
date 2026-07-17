@@ -20,14 +20,23 @@ plus a collapse of best relative-L2 vs conditioning `κ(H)`).
 |---|---|---|---|
 | [`pls/`](pls/README.md) | PLS `½‖P(Au−b)‖²` | `P` inside the squared loss | `κ(H)=κ(A)²` (`t=0`) → `1` |
 | [`deepritz/`](deepritz/README.md) | preconditioned Deep Ritz (surrogate `∂L/∂u = P r`, hard BC) | `P` on the energy gradient | `κ(PA)=κ(A)` (`t=0`) → `1` |
+| [`pls128/`](pls128/README.md), [`pls256/`](pls256/README.md) | PLS on `128²` / `256²` grids | fast **DST** preconditioner (`--precond_method sine`) | as `pls/`, refined grid |
+| [`deepritz128/`](deepritz128/README.md), [`deepritz256/`](deepritz256/README.md) | Deep Ritz on `128²` / `256²` grids | fast **DST** preconditioner (`--precond_method sine`) | as `deepritz/`, refined grid |
 
-Both use the same `K=4` dataset, 10 blend strengths + 1 multigrid reference, 500 epochs, adam.
+The base `pls/`/`deepritz/` variants use the `64²` grid with the dense eigendecomposition, 10 blend
+strengths + 1 multigrid reference, 500 epochs. The `*128`/`*256` variants refine the grid to `128²`
+/ `256²`, where the dense eigendecomposition is infeasible, so they build the **same** spectral `P`
+via the exact fast sine transform (`--precond_method sine`; see `../../notes/preconditioner_notes/`
+§Fast realization). They start as **sanity runs** (20 epochs, a coarse `t` grid set at the top of
+each `sweep.sbatch`) — retune `GRID / EPOCHS / TVALS` there. All use the same `K=4` dataset, adam.
 
 ## Conventions
 
 - Each variant writes to `output/poisson/sweep_blend/<variant>/` (git-ignored).
-- The sbatch array is `0-10`: tasks `0-9` are the blend strengths, task `10` is the multigrid
-  reference. To add only the GMG line to an already-run sweep: `sbatch --array=10 <sweep.sbatch>`.
+- For `pls/`/`deepritz/` the sbatch array is `0-10`: tasks `0-9` are the blend strengths, task `10`
+  is the multigrid reference (`sbatch --array=10 <sweep.sbatch>` adds only the GMG line). The
+  `*128`/`*256` variants instead expose an editable `TVALS` array at the top of `sweep.sbatch`
+  (array `0-5` by default; the GMG baseline is task `6`, added via `sbatch --array=6 …`).
 - Plot a variant with the shared script pointed at its results:
   `python experiments/poisson/sweep_blend/plot_sweep.py --results_dir output/poisson/sweep_blend/<variant>/results`.
   Optional flags: `--smooth` (centered moving average, raw kept faint; `--smooth_window N` to
