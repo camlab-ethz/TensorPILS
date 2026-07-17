@@ -188,7 +188,7 @@ class SineSpectralPreconditioner(Preconditioner):
             raise ValueError(f"boundary_mask has {mask.numel()} entries, expected nx*ny="
                              f"{self.n_full}")
         # The sine realization requires the structured uniform mesh: mask must be the outer frame.
-        frame = torch.zeros(self.ny, self.nx, dtype=torch.bool)
+        frame = torch.zeros(self.ny, self.nx, dtype=torch.bool, device=mask.device)
         frame[0, :] = frame[-1, :] = frame[:, 0] = frame[:, -1] = True
         if not torch.equal(mask.view(self.ny, self.nx), frame):
             raise ValueError("SineSpectralPreconditioner requires boundary_mask to be exactly the "
