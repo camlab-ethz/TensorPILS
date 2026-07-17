@@ -1,15 +1,27 @@
 # Experiments
 
-Each subfolder is one self-contained experiment: a `README.md` (description, facts, run &
-plot commands), the SLURM `*.sbatch` sweep script, and the aggregation plot script. Run
-artifacts land in `output/<name>/` (git-ignored); pull them back from the cluster with
-`rsync -avz euler:~/TensorPILS/output/<name> ~/Documents/TensorPILS/output/`.
+Experiments are grouped by PDE: **`poisson/`** and **`allen_cahn/`**. Each leaf subfolder is one
+self-contained experiment: a `README.md` (description, facts, run & plot commands), the SLURM
+`*.sbatch` sweep script, and the aggregation plot script. Run artifacts land in
+`output/<domain>/<name>/` (git-ignored); pull them back from the cluster with
+`rsync -avz euler:~/TensorPILS/output/<domain>/<name> ~/Documents/TensorPILS/output/<domain>/`.
+
+### `poisson/`
 
 | Experiment | Question |
 |---|---|
-| [`sweep_blend/`](sweep_blend/README.md) | Does the blend preconditioner strength `t` (residual `t=0` → supervised `t=1`) control training conditioning? Overlay + collapse plots vs `κ(H)`. Variants by loss: `pls/`, `deepritz/`. |
-| [`generalization/`](generalization/README.md) | Does that loss geometry `t` affect out-of-distribution generalization? Organized into per-regime **scenarios** (`pls_k4/`: K=4→6,8; `pls_k16/`: K=16→20; Deep Ritz variants planned). |
-| [`loss_comparison/`](loss_comparison/README.md) | Supervised true-L2 (`data_l2`, mass-weighted) vs MSE (`data`) vs label-free Deep Ritz — which training objective minimizes validation relative-L2? |
+| [`sweep_blend/`](poisson/sweep_blend/README.md) | Does the blend preconditioner strength `t` (residual `t=0` → supervised `t=1`) control training conditioning? Overlay + collapse plots vs `κ(H)`. Variants by loss: `pls/`, `deepritz/`. |
+| [`generalization/`](poisson/generalization/README.md) | Does that loss geometry `t` affect out-of-distribution generalization? Organized into per-regime **scenarios** (`pls_k4/`: K=4→6,8; `pls_k16/`: K=16→20; Deep Ritz variants planned). |
+| [`loss_comparison/`](poisson/loss_comparison/README.md) | Supervised true-L2 (`data_l2`, mass-weighted) vs MSE (`data`) vs label-free Deep Ritz — which training objective minimizes validation relative-L2? |
+
+### `allen_cahn/`
+
+| Experiment | Question |
+|---|---|
+| [`ac_loss_comparison/`](allen_cahn/ac_loss_comparison/README.md) | Data-driven MSE vs backward-Euler / convex-concave Galerkin vs minimizing-movement — FEM-L2 rollout metrics for the learned Allen–Cahn stepper. |
+| [`ac_stresstest/`](allen_cahn/ac_stresstest/README.md) | How far up the reaction-stiffness `ε` axis does each loss hold before the free-running rollout error blows up? |
+| [`compare_bptt/`](allen_cahn/compare_bptt/README.md) | How does the BPTT autodiff mode (full BPTT / detach-prev / pushforward) affect FNO rollout training across the three AC losses over the `ε` axis? |
+| [`long_rollout/`](allen_cahn/long_rollout/README.md) | Extrapolation past the 10-step training horizon: energy + error vs the convex-concave reference, plus 2D field heatmaps. |
 
 ## Evaluation convention
 
