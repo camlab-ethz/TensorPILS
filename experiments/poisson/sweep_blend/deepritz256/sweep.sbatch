@@ -14,7 +14,7 @@
 #SBATCH --gres=gpumem:20g
 #SBATCH --mem-per-cpu=16G
 #SBATCH --output=logs/blend_dr256_%A_%a.out
-#SBATCH --array=0-5
+#SBATCH --array=0-6
 
 # Source the environment first (module/Lmod is not always `set -u`-safe), then strict mode.
 source ~/env_tensorpils.sh
