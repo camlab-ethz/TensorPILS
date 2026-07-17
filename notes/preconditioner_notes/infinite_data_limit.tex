@@ -1,0 +1,197 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{booktabs}
+\usepackage{mathtools}
+\usepackage{hyperref}
+
+\newtheorem{remark}{Remark}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\Om}{\Omega}
+\newcommand{\eps}{\varepsilon}
+\newcommand{\ustar}{u^\star}
+\newcommand{\E}{\mathbb{E}}
+\DeclareMathOperator*{\argmin}{arg\,min}
+
+\title{The infinite-data limit in physics-informed operator learning:\\
+which error vanishes, and why it is free}
+\author{Marius Zeinhofer}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Physics-informed operator learning trains on a \emph{residual} loss that requires no
+solution labels. Consequently a fresh training sample costs only the draw of a random
+right-hand side---no PDE solve---and the \emph{infinite-data limit}, in which no sample is
+ever seen twice, is a practical operating point rather than a thought experiment. We
+recall the classical decomposition of the excess risk into approximation, estimation
+(generalization), and optimization errors, and observe that one-pass training on freshly
+drawn samples eliminates the estimation error \emph{exactly}: stochastic gradient descent
+then acts directly on the population risk. The remaining errors are the approximation
+error of the model class and the optimization error of the finite compute budget. This
+note fixes the terminology, states the prediction for a ``test error versus dataset
+size'' figure at fixed optimization budget, and records the experimental-design caveats.
+\end{abstract}
+
+\section{Setting: two risks, no labels}
+
+Let $\mu$ be a probability distribution over right-hand sides $f$ (in our experiments:
+random coefficients on $K$ Fourier modes), and let $u_\theta$ denote the neural operator
+(an FNO) with parameters $\theta\in\Theta$, mapping $f$ to an approximate solution of
+\begin{equation}
+  -\Delta u = f \quad\text{in }\Om, \qquad u=0 \quad\text{on }\partial\Om .
+\end{equation}
+After discretization ($Q_1$ finite elements, stiffness matrix $A$, load vector $b(f)$;
+see the companion note on the transition preconditioner), the \emph{physics-informed}
+per-sample loss is a residual functional, e.g.\ the preconditioned least-squares loss
+\begin{equation}
+  \ell(\theta; f) \;=\; \tfrac12\,\bigl\| P\bigl(A\,u_\theta(f) - b(f)\bigr) \bigr\|^2 ,
+  \label{eq:pls}
+\end{equation}
+or the (preconditioned) Deep Ritz energy. The object of interest is the
+\emph{population risk} and its empirical counterpart on a dataset
+$D_n=\{f_1,\dots,f_n\}\overset{\text{iid}}{\sim}\mu$:
+\begin{equation}
+  R(\theta) \;=\; \E_{f\sim\mu}\,\ell(\theta;f),
+  \qquad
+  R_n(\theta) \;=\; \frac1n \sum_{i=1}^n \ell(\theta;f_i).
+\end{equation}
+The evaluation metric (relative $L^2$ error against the manufactured analytic solution;
+see the remark below) is a different functional, but the discussion is insensitive to
+this distinction: what matters is that training only ever touches $\ell$, which does not
+contain the solution $\ustar(f)$.
+
+\begin{remark}[Why streaming is free here]\label{rem:free}
+Evaluating \eqref{eq:pls} requires $b(f)$---an assembly---but \emph{not} $\ustar(f)$. In
+our benchmark this asymmetry is softened: the dataset uses \emph{manufactured solutions}
+(the random coefficients define an analytic $\ustar$, and $f=-\Delta\ustar$ in closed
+form), so labels also cost nothing and a fresh sample is a random-number draw plus the
+evaluation of two closed-form fields---for \emph{every} loss. The asymmetry the
+experiment ultimately speaks to is the general case, where $f\sim\mu$ is prescribed and
+$\ustar(f)$ requires a numerical solve: there, \emph{data-driven} operator learning
+prices the infinite-data limit at one solver call per gradient contribution, while the
+physics-informed loss keeps it free. Within the benchmark, streaming simply lets us
+isolate the estimation error cleanly, at no extra cost, for whichever loss we train.
+\end{remark}
+
+\section{The error decomposition}
+
+Following the classical large-scale-learning decomposition (Bottou \& Bousquet, 2008),
+write $R^\star=\inf_u R(u)$ for the risk of the best measurable predictor,
+$\theta_{\mathrm{app}}\in\argmin_{\theta\in\Theta} R(\theta)$ for the best operator in
+the model class, $\theta_n\in\argmin_{\theta\in\Theta} R_n(\theta)$ for the empirical
+risk minimizer, and $\tilde\theta$ for what the optimizer actually returns after a
+compute budget of $T$ gradient evaluations. Then the excess risk splits as
+\begin{equation}
+  \underbrace{R(\tilde\theta)-R^\star}_{\text{excess risk}}
+  \;=\;
+  \underbrace{R(\theta_{\mathrm{app}})-R^\star}_{\eps_{\mathrm{app}}\;\text{(approximation)}}
+  \;+\;
+  \underbrace{R(\theta_n)-R(\theta_{\mathrm{app}})}_{\eps_{\mathrm{est}}\;\text{(estimation)}}
+  \;+\;
+  \underbrace{R(\tilde\theta)-R(\theta_n)}_{\eps_{\mathrm{opt}}\;\text{(optimization)}} .
+  \label{eq:decomp}
+\end{equation}
+The three terms are controlled by three different resources: $\eps_{\mathrm{app}}$ by
+model capacity (FNO width, modes, depth), $\eps_{\mathrm{est}}$ by the dataset size $n$
+(typically $\eps_{\mathrm{est}}=O((C_\Theta/n)^\alpha)$ with a complexity measure
+$C_\Theta$ and $\alpha\in[\tfrac12,1]$), and $\eps_{\mathrm{opt}}$ by the budget $T$ and
+by the \emph{conditioning of the loss}---which is where the preconditioner $P$ of the
+companion note enters.
+
+\section{Streaming eliminates the estimation error exactly}
+
+Suppose each optimization step draws a \emph{fresh} minibatch
+$f_{t,1},\dots,f_{t,B}\overset{\text{iid}}{\sim}\mu$, never reusing a sample
+(``streaming'' or \emph{one-pass} training). Then for every $t$,
+\begin{equation}
+  \E\Bigl[\frac1B\sum_{j=1}^B \nabla_\theta\,\ell(\theta_t; f_{t,j})\Bigr]
+  \;=\; \nabla R(\theta_t),
+\end{equation}
+i.e.\ the update is an unbiased stochastic gradient of the \emph{population} risk. No
+finite empirical risk $R_n$ ever appears; the algorithm is stochastic approximation
+(Robbins--Monro) applied directly to $R$. The decomposition \eqref{eq:decomp} collapses to
+\begin{equation}
+  R(\tilde\theta)-R^\star \;=\; \eps_{\mathrm{app}} + \eps_{\mathrm{opt}},
+  \qquad \eps_{\mathrm{est}} \equiv 0 .
+\end{equation}
+So yes: the streaming limit removes one of the three error terms \emph{identically}, not
+merely asymptotically. Two consequences and one honest caveat:
+
+\begin{enumerate}
+  \item \textbf{No generalization gap.} The running training loss is itself an unbiased
+  estimate of the test loss; overfitting is impossible in the usual sense, and early
+  stopping is unnecessary (it would only truncate the budget).
+  \item \textbf{No memorization.} With a finite dataset and $T\gg n/B$ the optimizer
+  spends most of its budget re-fitting samples it has already fit, driving
+  $R_n(\tilde\theta)$ below $R(\tilde\theta)$; the streaming run spends every gradient
+  evaluation on new information.
+  \item \textbf{Caveat: the sampling noise does not disappear---it moves.} The variance
+  of the minibatch gradient is the same whether the batch is fresh or recycled, and it
+  enters the convergence rate of stochastic approximation. Eliminating
+  $\eps_{\mathrm{est}}$ does not mean finite-sample effects vanish; it means they are
+  accounted for \emph{inside} $\eps_{\mathrm{opt}}$, which now carries the
+  $O(\sigma/\sqrt{TB})$-type noise floor of SGD in addition to the deterministic,
+  conditioning-driven contraction. In the convex setting one-pass SGD is known to attain
+  the optimal statistical rates, so nothing is lost in the exchange.
+\end{enumerate}
+
+\section{The experiment: fixed budget, varying $n$}
+
+Fix the model, the loss (hence the conditioning), and a compute budget of $T$ forward
+passes. Train on datasets of size $n\in\{n_1<n_2<\dots\}$ plus one streaming run
+($n=\infty$), and report the relative $L^2$ error on a fixed held-out test set. The
+decomposition \eqref{eq:decomp} predicts the shape of the curve:
+\begin{equation}
+  \mathrm{err}(n)
+  \;\approx\;
+  \underbrace{\eps_{\mathrm{app}} + \eps_{\mathrm{opt}}(T)}_{\text{$n$-independent floor}}
+  \;+\;
+  \underbrace{O\bigl((C_\Theta/n)^{\alpha}\bigr)}_{\text{estimation}} ,
+\end{equation}
+i.e.\ a monotonically decreasing curve that \emph{saturates} at the value attained by
+the streaming run. The crossover scale $n^\star$---where the estimation term drops below
+the floor---marks the dataset size beyond which more data is useless \emph{at this
+budget}; for $n\ge n^\star$ the finite-data runs should be statistically
+indistinguishable from streaming. The figure then makes a clean claim: at fixed
+optimization budget, the infinite-data limit is (weakly) optimal, and physics-informed
+training gets it for free (Remark~\ref{rem:free}).
+
+\begin{remark}[Budget accounting]
+``Same number of forward passes'' is the right currency, because per-sample cost is
+identical across runs (the residual assembly is negligible next to the FNO forward). For
+small $n$ the optimizer will plateau---or overfit---long before exhausting $T$; early
+stopping on a \emph{validation} set (patience of $x$ evaluations) then truncates the run.
+This is fair, not generous, to small $n$: the stopped run reports the best risk it ever
+achieved, which is exactly what a practitioner would extract from that dataset.
+\end{remark}
+
+\begin{remark}[Design caveats]
+\leavevmode
+\begin{enumerate}
+  \item \textbf{Never stop on the test set.} Early stopping must monitor a validation
+  set; the test set is touched once per reported number. Stopping on the test error
+  biases the reported minimum downward, most severely for the small-$n$ runs whose
+  validation curves are noisiest---precisely the runs the figure is about.
+  \item \textbf{Seeds.} The small-$n$ runs inherit variance from the draw of $D_n$
+  itself; repeat over a few dataset seeds and plot mean $\pm$ spread, otherwise the
+  left end of the curve is a single noisy realization.
+  \item \textbf{Test-set resolution.} A test set of size $m$ estimates the population
+  test error to $O(m^{-1/2})$ relative accuracy; $m$ must be large enough that this is
+  below the gaps the figure claims to resolve (a few hundred samples suffices at the
+  effect sizes we expect).
+  \item \textbf{Plotting $n=\infty$.} On a logarithmic $n$-axis the streaming run has no
+  abscissa; draw it as a horizontal reference line (the floor), which is also the more
+  honest visual statement.
+\end{enumerate}
+\end{remark}
+
+\section*{Reference}
+
+L.~Bottou and O.~Bousquet, \emph{The tradeoffs of large scale learning}, Advances in
+Neural Information Processing Systems~20 (2008).
+
+\end{document}
