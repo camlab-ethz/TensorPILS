@@ -158,6 +158,10 @@ def plot_collapse(runs, out_path, annotate=True):
         final_rl2.append(min(rl2))          # best achieved
         strengths.append(r["precond_strength"])
 
+    if not kappa:                           # only multigrid / NaN-conditioning runs present so far
+        print(f"collapse -> skipped (no blend runs with finite conditioning in {out_path})")
+        return
+
     fig, ax = plt.subplots(figsize=(7, 5))
     ax.plot(kappa, final_rl2, "o-", lw=1.6)
     for k, e, t in zip(kappa, final_rl2, strengths):
