@@ -22,10 +22,10 @@ set -eo pipefail
 
 # --- sweep configuration (edit freely) ---------------------------------------
 GRID=64
-EPOCHS=500        # virtual epochs; total budget = EPOCHS * STEPS optimizer steps
+EPOCHS=1000        # virtual epochs; total budget = EPOCHS * STEPS optimizer steps
 STEPS=32          # optimizer steps per virtual epoch (32 steps x batch 32 = 1024 samples/epoch,
                   # so the budget equals the existing 500-epoch runs on n_train=1024)
-PATIENCE=50       # early-stop after this many epochs without val improvement
+PATIENCE=500       # early-stop after this many epochs without val improvement
 NVALS=(32 64 128 256 512 1024 2048 4096)   # dataset sizes; keep --array as 0-${#NVALS[@]}
 # Tasks 0..N-1 sweep n_train; task N (= ${#NVALS[@]}) trains on the infinite stream.
 NN=${#NVALS[@]}
