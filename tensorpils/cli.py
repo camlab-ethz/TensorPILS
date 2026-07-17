@@ -14,7 +14,7 @@ from argparse import ArgumentParser
 import numpy as np
 import torch
 
-from .data import (create_datasets, PoissonDataset,
+from .data import (create_datasets, create_scaling_datasets, PoissonDataset,
                    create_wave_datasets, create_ac_datasets)
 from .models import FNOModel
 from .trainer import PoissonTrainer, WaveTrainer, ACTrainer
@@ -34,6 +34,23 @@ def build_parser() -> ArgumentParser:
     p.add_argument("--n_val", type=int, default=128)
     p.add_argument("--n_test", type=int, default=256)
     p.add_argument("-k", "--k", type=int, default=4, help="K x K source/IC complexity")
+
+    # -------- Data-scaling / streaming mode (poisson) --------
+    p.add_argument("--stream", action="store_true",
+                   help="Poisson: train on an infinite stream of fresh samples (none seen twice; "
+                        "the infinite-data limit). Ignores --n_train for training; requires "
+                        "--steps_per_epoch. Implies --fixed_eval.")
+    p.add_argument("--steps_per_epoch", type=int, default=None,
+                   help="Poisson: fixed number of optimizer steps per epoch, independent of "
+                        "n_train (finite datasets are sampled i.i.d. with replacement). "
+                        "Equalizes the optimization budget across dataset sizes.")
+    p.add_argument("--patience", type=int, default=None,
+                   help="Poisson: early-stop when the validation error has not improved for "
+                        "this many epochs (default: off).")
+    p.add_argument("--fixed_eval", action="store_true",
+                   help="Poisson: draw val/test from dedicated seeds (seed+1/seed+2), identical "
+                        "for every --n_train — all runs of a dataset-size sweep share the same "
+                        "eval sets. Default: the usual joint train/val/test pool.")
 
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--epochs", type=int, default=500)
@@ -172,14 +189,31 @@ def run_poisson(args, device):
         else:
             print(f"precond     : {args.precond_kind}  strength={args.precond_strength:.3f}"
                   f"  method={args.precond_method}")
+    if args.stream and args.steps_per_epoch is None:
+        raise SystemExit("--stream requires --steps_per_epoch (an epoch has no natural "
+                         "length on an infinite stream).")
+    if args.stream or args.steps_per_epoch or args.patience or args.fixed_eval:
+        print(f"data mode   : {'stream (fresh samples every step)' if args.stream else 'finite'}"
+              + (f"  steps/epoch={args.steps_per_epoch}" if args.steps_per_epoch else "")
+              + (f"  patience={args.patience}" if args.patience else "")
+              + ("  fixed-eval split" if (args.stream or args.fixed_eval) else ""))
     _print_common(args, device)
 
     print("Building datasets...")
-    train_ds, val_ds, test_ds = create_datasets(
-        n_train=args.n_train, n_val=args.n_val, n_test=args.n_test,
-        K=args.k, grid_resolution=args.grid_resolution, seed=args.seed,
-    )
-    print(f"  train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}, "
+    if args.stream or args.fixed_eval:
+        train_ds, val_ds, test_ds = create_scaling_datasets(
+            n_train=args.n_train, n_val=args.n_val, n_test=args.n_test,
+            K=args.k, grid_resolution=args.grid_resolution, seed=args.seed,
+            stream_samples_per_epoch=(args.steps_per_epoch * args.batch_size
+                                      if args.stream else None),
+        )
+    else:
+        train_ds, val_ds, test_ds = create_datasets(
+            n_train=args.n_train, n_val=args.n_val, n_test=args.n_test,
+            K=args.k, grid_resolution=args.grid_resolution, seed=args.seed,
+        )
+    ntr = f"stream({len(train_ds)}/epoch)" if args.stream else len(train_ds)
+    print(f"  train={ntr}, val={len(val_ds)}, test={len(test_ds)}, "
           f"grid={train_ds.grid_size}\n")
 
     # Out-of-distribution eval datasets (higher source complexity K, same grid).
@@ -206,6 +240,7 @@ def run_poisson(args, device):
         precond_method=args.precond_method,
         mg_levels=args.mg_levels, mg_pre_smooth=args.mg_pre_smooth,
         mg_post_smooth=args.mg_post_smooth, mg_omega=args.mg_omega,
+        steps_per_epoch=args.steps_per_epoch, patience=args.patience,
         eval_datasets=eval_datasets,
     )
     _run(trainer, train_ds, test_ds, args)

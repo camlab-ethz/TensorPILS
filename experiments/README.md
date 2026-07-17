@@ -13,6 +13,7 @@ self-contained experiment: a `README.md` (description, facts, run & plot command
 | [`sweep_blend/`](poisson/sweep_blend/README.md) | Does the blend preconditioner strength `t` (residual `t=0` → supervised `t=1`) control training conditioning? Overlay + collapse plots vs `κ(H)`. Variants by loss: `pls/`, `deepritz/`. |
 | [`generalization/`](poisson/generalization/README.md) | Does that loss geometry `t` affect out-of-distribution generalization? Organized into per-regime **scenarios** (`pls_k4/`: K=4→6,8; `pls_k16/`: K=16→20; Deep Ritz variants planned). |
 | [`loss_comparison/`](poisson/loss_comparison/README.md) | Supervised true-L2 (`data_l2`, mass-weighted) vs MSE (`data`) vs label-free Deep Ritz — which training objective minimizes validation relative-L2? |
+| [`data_scaling/`](poisson/data_scaling/README.md) | At a fixed optimization budget, how does test error scale with dataset size — and does the infinite-data (streaming) limit, which eliminates the estimation error exactly, set the floor? |
 
 ### `allen_cahn/`
 

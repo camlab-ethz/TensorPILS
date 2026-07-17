@@ -18,7 +18,7 @@ from typing import List, Optional
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, IterableDataset, RandomSampler
 from tqdm import tqdm
 
 from .meshing import node_to_grid, grid_to_node
@@ -49,6 +49,8 @@ class TrainingStats:
     ood_rel_l2: dict = field(default_factory=dict)
     best_epoch: int = 0
     best_val_error: float = float("inf")
+    # Epoch at which patience-based early stopping fired (-1: ran the full budget).
+    stopped_epoch: int = -1
     # Preconditioner identity + conditioning (for the sweep / collapse plot).
     precond_kind: str = ""
     precond_strength: float = float("nan")
@@ -221,6 +223,8 @@ class PoissonTrainer(BaseTrainer):
         mg_pre_smooth: int = 2,
         mg_post_smooth: int = 2,
         mg_omega: float = 2.0 / 3.0,
+        steps_per_epoch: Optional[int] = None,
+        patience: Optional[int] = None,
         eval_datasets: Optional[dict] = None,
     ):
         super().__init__(model, loss_type, train_dataset.K, optimizer_name,
@@ -229,12 +233,28 @@ class PoissonTrainer(BaseTrainer):
         self.val_dataset = val_dataset
         self.test_dataset = test_dataset
         self.grid_size = train_dataset.grid_size
+        self.stream = isinstance(train_dataset, IterableDataset)
+        self.steps_per_epoch = steps_per_epoch
+        self.patience = patience
 
         # All splits share one PoissonProblem; move it (and its A, M) to the device once.
         self.problem = train_dataset.problem.to(device)
 
-        self.train_loader = DataLoader(train_dataset, batch_size=batch_size,
-                                       shuffle=True, collate_fn=self._collate)
+        if self.stream:
+            # Infinite stream: the dataset yields its samples_per_epoch fresh samples per pass.
+            self.train_loader = DataLoader(train_dataset, batch_size=batch_size,
+                                           collate_fn=self._collate)
+        elif steps_per_epoch is not None:
+            # Fixed-budget "virtual epoch": steps_per_epoch batches drawn i.i.d. WITH replacement
+            # from the finite dataset — the empirical-measure analogue of the fresh stream, so a
+            # dataset-size sweep varies only the sampled measure, not the algorithm.
+            sampler = RandomSampler(train_dataset, replacement=True,
+                                    num_samples=steps_per_epoch * batch_size)
+            self.train_loader = DataLoader(train_dataset, batch_size=batch_size,
+                                           sampler=sampler, collate_fn=self._collate)
+        else:
+            self.train_loader = DataLoader(train_dataset, batch_size=batch_size,
+                                           shuffle=True, collate_fn=self._collate)
         self.val_loader = DataLoader(val_dataset, batch_size=batch_size,
                                      shuffle=False, collate_fn=self._collate)
         self.test_loader = DataLoader(test_dataset, batch_size=batch_size,
@@ -387,7 +407,9 @@ class PoissonTrainer(BaseTrainer):
     # -------------------- training loop --------------------
     def train(self) -> float:
         print(f"Training FNO with {self.loss_type} loss")
-        print(f"  Train: {len(self.train_dataset)}  Val: {len(self.val_dataset)}  "
+        ntr = (f"stream ({len(self.train_dataset)}/epoch)" if self.stream
+               else len(self.train_dataset))
+        print(f"  Train: {ntr}  Val: {len(self.val_dataset)}  "
               f"Test: {len(self.test_dataset)}  Device: {self.device}\n")
         if self.precond is not None:
             self.precond.report()
@@ -420,6 +442,13 @@ class PoissonTrainer(BaseTrainer):
                                 l2=f"{l2:.2e}", rl2=f"{rl2:.2%}",
                                 best=f"{self.stats.best_val_error:.2e}", lr=f"{lr:.2e}")
 
+                if (self.patience is not None
+                        and epoch - self.stats.best_epoch >= self.patience):
+                    self.stats.stopped_epoch = epoch
+                    print(f"\nEarly stop at epoch {epoch}: no val improvement "
+                          f"for {self.patience} epochs (best: epoch {self.stats.best_epoch}).")
+                    break
+
         if self.best_state is not None:
             self.model.load_state_dict(self.best_state, strict=False)
             print(f"\nRestored best model from epoch {self.stats.best_epoch} "
@@ -449,7 +478,10 @@ class PoissonTrainer(BaseTrainer):
             "precond_strength": self.precond_strength,
             "precond_method": self.precond_method,
             "K": self.K,
-            "n_train": len(self.train_dataset),
+            "n_train": (None if self.stream else len(self.train_dataset)),
+            "stream": self.stream,
+            "steps_per_epoch": self.steps_per_epoch,
+            "patience": self.patience,
             "epochs": self.epochs,
             "test_mse": test_mse, "test_l2": test_l2, "test_rl2": test_rl2,
             "stats": asdict(self.stats),
@@ -476,8 +508,9 @@ class PoissonTrainer(BaseTrainer):
             tag = f"_{self._precond_tag()}"
         else:
             tag = ""
+        ntr = "inf" if self.stream else len(self.train_dataset)
         return (f"fno_{self.loss_type}{tag}_K{self.K}_"
-                f"samples-{len(self.train_dataset)}-{len(self.val_dataset)}-{len(self.test_dataset)}")
+                f"samples-{ntr}-{len(self.val_dataset)}-{len(self.test_dataset)}")
 
     def visualize_sample(self, dataset, split: str, sample_idx: int = 0):
         suffix = "" if sample_idx == 0 else f"_sample{sample_idx}"
