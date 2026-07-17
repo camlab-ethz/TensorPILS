@@ -14,7 +14,7 @@
 #SBATCH --gres=gpumem:20g
 #SBATCH --mem-per-cpu=16G
 #SBATCH --output=logs/blend_pls256_%A_%a.out
-#SBATCH --array=0-6
+#SBATCH --array=0-6 
 
 # Source the environment first (module/Lmod is not always `set -u`-safe), then strict mode.
 source ~/env_tensorpils.sh
@@ -23,7 +23,7 @@ set -eo pipefail
 # --- sweep configuration (edit freely) ---------------------------------------
 GRID=256
 EPOCHS=20
-TVALS=(1.0 0.9 0.5 0.25 0.01 0.0)      # blend strengths t; keep --array as 0-$((${#TVALS[@]}-1))
+TVALS=(1.0 0.9 0.5 0.25 0.05 0.0)      # blend strengths t; keep --array as 0-$((${#TVALS[@]}-1))
 # Tasks 0..N-1 sweep t via the fast DST ("sine") preconditioner. Task N (= ${#TVALS[@]}) is the
 # multigrid (GMG) baseline; add it with:  sbatch --array=6 <this file>.
 NT=${#TVALS[@]}

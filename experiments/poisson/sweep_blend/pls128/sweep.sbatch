@@ -22,7 +22,7 @@ set -eo pipefail
 # --- sweep configuration (edit freely) ---------------------------------------
 GRID=128
 EPOCHS=20
-TVALS=(1.0 0.9 0.5 0.25 0.01 0.0)      # blend strengths t; keep --array as 0-$((${#TVALS[@]}-1))
+TVALS=(1.0 0.9 0.5 0.25 0.05 0.0)      # blend strengths t; keep --array as 0-$((${#TVALS[@]}-1))
 # Tasks 0..N-1 sweep t via the fast DST ("sine") preconditioner. Task N (= ${#TVALS[@]}) is the
 # multigrid (GMG) baseline; add it with:  sbatch --array=6 <this file>.
 NT=${#TVALS[@]}
