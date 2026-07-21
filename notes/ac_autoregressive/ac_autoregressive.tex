@@ -324,6 +324,92 @@ label-free training loss \eqref{eq:lgal} still drives the backward--Euler residu
 \eqref{eq:res}; the two discrete solutions agree to $O(\dt)$, so a physics-trained model matches
 the convex--concave reference up to the time-discretisation error.
 
+\section{Numerical soundness of the target regime}
+\label{sec:regime}
+
+The autoregressive experiment fixes a concrete regime --- grid $n\times n=256^2$, diffusion
+$a=1$, reaction strength $\epsilon=64$, step $\dt=10^{-2}$ on $\Omega=(0,1)^2$, tame $K=4$
+initial data --- and its soundness is governed by three dimensionless groups. Write
+$h=1/(n-1)$ for the mesh size and $\ell=a/\epsilon$ for the interface-width scale (balancing
+$a^2u_{xx}+\epsilon^2(u-u^3)=0$ gives the stationary profile $u=\tanh\!\big(x/(\sqrt2\,\ell)\big)$).
+
+\paragraph{(i) Interface resolution $\ell/h$.}
+With $\ell=a/\epsilon=1/64\approx1.56\times10^{-2}$ and $h=1/255\approx3.92\times10^{-3}$,
+\[
+  \ell/h \;=\; a(n-1)/\epsilon \;=\; 255/64 \;\approx\; 4 .
+\]
+Four cells per $\ell$; the visible transition ($u:-0.9\!\to\!0.9$, width $\approx4.16\,\ell$)
+spans $\approx17$ cells --- comfortably resolved. This is the reason to move to $256^2$: at
+$64^2$ ($\ell/h\approx1$) the whole transition would fall in $\sim4$ cells (under-resolved), and
+$128^2$ ($\ell/h\approx2$) is borderline.
+
+\paragraph{(ii) Reaction stiffness per step $\epsilon^2\dt$.}
+The reaction relaxes on $\tau_{\mathrm{react}}=\epsilon^{-2}=2.4\times10^{-4}$ while $\dt=10^{-2}$:
+\[
+  \epsilon^2\dt \;=\; 4096\times10^{-2}\;=\;40.96\;\gg\;1 .
+\]
+The step is $\sim41$ reaction times long, so smooth initial data saturates onto the $\pm1$ wells
+with sharp interfaces within the \emph{first} step (phase separation is essentially instantaneous),
+and an explicit reaction would be violently unstable --- the convex--concave split \eqref{eq:cc}
+(implicit convex part, SPD Jacobian for all $\dt$) is mandatory.
+
+\paragraph{(iii) Diffusion implicitness $a^2\dt/h^2$.}
+\[
+  \frac{a^2\dt}{h^2}\;=\;0.01\times255^2\;\approx\;6.5\times10^2 ,
+\]
+far above the explicit limit $\approx\tfrac14$, so the diffusion is implicit too --- and this same
+group sets the conditioning of the per-step solve.
+
+\paragraph{Conditioning, and why it decides the loss geometry.}
+The convex--concave Jacobian \eqref{eq:cc-jac} $J^{\mathrm{cc}}=M/\dt+a^2A+3\epsilon^2M\diag(u^2)$
+is SPD for every $u,\dt$. Mass-normalised, its spectrum is
+$\lambda\approx\dt^{-1}+a^2\lambda(M^{-1}A)+3\epsilon^2\langle u^2\rangle$; on the regular grid
+$\lambda(M^{-1}A)$ runs from $2\pi^2$ to $\approx24/h^2$ (the exact $Q_1$ tensor spectrum of
+\S\ref{sec:cc}), so
+\[
+  \kappa(J^{\mathrm{cc}})\;\approx\;
+  \frac{\dt^{-1}+24\,a^2/h^2}{\dt^{-1}+2\pi^2a^2}
+  \;\approx\; 24\,\frac{a^2\dt}{h^2}
+  \;\sim\; 1.3\times10^{4}.
+\]
+Two points. First, the conditioning is set by the \emph{diffusion} group $a^2\dt/h^2$ (times an
+$O(20)$ FEM constant), \emph{not} by $\epsilon$: the reaction term $3\epsilon^2u^2$ only
+\emph{raises} eigenvalues where $|u|\approx1$, and the worst-conditioned modes sit exactly where
+$u\approx0$ (the interfaces and the $O(\ell)$ Dirichlet boundary layer), where it vanishes.
+Second, each physics loss inherits this operator \emph{differently}:
+\begin{itemize}\itemsep2pt
+  \item \textbf{Data MSE} $\|\uhat-u^\star\|^2$: output Hessian $=I$, conditioning $O(1)$ --- no PDE
+        operator enters (needs the reference labels).
+  \item \textbf{Minimizing movement} \eqref{eq:mm}: minimises the convex $J$, Hessian $=J^{\mathrm{cc}}$,
+        so $\kappa\sim10^4$ --- ill-conditioned only \emph{linearly} (the Deep-Ritz situation:
+        tractable under Adam, slower/less accurate).
+  \item \textbf{Least squares} \eqref{eq:lgal}: minimises $\tfrac12\|R\|^2$, Hessian
+        $\approx(J^{\mathrm{cc}})^\top J^{\mathrm{cc}}$, so $\kappa^2\sim10^{8}$ --- the squaring that
+        stalls \emph{unpreconditioned} residual training. A left preconditioner
+        $P\approx(J^{\mathrm{cc}})^{-1}$ (or $\approx A^{-1}$; multigrid is the grid-scalable choice at
+        $256^2$) restores $O(1)$ and is the intended fix (preconditioner notes).
+\end{itemize}
+
+\paragraph{Reachable dynamics: what $10/40/100$ steps cover.}
+After separation the interfaces move by mean curvature, $V=a^2\kappa$, and the feature size
+coarsens as $L(t)\sim\sqrt{2a^2t}$:
+\[
+  L(0.1)\approx0.45,\qquad L(0.4)\approx0.89,\qquad L(1.0)\approx1.4\;(>\text{domain}).
+\]
+So the $R=10$ training horizon already sits in the coarsening regime (each step advances an
+interface by $V\dt\approx6$ cells $\approx1.4\,\ell$ --- a substantial, learnable motion), $R=40$
+is well-coarsened, and the $R=100$ rollout runs the domain out toward a single-phase,
+boundary-pinned steady state. Phase separation itself needs no more than the first step; the
+horizon is a choice of how much \emph{coarsening} to expose. Caveat: the first map
+$u^0\!\to\!\uhat^1$ (the stiff near-projection onto the sharp-interface manifold) is qualitatively
+unlike the gentle curvature steps that follow and tends to carry most of the one-step error.
+
+\paragraph{Practical note.} $256^2$ makes both the reference build (batched Newton on
+$\sim6.5\times10^4$-DOF SPD systems per step; a trajectory tensor
+$\sim n_{\text{samples}}\times(R{+}1)\times n^2$ that runs to a few GB at
+$n_{\text{samples}}\sim10^3$) and FNO training markedly heavier than the $64^2$ studies --- budget
+storage and GPU memory accordingly.
+
 \section{Code pointers}
 
 \begin{itemize}\itemsep2pt

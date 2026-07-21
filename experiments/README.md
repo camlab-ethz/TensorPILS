@@ -23,6 +23,7 @@ self-contained experiment: a `README.md` (description, facts, run & plot command
 | [`ac_stresstest/`](allen_cahn/ac_stresstest/README.md) | How far up the reaction-stiffness `ε` axis does each loss hold before the free-running rollout error blows up? |
 | [`compare_bptt/`](allen_cahn/compare_bptt/README.md) | How does the BPTT autodiff mode (full BPTT / detach-prev / pushforward) affect FNO rollout training across the three AC losses over the `ε` axis? |
 | [`long_rollout/`](allen_cahn/long_rollout/README.md) | Extrapolation past the 10-step training horizon: energy + error vs the convex-concave reference, plus 2D field heatmaps. |
+| [`realistic_ac/`](allen_cahn/realistic_ac/README.md) | A realistic FEM regime (`256²`, `eps=64`, `dt=0.01`): with the Newton-Jacobian conditioning `κ~10⁴`, do data-driven / minimizing-movement / **bare** least-squares (which sees `κ²~10⁸`) survive a 100-step pushforward rollout? Error + energy + heatmaps, test & train. Preconditioned-LS arm slots in later. |
 
 ## Evaluation convention
 
