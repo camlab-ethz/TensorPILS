@@ -12,6 +12,7 @@ __all__ = ["build_preconditioner"]
 def build_preconditioner(kind: str, problem, grid_size, *,
                          mg_levels: int = 4, mg_pre_smooth: int = 2,
                          mg_post_smooth: int = 2, mg_omega: float = 2.0 / 3.0,
+                         mg_a2: float = 1.0, mg_c: float = 0.0,
                          strength: float = 1.0, method: str = "dense",
                          device: Optional[str] = None) -> Preconditioner:
     """Build a preconditioner.
@@ -25,7 +26,9 @@ def build_preconditioner(kind: str, problem, grid_size, *,
         Source of the stiffness ``A`` and boundary mask (spectral kinds).
     grid_size : tuple(int, int)
         ``(nx, ny)`` of the fine grid (multigrid kind).
-    mg_* : multigrid V-cycle settings (ignored by spectral kinds).
+    mg_* : multigrid V-cycle settings (ignored by spectral kinds). ``mg_a2``/``mg_c`` set the level
+        operator ``a²A + cM``: the defaults ``(1, 0)`` give the Poisson stiffness ``A``; a positive
+        ``mg_c`` builds the screened-Poisson operator for the Allen–Cahn preconditioned LS loss.
     strength : float in [0, 1]
         ``t`` (blend) or ``s`` (power); ignored by multigrid.
     method : {"dense", "sine"}
@@ -40,6 +43,7 @@ def build_preconditioner(kind: str, problem, grid_size, *,
         precond = GeometricMultigrid(
             nx_fine=nx, ny_fine=ny, n_levels=mg_levels,
             pre_smooth=mg_pre_smooth, post_smooth=mg_post_smooth, omega=mg_omega,
+            a2=mg_a2, c=mg_c,
         )
     elif kind in ("blend", "power"):
         if method == "sine":

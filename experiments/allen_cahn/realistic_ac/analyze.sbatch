@@ -27,6 +27,7 @@ python experiments/allen_cahn/realistic_ac/compute_rollout.py \
     --steps 100 \
     --n_samples 128 \
     --splits test train \
+    --grid_resolution 128 \
     --device cuda
 
 # Scalar figures (headless Agg) so they come down with metrics.json.
@@ -37,4 +38,5 @@ python experiments/allen_cahn/realistic_ac/plot_rollout.py \
 # Field heatmaps (needs the checkpoints -> stays on Euler; download the PNGs).
 python experiments/allen_cahn/realistic_ac/heatmaps.py \
     --steps 100 --split test --samples 0 1 2 \
+    --grid_resolution 128 \
     --out_dir output/allen_cahn/realistic_ac/heatmaps

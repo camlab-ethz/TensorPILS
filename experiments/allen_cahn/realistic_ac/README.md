@@ -81,12 +81,22 @@ Produces (in `output/allen_cahn/realistic_ac/`):
   `[CC reference | data | min-movement | bare-LS]`, each panel annotated with its relative L2 vs CC.
   *(deliverable b)* Use `--split train` / `--samples …` / `--runs …` for subsets.
 
-## Adding the preconditioned-LS arm (later)
+## Adding the preconditioned-LS arm
 
-The whole point of dropping bare LS into this benchmark is to later show a **preconditioned** LS
-loss `½‖P·R‖²` (with `P ≈ (J^cc)⁻¹`, multigrid being the grid-scalable choice at 256²) *rescues*
-the squared conditioning — turning "bare LS fails" into "preconditioning fixes it". Once that loss
-lands in `tensorpils` (planned flag `--ac_precond multigrid`), it slots in with **no change to the
-analysis**: add one line to `ARMS` in `sweep.sbatch` (the commented task 3) and bump `--array=0-3`.
-`compute_rollout.py` / `plot_rollout.py` / `heatmaps.py` key runs by loss and glob whatever
-checkpoints exist, so they pick the new arm up automatically. Nothing here hard-codes three losses.
+The point of dropping bare LS into this benchmark is to show a **preconditioned** LS loss
+`½‖P·R‖²` *rescues* the squared conditioning — turning "bare LS fails" into "preconditioning fixes
+it". `P ≈ J₀⁻¹` with `J₀ = a²A + cM` the frozen (`u²=1`) Newton Jacobian, `c = 1/dt + 3ε²`,
+realized as a multigrid V-cycle on `a²A + cM` (grid-scalable at 256²). See
+`notes/ac_autoregressive/` §"Preconditioning the least-squares loss" for the derivation.
+
+**This loss is implemented** (`--ac_precond multigrid`, with `--ac_loss_form galerkin`). To enable
+the arm: uncomment task 3 in `sweep.sbatch` and bump `--array=0-3`:
+
+```bash
+"--loss galerkin --ac_loss_integrator convex_concave --ac_precond multigrid"   # 3 preconditioned LS
+```
+
+No analysis change is needed — `compute_rollout.py` / `plot_rollout.py` / `heatmaps.py` key runs by
+loss (the preconditioned arm reads back as `pls`, tagged `_ls_precmg_` in filenames so it never
+collides with bare LS) and glob whatever checkpoints exist, so they pick the new arm up
+automatically. At 256² consider `--mg_levels 6` (coarsens 256→…→8) for a cheaper coarse solve.

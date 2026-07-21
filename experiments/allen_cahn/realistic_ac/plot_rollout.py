@@ -23,10 +23,11 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-LOSS_COLOR = {"mm": "#1f77b4", "ls": "#ff7f0e", "data": "#2ca02c"}
-LOSS_NAME = {"mm": "min-movement", "ls": "bare least-squares", "data": "data-driven"}
+LOSS_COLOR = {"mm": "#1f77b4", "ls": "#ff7f0e", "data": "#2ca02c", "pls": "#d62728"}
+LOSS_NAME = {"mm": "min-movement", "ls": "bare least-squares", "data": "data-driven",
+             "pls": "preconditioned LS"}
 SPLIT_STYLE = {"test": "-", "train": "--"}
-ORDER = ["data", "mm", "ls"]
+ORDER = ["data", "mm", "ls", "pls"]
 
 
 def nan_clean(vec):

@@ -410,6 +410,83 @@ $\sim n_{\text{samples}}\times(R{+}1)\times n^2$ that runs to a few GB at
 $n_{\text{samples}}\sim10^3$) and FNO training markedly heavier than the $64^2$ studies --- budget
 storage and GPU memory accordingly.
 
+\section{Preconditioning the least-squares loss}
+\label{sec:precond}
+
+The least-squares physics loss \eqref{eq:lgal} is a \emph{nonlinear} least-squares problem in the
+new frame: $\ell(u)=\tfrac12\|R(u^n,u)\|_2^2$ with $u=u^{n+1}$. Its Gauss--Newton Hessian is
+$J^\top J$ (the second-order term $\sum_i R_i\nabla^2R_i$ vanishes at the solution $R=0$), so the
+conditioning it presents to the optimiser is $\kappa(J^\top J)=\kappa(J)^2$ --- the squaring of
+\S\ref{sec:regime} that stalls training at $\kappa\sim10^4\Rightarrow\kappa^2\sim10^8$. A left
+preconditioner $P$ acting on the residual, $\ell_P(u)=\tfrac12\|P\,R(u^n,u)\|_2^2$, changes the
+Gauss--Newton Hessian to $(PJ)^\top(PJ)=J^\top P^\top P\,J$; with $P\approx J^{-1}$ this is
+$\approx I$, restoring $O(1)$ conditioning without labels. This is the Allen--Cahn analogue of the
+Poisson preconditioned least-squares (\texttt{pls}) loss.
+
+\paragraph{The residual Jacobian (as coded).} The loss drives the \emph{$/\dt$-scaled} residual
+\eqref{eq:cc} in its $/\dt$ form (\texttt{ACProblem.residual}, \S\ref{sec:cc}),
+\begin{equation}
+  R(u^{n},u^{n+1}) \;=\; M\,\frac{u^{n+1}-u^{n}}{\dt} \;+\; a^2A\,u^{n+1}
+     \;+\; \epsilon^2 M\big((u^{n+1})^3 - u^{n}\big),
+  \label{eq:R-coded}
+\end{equation}
+i.e.\ \textbf{not} multiplied through by $\dt$. Differentiating in the new frame $u^{n+1}$ (the
+argument the model controls; $u^n$ is the fixed/detached previous frame) term by term:
+$\partial_{u^{n+1}}\big[M(u^{n+1}-u^n)/\dt\big]=M/\dt$;
+$\partial_{u^{n+1}}\big[a^2Au^{n+1}\big]=a^2A$; and, since the cubic is nodal/collocated,
+$\partial_{u^{n+1}}\big[\epsilon^2 M(u^{n+1})^3\big]=\epsilon^2 M\diag\!\big(3(u^{n+1})^2\big)
+=3\epsilon^2 M\diag\!\big((u^{n+1})^2\big)$. Hence
+\begin{equation}
+  \boxed{\;
+  J(u) \;=\; \frac{M}{\dt} \;+\; a^2 A \;+\; 3\,\epsilon^2\,M\,\diag(u^2)
+  \;}
+  \label{eq:R-jac}
+\end{equation}
+--- exactly the convex--concave Newton Jacobian \eqref{eq:cc-jac}, in the $/\dt$ normalisation.
+(Multiplying \eqref{eq:R-coded} by $\dt$ instead would give $\tilde J=\dt\,J=M+\dt\,a^2A
++3\dt\,\epsilon^2M\diag(u^2)$; the two differ only by the scalar $\dt$, so as a preconditioner
+they are equivalent up to that constant. We match the code and use \eqref{eq:R-jac}.) The mass on
+the reaction is the consistent $M\diag(u^2)$ (``$M_{u^2}$''), not a lumped $\diag(M\mathbf1\,u^2)$
+--- the loss residual uses the consistent-mass cubic $\epsilon^2M(u^{n+1})^3$.
+
+\paragraph{Frozen-coefficient preconditioner.} $J(u)$ depends on $u$ only through the reaction
+diagonal $\diag(u^2)$. Freezing it at the bulk value of a phase, $u^2\equiv1$, removes that
+dependence and gives the \emph{constant}, symmetric-positive-definite operator
+\begin{equation}
+  J_0 \;=\; \frac{M}{\dt} + a^2A + 3\epsilon^2 M
+      \;=\; a^2 A \;+\; c\,M,\qquad
+      c \;=\; \frac{1}{\dt} + 3\epsilon^2 ,
+  \label{eq:J0}
+\end{equation}
+a \textbf{screened-Poisson / reaction--diffusion} operator (stiffness $a^2A$ plus a positive mass
+shift $cM$). We take $P\approx J_0^{-1}$. Because $J_0$ is $u$-independent it is assembled
+\emph{once}, and the preconditioned Gauss--Newton Hessian $J^\top J_0^{-1}J_0^{-1}J\approx I$
+wherever $J\approx J_0$.
+
+\paragraph{Where the approximation is exact, and where it is not.} Setting $u^2=1$ is exact in the
+bulk of each phase and \emph{over}-shifts the reaction where $u\approx0$ --- the interfaces and the
+$O(\ell)$ Dirichlet boundary layer --- since there the true $J$ has $3\epsilon^2M\diag(u^2)\to0$
+while $J_0$ keeps the full $3\epsilon^2M$. So $P$ is an over-damped approximation of $J^{-1}$ on the
+interface subspace. It remains SPD and still collapses the $\kappa^2$ of the dominant
+(diffusion/bulk) spectrum; it is a preconditioner, not an exact inverse, so a residual solver would
+still need a few iterations there --- but for reshaping the \emph{training} conditioning it is the
+cheap, $u$-independent, grid-scalable choice. For the target regime $c=1/\dt+3\epsilon^2=100+12288
+=12388$, so $J_0$ is strongly mass-dominated and itself well-conditioned
+($\kappa(J_0)\sim c^{-1}\!\cdot\!24a^2/h^2$ down from $\kappa(J)\sim10^4$).
+
+\paragraph{Realisation: multigrid V-cycle on $a^2A+cM$.} We reuse the geometric-multigrid V-cycle
+(\texttt{GeometricMultigrid}) that supplies $P\approx A^{-1}$ for Poisson, with the level operator
+changed from the bare stiffness to $a^2A_\ell + cM_\ell$, \textbf{re-discretised} on each coarsened
+grid (both $A_\ell$ and $M_\ell$ from TensorMesh's \texttt{Laplace}/\texttt{MassElementAssembler},
+Dirichlet rows/cols zeroed with unit diagonal). Weighted-Jacobi smoothing, bilinear
+prolongation/restriction $R=P^\top$, and a dense coarse solve are unchanged; the positive mass
+shift only makes the operator \emph{more} diagonally dominant, so the smoother is at least as
+effective as in the Poisson case. One V-cycle is a differentiable sequence of sparse mat--vecs, so
+autograd flows through $\tfrac12\|P R\|^2$ exactly. Selected by \texttt{--ac\_precond multigrid}
+(only with \texttt{--ac\_loss\_form galerkin}); the coefficients $a^2$ and $c=1/\dt+3\epsilon^2$ are
+formed by \texttt{ACTrainer} from the run's $a,\epsilon,\dt$ and passed to
+\texttt{build\_preconditioner(\dots, mg\_a2, mg\_c)}.
+
 \section{Code pointers}
 
 \begin{itemize}\itemsep2pt

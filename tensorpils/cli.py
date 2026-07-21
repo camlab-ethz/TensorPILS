@@ -135,6 +135,11 @@ def build_parser() -> ArgumentParser:
                    help="Override the residual integrator used by the Galerkin physics loss, "
                         "decoupled from the reference data (--ac_integrator). Default: follow the "
                         "data. Lets a BE-residual loss train on convex_concave reference data.")
+    p.add_argument("--ac_precond", choices=["none", "multigrid"], default="none",
+                   help="Precondition the AC least-squares residual (--ac_loss_form galerkin only): "
+                        "'multigrid' trains ½‖P R‖² with P ≈ J0^-1, J0 = a²A + cM the frozen (u²=1) "
+                        "Newton Jacobian (c = 1/dt + 3ε²), removing the κ² conditioning of the bare "
+                        "residual. Uses the --mg_* V-cycle settings. Default: none (bare ½‖R‖²).")
     p.add_argument("--bptt_mode", choices=["full_bptt", "detach_prev", "pushforward"], default=None,
                    help="Autodiff/backprop-through-time strategy for the rollout. 'full_bptt': no "
                         "detach (backprop through the whole rollout). 'detach_prev': detach the "
@@ -309,6 +314,10 @@ def run_ac(args, device):
     print(f"integrator  : data={args.ac_integrator}  loss-residual={loss_integ}")
     print(f"phys loss   : {args.ac_loss_form}  "
           f"({'least-squares residual ½‖R‖²' if args.ac_loss_form == 'galerkin' else 'minimizing-movement objective J'})")
+    if args.ac_precond != "none":
+        c_shift = 1.0 / args.dt + 3.0 * args.ac_eps ** 2
+        print(f"precond     : {args.ac_precond}  ½‖P R‖², P≈(a²A+cM)⁻¹  "
+              f"(a²={args.ac_a ** 2:g}, c=1/dt+3ε²={c_shift:g}, mg_levels={args.mg_levels})")
     print(f"bptt mode   : {args.bptt_mode or 'default (per-loss)'}")
     print(f"reference   : FEM {args.ac_integrator} + Newton (build cost ~ {total}x{args.n_steps} steps; "
           f"no analytical solution exists for AC)")
@@ -338,6 +347,9 @@ def run_ac(args, device):
         rollout_steps=args.rollout_steps, discount_factor=args.discount_factor,
         ac_loss_form=args.ac_loss_form, ac_integrator=args.ac_loss_integrator,
         bptt_mode=args.bptt_mode,
+        ac_precond=("" if args.ac_precond == "none" else args.ac_precond),
+        mg_levels=args.mg_levels, mg_pre_smooth=args.mg_pre_smooth,
+        mg_post_smooth=args.mg_post_smooth, mg_omega=args.mg_omega,
     )
     _run(trainer, train_ds, test_ds, args)
 

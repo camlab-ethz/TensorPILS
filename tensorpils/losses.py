@@ -263,10 +263,17 @@ class ACGalerkinLoss(nn.Module):
     ``integrator`` selects the residual form (see :meth:`ACProblem.residual`): ``"backward_euler"``
     (fully implicit) or ``"convex_concave"`` (Eyre split). Both use the ``/dt`` scaling, so the
     loss is ``dt``-independent in gradient scale.
+
+    If ``precond`` is given, the loss is the **preconditioned** least-squares residual
+    :math:`\tfrac12\|P R\|^2` with :math:`P\approx J_0^{-1}`, :math:`J_0=a^2A+cM` the frozen
+    (``u²=1``) Newton Jacobian (see ``notes/ac_autoregressive/`` §"Preconditioning the least-squares
+    loss"). The preconditioned Gauss–Newton Hessian :math:`J^\top P^\top P J\approx I` removes the
+    :math:`\kappa^2` squaring that stalls the bare residual at stiff ``eps``.
     """
 
     def __init__(self, problem: ACProblem, a: float, eps: float, dt: float, discount: float = 1.0,
-                 integrator: str = "backward_euler", detach_coupling=None):
+                 integrator: str = "backward_euler", detach_coupling=None,
+                 precond: Optional[Preconditioner] = None):
         super().__init__()
         self.problem = problem
         self.a = a
@@ -274,6 +281,7 @@ class ACGalerkinLoss(nn.Module):
         self.dt = dt
         self.discount = discount
         self.integrator = integrator
+        self.precond = precond
         # Whether to detach the previous frame u^k in R(u^k, u^{k+1}). ½‖R‖² is self-balancing
         # (∇ vanishes in both args at R=0), so the default is False (no detach) — a valid variant
         # for the bptt-mode study. None -> class default.
@@ -289,8 +297,10 @@ class ACGalerkinLoss(nn.Module):
             prev = seq_node[:, k].detach() if self.detach_coupling else seq_node[:, k]
             r = self.problem.residual(prev, seq_node[:, k + 1],
                                       self.a, self.eps, self.dt, integrator=self.integrator)
+            if self.precond is not None:
+                r = self.precond(r)                                   # ½‖P R‖², P ≈ (a²A+cM)⁻¹
             w = self.discount ** k
-            total = total + w * (0.5 * (r ** 2).sum(dim=-1).mean())   # ½‖R‖²: sum nodes, mean batch
+            total = total + w * (0.5 * (r ** 2).sum(dim=-1).mean())   # sum nodes, mean batch
             wsum += w
         return total / wsum
 
@@ -339,20 +349,24 @@ class ACMinMovementLoss(nn.Module):
 
 def build_ac_loss(problem: ACProblem, a: float, eps: float, dt: float, discount: float = 1.0,
                   integrator: str = "backward_euler", form: str = "galerkin",
-                  detach_coupling=None):
+                  detach_coupling=None, precond: Optional[Preconditioner] = None):
     """Factory for the Allen–Cahn physics criterion. The supervised data term is a plain
     trajectory MSE handled by the trainer; only the label-free physics loss is assembled here.
 
     ``form`` picks the physics loss:
       * ``"galerkin"`` — least-squares residual ``½‖R‖²`` (:class:`ACGalerkinLoss`); ``integrator``
-        selects the residual scheme (``backward_euler`` | ``convex_concave``).
+        selects the residual scheme (``backward_euler`` | ``convex_concave``). If ``precond`` is
+        given, this becomes the preconditioned residual ``½‖P R‖²``.
       * ``"min_movement"`` — convex–concave minimizing-movement objective ``J``
         (:class:`ACMinMovementLoss`); intrinsically convex–concave, ``integrator`` is ignored.
     """
     if form == "galerkin":
         return ACGalerkinLoss(problem, a=a, eps=eps, dt=dt, discount=discount, integrator=integrator,
-                              detach_coupling=detach_coupling)
+                              detach_coupling=detach_coupling, precond=precond)
     if form == "min_movement":
+        if precond is not None:
+            raise ValueError("preconditioning applies to the least-squares residual only "
+                             "(form='galerkin'), not the minimizing-movement objective")
         return ACMinMovementLoss(problem, a=a, eps=eps, dt=dt, discount=discount,
                                  detach_coupling=detach_coupling)
     raise ValueError(f"unknown AC loss form {form!r}; expected 'galerkin' or 'min_movement'")

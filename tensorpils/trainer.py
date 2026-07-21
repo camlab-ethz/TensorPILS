@@ -713,6 +713,7 @@ class RolloutTrainer(BaseTrainer):
             "loss_type": self.loss_type,
             "ac_loss_form": getattr(self, "ac_loss_form", None),
             "ac_integrator": getattr(self, "ac_integrator", None),
+            "ac_precond": getattr(self, "ac_precond", ""),
             "bptt_mode": self.bptt_mode,
             "lambda_galerkin": self.lambda_galerkin,
             "lambda_data": self.lambda_data,
@@ -787,7 +788,8 @@ class ACTrainer(RolloutTrainer):
                  weight_decay=0.0, batch_size=32, epochs=500, device="cuda",
                  output_dir="output", lambda_galerkin=1.0, lambda_data=0.0,
                  rollout_steps=4, discount_factor=1.0, ac_integrator=None,
-                 ac_loss_form="galerkin", bptt_mode=None):
+                 ac_loss_form="galerkin", bptt_mode=None, ac_precond="",
+                 mg_levels=4, mg_pre_smooth=2, mg_post_smooth=2, mg_omega=2.0 / 3.0):
         super().__init__(model, train_dataset, val_dataset, test_dataset, loss_type,
                          n_seed_frames=1, optimizer_name=optimizer_name, lr=lr, lr_min=lr_min,
                          weight_decay=weight_decay, batch_size=batch_size, epochs=epochs,
@@ -804,17 +806,40 @@ class ACTrainer(RolloutTrainer):
         # None keeps each loss's own default (MM detaches, Galerkin does not). detach_rollout (the
         # pushforward) is handled on the base trainer.
         detach_coupling = None if bptt_mode is None else (bptt_mode in ("detach_prev", "pushforward"))
+
+        # Preconditioned least-squares: P ≈ J_0^{-1} with J_0 = a²A + cM the frozen (u²=1) Newton
+        # Jacobian (c = 1/dt + 3ε²), realized as a multigrid V-cycle on a²A + cM. See
+        # notes/ac_autoregressive/ §"Preconditioning the least-squares loss". Galerkin form only.
+        self.ac_precond = ac_precond or ""
+        self.precond: Optional[Preconditioner] = None
+        if self.ac_precond:
+            if ac_loss_form != "galerkin":
+                raise ValueError("--ac_precond applies to the least-squares residual only "
+                                 f"(--ac_loss_form galerkin), got {ac_loss_form!r}")
+            if self.ac_precond != "multigrid":
+                raise ValueError(f"unknown ac_precond {self.ac_precond!r}; expected 'multigrid'")
+            a2 = self.a * self.a
+            c = 1.0 / self.dt + 3.0 * self.eps * self.eps
+            self.precond = build_preconditioner(
+                kind="multigrid", problem=self.problem, grid_size=self.grid_size,
+                mg_levels=mg_levels, mg_pre_smooth=mg_pre_smooth, mg_post_smooth=mg_post_smooth,
+                mg_omega=mg_omega, mg_a2=a2, mg_c=c, device=device)
+            print(f"[ac precond] multigrid V-cycle on a²A+cM  (a²={a2:g}, c=1/dt+3ε²={c:g})")
+
         self.criterion = build_ac_loss(self.problem, a=self.a, eps=self.eps, dt=self.dt,
                                        discount=discount_factor, integrator=self.ac_integrator,
-                                       form=ac_loss_form, detach_coupling=detach_coupling)
+                                       form=ac_loss_form, detach_coupling=detach_coupling,
+                                       precond=self.precond)
 
     def _file_prefix(self) -> str:
         itag = {"convex_concave": "cc", "backward_euler": "be"}.get(self.ac_integrator, self.ac_integrator)
         ftag = {"galerkin": "ls", "min_movement": "mm"}.get(self.ac_loss_form, self.ac_loss_form)
+        # Tag preconditioned LS so it never collides with the bare-LS run at the same config.
+        ptag = "_precmg" if getattr(self, "ac_precond", "") else ""
         # Tag the bptt mode only when set, so existing (mode=None) run filenames are unchanged.
         btag = "" if self.bptt_mode is None else \
             "_bptt-" + {"full_bptt": "full", "detach_prev": "detach", "pushforward": "push"}.get(
                 self.bptt_mode, self.bptt_mode)
-        return (f"fno_ac_{self.loss_type}_{ftag}_{itag}{btag}_a{self.a:g}_eps{self.eps:g}_dt{self.dt:g}_"
+        return (f"fno_ac_{self.loss_type}_{ftag}{ptag}_{itag}{btag}_a{self.a:g}_eps{self.eps:g}_dt{self.dt:g}_"
                 f"T{self.n_steps}_R{self.rollout_steps}_K{self.K}_"
                 f"samples-{len(self.train_dataset)}-{len(self.val_dataset)}-{len(self.test_dataset)}")

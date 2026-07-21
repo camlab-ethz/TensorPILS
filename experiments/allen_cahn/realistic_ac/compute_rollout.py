@@ -39,10 +39,12 @@ DEFAULT_CFG = dict(n_modes=(16, 16), hidden_channels=64, in_channels=1, out_chan
 
 
 def loss_key(rec):
-    """data / mm (minimizing-movement) / ls (least-squares residual)."""
+    """data / mm (minimizing-movement) / ls (bare least-squares) / pls (preconditioned LS)."""
     if rec.get("loss_type") == "data" or (rec.get("lambda_data") and not rec.get("lambda_galerkin")):
         return "data"
-    return "mm" if rec.get("ac_loss_form") == "min_movement" else "ls"
+    if rec.get("ac_loss_form") == "min_movement":
+        return "mm"
+    return "pls" if rec.get("ac_precond") else "ls"
 
 
 def parse_samples(prefix):

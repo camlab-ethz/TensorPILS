@@ -15,7 +15,7 @@ autograd flows through it: for the symmetric ``M`` produced by symmetric Jacobi 
 import numpy as np
 import torch
 
-from tensormesh import LaplaceElementAssembler
+from tensormesh import LaplaceElementAssembler, MassElementAssembler
 from ..meshing import structured_quad_mesh
 from .base import Preconditioner
 
@@ -49,24 +49,34 @@ def _build_2d_prolongation(nx_f: int, ny_f: int, nx_c: int, ny_c: int) -> np.nda
 
 
 class GeometricMultigrid(Preconditioner):
-    """Geometric multigrid V-cycle preconditioner :math:`M \\approx A^{-1}`.
+    r"""Geometric multigrid V-cycle preconditioner :math:`P \approx (a^2A + cM)^{-1}`.
+
+    Defaults ``a2=1, c=0`` give the bare Poisson stiffness :math:`P\approx A^{-1}` (unchanged);
+    a positive mass shift ``c>0`` builds the screened-Poisson / reaction--diffusion operator
+    :math:`a^2A + cM` used to precondition the Allen--Cahn least-squares residual (the frozen
+    Newton Jacobian :math:`J_0 = a^2A + cM`, :math:`c=1/\dt+3\epsilon^2`; see
+    ``notes/ac_autoregressive/`` §"Preconditioning the least-squares loss").
 
     Each coarser level uses ``((nx+1)//2, (ny+1)//2)`` (floored at 3). Prolongation is
     bilinear interpolation respecting the row-major node order; restriction is ``R = Pᵀ``.
-    The stiffness at every level is re-discretized via :func:`structured_quad_mesh` +
-    ``LaplaceElementAssembler``, then its Dirichlet rows/cols are zeroed with a unit
-    diagonal. Given a residual with zero boundary entries (as produced by
-    :meth:`PoissonProblem.residual`), the V-cycle preserves a zero boundary.
+    The level operator at every level is re-discretized via :func:`structured_quad_mesh` +
+    ``Laplace``/``MassElementAssembler``, then its Dirichlet rows/cols are zeroed with a unit
+    diagonal. Given a residual with zero boundary entries, the V-cycle preserves a zero boundary.
+    The positive mass shift only makes the operator more diagonally dominant, so weighted-Jacobi
+    smoothing is at least as effective as in the Poisson case.
     """
 
     def __init__(self, nx_fine: int, ny_fine: int, n_levels: int = 4,
                  pre_smooth: int = 2, post_smooth: int = 2,
-                 omega: float = 2.0 / 3.0, ngp: int = 4):
+                 omega: float = 2.0 / 3.0, ngp: int = 4,
+                 a2: float = 1.0, c: float = 0.0):
         super().__init__()
         self.n_levels = n_levels
         self.pre_smooth = pre_smooth
         self.post_smooth = post_smooth
         self.omega = omega
+        self.a2 = a2                                  # stiffness coefficient (Poisson: 1)
+        self.c = c                                    # mass shift (Poisson: 0; AC: 1/dt+3ε²)
 
         # ---- 1. dimensions at each level ----
         dims = [(nx_fine, ny_fine)]
@@ -77,7 +87,7 @@ class GeometricMultigrid(Preconditioner):
 
         # ---- 2. stiffness + diag at each level (with Dirichlet BC enforcement) ----
         for L, (nx, ny) in enumerate(dims):
-            A = self._discretize(nx, ny, ngp)        # dense [N, N], double, BC-enforced
+            A = self._assemble_operator(nx, ny, ngp)  # dense [N, N], double, BC-enforced
             A_t = torch.from_numpy(A).float()
             A_coo = A_t.to_sparse_coo().coalesce()
             self.register_buffer(f"A_indices_{L}", A_coo.indices())
@@ -98,18 +108,21 @@ class GeometricMultigrid(Preconditioner):
             self.register_buffer(f"R_indices_{L}", R_coo.indices())
             self.register_buffer(f"R_values_{L}", R_coo.values())
 
-    @staticmethod
-    def _discretize(nx: int, ny: int, ngp: int) -> np.ndarray:
-        """Assemble the Poisson stiffness on an ``nx×ny`` structured grid via TensorMesh,
-        then zero Dirichlet rows/cols and set the boundary diagonal to 1. Returns dense double."""
+    def _assemble_operator(self, nx: int, ny: int, ngp: int) -> np.ndarray:
+        """Assemble the level operator ``a²·A + c·M`` on an ``nx×ny`` structured grid via
+        TensorMesh, then zero Dirichlet rows/cols and set the boundary diagonal to 1. Dense double.
+        With the defaults (``a2=1, c=0``) this is exactly the bare Poisson stiffness."""
         mesh = structured_quad_mesh(nx=nx, ny=ny)
         A = LaplaceElementAssembler.from_mesh(mesh, quadrature_order=ngp)(mesh.points)
-        Ad = A.to_dense().double().cpu().numpy()
+        Op = self.a2 * A.to_dense().double().cpu().numpy()
+        if self.c != 0.0:                             # screened-Poisson shift a²A + cM
+            M = MassElementAssembler.from_mesh(mesh, quadrature_order=ngp)(mesh.points)
+            Op = Op + self.c * M.to_dense().double().cpu().numpy()
         mask = mesh.boundary_mask.cpu().numpy().astype(bool)
-        Ad[mask, :] = 0.0
-        Ad[:, mask] = 0.0
-        Ad[mask, mask] = 1.0                          # numpy fancy diagonal assignment
-        return Ad
+        Op[mask, :] = 0.0
+        Op[:, mask] = 0.0
+        Op[mask, mask] = 1.0                          # numpy fancy diagonal assignment
+        return Op
 
     # -------------------- sparse tensor reconstruction --------------------
     def _size(self, L: int) -> int:
@@ -149,7 +162,8 @@ class GeometricMultigrid(Preconditioner):
         return self.v_cycle(r)
 
     def report(self) -> None:
-        print(f"[multigrid precond] n_levels={self.n_levels}  "
+        op = "A" if self.c == 0.0 else f"a²A+cM (a²={self.a2:g}, c={self.c:g})"
+        print(f"[multigrid precond] operator {op}  n_levels={self.n_levels}  "
               f"pre/post={self.pre_smooth}/{self.post_smooth}  omega={self.omega:.3f}  "
               f"dims={self.dims}")
 
