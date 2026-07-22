@@ -487,6 +487,130 @@ autograd flows through $\tfrac12\|P R\|^2$ exactly. Selected by \texttt{--ac\_pr
 formed by \texttt{ACTrainer} from the run's $a,\epsilon,\dt$ and passed to
 \texttt{build\_preconditioner(\dots, mg\_a2, mg\_c)}.
 
+\section{Mesh-consistent scaling of the loss functionals}
+\label{sec:scaling}
+
+Each training loss reduces a per-node DOF vector to a scalar, and under mesh refinement
+($h\to0$, node count $N\sim h^{-2}$ in 2D) the three do \emph{not} share a common scale unless
+one is careful. This matters whenever the losses are blended (the data and physics terms enter the
+\emph{same} objective $\mathcal L=\lambda_{\mathrm{gal}}\mathcal L_{\mathrm{gal}}
++\lambda_{\mathrm{data}}\mathcal L_{\mathrm{data}}$) or compared across resolutions: a hidden
+factor of $N$ silently reweights one term. The governing distinction is \emph{not} \texttt{mean}
+vs \texttt{sum} --- for any fixed vector $v$, $\sum_i v_i^2 = N\,\overline{v_i^2}$, so those differ
+by exactly $N$ and can never both be scale-stable --- but \textbf{what kind of object the vector
+is}.
+
+\paragraph{Primal fields vs.\ dual residuals.} The mass matrix $M$ is the $L^2$ Gram matrix of the
+nodal basis, $M_{ij}=\int_\Omega\phi_i\phi_j$, with row sums $\sum_j M_{ij}=\int_\Omega\phi_i\sim
+h^2$ (a nodal area). Two kinds of DOF vector occur:
+\begin{itemize}\itemsep2pt
+  \item A \textbf{primal field} $e$ (e.g.\ an error $e=u_\theta-u^\star$) stores nodal \emph{function
+        values}: $e_i=e(x_i)=O(1)$.
+  \item A \textbf{dual residual} $r$ (e.g.\ the weak-form step residual \eqref{eq:R-coded}) stores
+        \emph{functionals} tested against the basis: $r_i=\langle R,\phi_i\rangle=\int_\Omega R\,\phi_i
+        \sim h^2 R(x_i)=O(h^2)$.
+\end{itemize}
+$M$ maps between them ($r=M\rho$ represents a primal density $\rho_i=O(1)$), so their Euclidean
+reductions scale \emph{oppositely}:
+\begin{equation}
+  \|e\|_2^2=\textstyle\sum_i e_i^2=O(N),\qquad
+  \overline{e_i^2}=\tfrac1N\|e\|_2^2=O(1),\qquad
+  \|r\|_2^2=\textstyle\sum_i r_i^2=O(N h^4)=O(h^2)\xrightarrow{h\to0}0,
+  \label{eq:euclid-scaling}
+\end{equation}
+and $\overline{r_i^2}=O(h^4)$ decays faster still. So \emph{no} Euclidean square is mesh-consistent
+for either object: a bare $\|v\|_2^2$ is scale-stable only for a ``density'' with $v_i\sim
+h=N^{-1/2}$, which neither $e$ (too large) nor $r$ (too small) is.
+
+\paragraph{The consistent form is a mass-weighted pairing.} The mesh-independent squared integral
+is recovered by inserting the correct Gram weight:
+\begin{equation}
+  \boxed{\;
+  e^\top M e=\int_\Omega e^2\,dx+O(h^2)\ \ (\text{primal}),
+  \qquad
+  r^\top M^{-1} r=\int_\Omega R^2\,dx+O(h^2)\ \ (\text{dual}).
+  \;}
+  \label{eq:consistent-norms}
+\end{equation}
+For a primal field $M$ supplies the $h^2$ quadrature weight ($e^\top Me\approx h^2\sum_i e_i^2$;
+on the unit square this equals $\overline{e_i^2}$ up to $|\Omega|$, so the plain mean is
+\emph{already} consistent). For a dual residual $M^{-1}$ \emph{removes} the extra $h^2$
+($r^\top M^{-1}r=(M\rho)^\top M^{-1}(M\rho)=\rho^\top M\rho\approx\int\rho^2$). Table~\ref{tab:scaling}
+confirms this on $u=\sin\pi x\sin\pi y$ over $(0,1)^2$: the pairing $u^\top Mu$ and the mean
+$\overline{u_i^2}$ are flat in $N$, while $\|Mu\|_2^2$ (a stand-in for $\|r\|_2^2$, since $r$ has
+the same mass-weighted structure) falls like $h^2$.
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{r r c c c}
+\hline
+$n$ & $N=n^2$ & $\overline{u_i^2}$ (primal, mean) & $u^\top Mu$ (pairing) & $\|Mu\|_2^2$ (dual, Euclidean)\\
+\hline
+$33$  & $1089$  & $0.2351$ & $0.2492$ & $2.43\times10^{-4}$\\
+$65$  & $4225$  & $0.2424$ & $0.2498$ & $6.09\times10^{-5}$\\
+$129$ & $16641$ & $0.2461$ & $0.2499$ & $1.53\times10^{-5}$\\
+$257$ & $66049$ & $0.2481$ & $0.2500$ & $3.81\times10^{-6}$\\
+\hline
+\multicolumn{2}{r}{scaling} & $O(1)$ & $O(1)=\int u^2=\tfrac14$ & $O(h^2)\to0$\\
+\hline
+\end{tabular}
+\caption{Reductions of a fixed smooth field $u$ under refinement. Primal reductions
+($\overline{u_i^2}$, $u^\top Mu$) are mesh-independent; the Euclidean square of the dual object
+$Mu$ decays like $h^2$ (quarters as $n$ doubles), the scaling a bare least-squares $\|r\|_2^2$
+inherits.}
+\label{tab:scaling}
+\end{table}
+
+\paragraph{The three Allen--Cahn losses on this map.}
+\begin{itemize}\itemsep2pt
+  \item \textbf{Data MSE} $\overline{(u_\theta-u^\star)^2}$ --- a \emph{primal} field reduced by the
+        mean $\approx\int e^2$. Mesh-consistent, $O(1)$.
+  \item \textbf{Minimizing movement} $J$ \eqref{eq:mm} --- built entirely from mass/stiffness
+        pairings $u^\top Mu$, $u^\top Au$ (i.e.\ $\int u^2,\int|\nabla u|^2$). Mesh-consistent, $O(1)$.
+  \item \textbf{Bare least squares} $\tfrac12\|r\|_2^2$ \eqref{eq:lgal} --- a \emph{dual} residual
+        reduced in the \emph{Euclidean} norm rather than the dual norm $\|r\|_{M^{-1}}^2$. Scales as
+        $O(h^2)$: relative to the two integral-scaled losses it is suppressed by $\sim N$
+        (at $128^2$, by $\sim10^4$). This is the loss-geometry counterpart of the $\kappa^2$
+        conditioning of \S\ref{sec:precond}.
+\end{itemize}
+The mesh-consistent least-squares functional is $\tfrac12 r^\top M^{-1}r$. The preconditioned loss
+$\tfrac12\|Pr\|_2^2$ with $P\approx J_0^{-1}$ (\S\ref{sec:precond}) supplies exactly this missing
+inverse-Gram weight --- for the mass-dominated $J_0\approx cM$, $P\approx c^{-1}M^{-1}$ --- so
+\textbf{preconditioning repairs the \emph{scaling} as well as the \emph{conditioning}}.
+
+\paragraph{Gradients: Euclidean vs.\ natural, and why refinement does not stall training.} One might
+fear the consistent form $e^\top Me$ has a vanishing gradient, since $\partial(e^\top Me)/\partial
+u=2Me$ has $O(h^2)$ entries. But $2Me$ is a \emph{dual covector}, not a function-space descent
+direction. The $L^2$ (Riesz/natural) gradient is
+\begin{equation}
+  \nabla_{L^2}(e^\top Me)=M^{-1}(2Me)=2e=O(1),
+\end{equation}
+mesh-independent --- and applying $M^{-1}$ to a gradient/residual is exactly what a preconditioner
+does, so \emph{preconditioning is natural-gradient descent}. Moreover the quantity that actually
+drives training, the gradient in \emph{parameters}, is mesh-independent with no $M^{-1}$ at all:
+with $J_\theta=\partial u/\partial\theta$,
+\begin{equation}
+  \frac{\partial(e^\top Me)}{\partial\theta}
+  =J_\theta^\top(2Me)
+  =2\sum_i\frac{\partial u_i}{\partial\theta}(Me)_i
+  \approx 2\!\int_\Omega(\partial_\theta u)\,e\,dx=O(1),
+  \label{eq:theta-grad}
+\end{equation}
+because the sum over $N\sim h^{-2}$ nodes cancels the per-node $h^2$ ($Nh^2=|\Omega|$). Hence
+refining the mesh does not shrink the parameter update, and promoting the data term from
+$\overline{e^2}$ to $e^\top Me$ is scale-neutral (they agree up to $|\Omega|$).
+
+\paragraph{When it bites in practice.} Under Adam (used throughout) a \emph{global} per-loss scale
+is divided out per parameter by the gradient RMS, so a single-loss run at fixed resolution is
+largely insensitive to the constants above. The scaling becomes physical --- beyond Adam's reach
+--- when (i) the data and physics terms are \emph{blended} in one objective, where the relative
+weight $\lambda_{\mathrm{data}}/\lambda_{\mathrm{gal}}$ shifts by $\sim N$ if one term is
+integral-scaled and the other Euclidean; (ii) a learning rate or $\lambda$ tuned at one resolution
+is \emph{transferred} to another; or (iii) loss values are compared across arms or resolutions. For
+those, put every term in the same integral currency --- mass-weight the data MSE ($e^\top Me$) and
+use the dual/preconditioned norm for the residual --- after which $\lambda$ and the learning rate
+carry the same meaning at every $N$.
+
 \section{Code pointers}
 
 \begin{itemize}\itemsep2pt

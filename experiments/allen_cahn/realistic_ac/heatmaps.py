@@ -44,11 +44,11 @@ from plot_rollout import LOSS_NAME, ORDER                              # noqa: E
 
 
 def default_snaps(steps, horizon):
-    """3 snapshots inside the training horizon and 3 beyond it (scaled to ``steps``)."""
-    h = min(horizon, steps)
-    within = [int(round(x)) for x in np.linspace(0, h, 3)]
-    beyond = [int(round(x)) for x in np.linspace(h, steps, 4)[1:]] if steps > h else []
-    return sorted(set(within + beyond))
+    """Fixed snapshot rows resolving the fast initial dynamics (0,1,2,3,5,10) and the late
+    coarsening (40,70,100), capped at the rollout horizon ``steps``. ``horizon`` (the 10-step
+    training horizon) is kept in the signature for callers but not needed for this fixed schedule."""
+    wanted = [0, 1, 2, 3, 5, 10, 40, 70, 100]
+    return sorted(s for s in wanted if s <= steps)
 
 
 def run_matches(rec, tokens):
