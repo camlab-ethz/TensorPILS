@@ -21,7 +21,7 @@ import pytest
 from tensorpils.meshing import structured_quad_mesh, node_to_grid, grid_to_node
 from tensorpils.physics import PoissonProblem
 from tensorpils.losses import build_loss
-from tensorpils.multigrid import GeometricMultigrid
+from tensorpils.preconditioners import GeometricMultigrid
 from tensormesh.dataset import PoissonMultiFrequency
 
 
@@ -154,7 +154,7 @@ def test_losses_forward_backward(loss_type, bc_mode, precondition):
     if loss_type == "pls" or (loss_type == "deepritz" and precondition):
         mg = GeometricMultigrid(nx, ny, n_levels=3)
     crit = build_loss(loss_type, prob, lambda_bc=100.0, bc_mode=bc_mode,
-                      mg=mg, precondition=precondition)
+                      precond=mg, precondition=precondition)
     torch.manual_seed(3)
     u = torch.randn(4, nx * ny, requires_grad=True)
     f = torch.randn(4, nx * ny)

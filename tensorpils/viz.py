@@ -4,6 +4,8 @@ These are pure functions (no Trainer dependency); the Trainer passes its model, 
 evaluation-time boundary projection (``apply_eval_bc``), and output paths.
 """
 
+import os
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -11,12 +13,16 @@ import numpy as np
 import torch
 
 __all__ = ["plot_loss_curve", "visualize_sample", "compute_error_distribution",
-           "visualize_rollout_sample", "compute_rollout_error_distribution"]
+           "visualize_rollout_sample", "compute_rollout_error_distribution",
+           "visualize_data_trajectory"]
 
 
 def plot_loss_curve(stats, loss_type: str, K: int, save_path: str):
-    """Two-panel figure: training loss (log / symlog) and validation MSE (log)."""
-    fig, axes = plt.subplots(2, 1, figsize=(10, 8))
+    """Three-panel figure: training loss, validation MSE, and validation FEM-L2."""
+    has_l2 = bool(getattr(stats, "val_l2_errors", []))
+    has_rel_l2 = bool(getattr(stats, "val_rel_l2_errors", []))
+    n_panels = 2 + has_l2 + has_rel_l2
+    fig, axes = plt.subplots(n_panels, 1, figsize=(10, 4 * n_panels))
     epochs = range(len(stats.train_losses))
 
     axes[0].plot(epochs, stats.train_losses, label="Train Loss", linewidth=2)
@@ -37,8 +43,26 @@ def plot_loss_curve(stats, loss_type: str, K: int, save_path: str):
                     label=f"best val={stats.best_val_error:.2e}")
     axes[1].set_yscale("log")
     axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("MSE")
-    axes[1].set_title("Validation Error")
+    axes[1].set_title("Validation MSE")
     axes[1].legend(); axes[1].grid(alpha=0.4)
+
+    panel = 2
+    if has_l2:
+        axes[panel].plot(epochs, stats.val_l2_errors, label="Val FEM-L2", linewidth=2, color="purple")
+        axes[panel].axvline(stats.best_epoch, color="r", linestyle="--")
+        axes[panel].set_yscale("log")
+        axes[panel].set_xlabel("Epoch"); axes[panel].set_ylabel("FEM-L2")
+        axes[panel].set_title("Validation FEM-L2  (√eᵀMe)")
+        axes[panel].legend(); axes[panel].grid(alpha=0.4)
+        panel += 1
+    if has_rel_l2:
+        pct = [v * 100 for v in stats.val_rel_l2_errors]
+        axes[panel].plot(epochs, pct, label="Val rel-L2 (%)", linewidth=2, color="teal")
+        axes[panel].axvline(stats.best_epoch, color="r", linestyle="--")
+        axes[panel].set_yscale("log")
+        axes[panel].set_xlabel("Epoch"); axes[panel].set_ylabel("rel-L2 (%)")
+        axes[panel].set_title("Validation relative FEM-L2  (√eᵀMe / √uᵀMu)")
+        axes[panel].legend(); axes[panel].grid(alpha=0.4)
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=200, bbox_inches="tight"); plt.close()
@@ -202,3 +226,72 @@ def compute_rollout_error_distribution(model, test_dataset, device, project_bc,
     print(f"  saved -> {save_path}")
     print("=" * 50 + "\n")
     return median, errs
+
+
+# ==================== data trajectory visualization (no model) ====================
+
+def visualize_data_trajectory(dataset, sample_idx: int = 0, n_frames: int = 5,
+                              save_path: str = None, title: str = None,
+                              dt: float = None) -> str:
+    """Filmstrip + amplitude/boundary diagnostics of a *reference* trajectory, straight from a
+    time-dependent dataset (Wave / Allen--Cahn) with **no model** involved.
+
+    Purpose: eyeball the generated data and compare integrators (e.g. backward-Euler vs a
+    convex--concave splitting) in both eyeball- and quantitative norm. ``dataset[sample_idx]``
+    must yield ``(traj_grid [T+1, H, W], ...)`` (the AC/Wave datasets do).
+
+    The top row is the trajectory at ``n_frames`` evenly-spaced times on a shared symmetric
+    colour scale (so decay/coarsening is visible); the bottom panel tracks ``max|u|`` and
+    ``||u||_2`` over time, and the title reports the largest boundary value (a zero-Dirichlet
+    leak check).
+
+    Saves to ``output/data_viz/traj_sample{idx}.png`` by default (git-ignored, next to all
+    other run output); pass ``save_path`` to override. Returns the resolved path.
+    """
+    item = dataset[sample_idx]
+    traj_grid = item[0] if isinstance(item, (tuple, list)) else item
+    tg = traj_grid.detach().cpu().numpy()                    # [T+1, H, W]
+    T1 = tg.shape[0]
+    dt = dt if dt is not None else getattr(dataset, "dt", None)
+
+    if save_path is None:
+        save_path = os.path.join("output", "data_viz", f"traj_sample{sample_idx}.png")
+    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+
+    ks = np.unique(np.linspace(0, T1 - 1, min(n_frames, T1)).round().astype(int))
+    vlim = max(float(np.abs(tg).max()), 1e-12)               # shared scale -> decay is legible
+
+    frames = tg.reshape(T1, -1)
+    maxabs = np.abs(frames).max(axis=1)
+    l2 = np.sqrt((frames ** 2).sum(axis=1))
+    bmax = float(max(np.abs(tg[:, 0, :]).max(), np.abs(tg[:, -1, :]).max(),
+                     np.abs(tg[:, :, 0]).max(), np.abs(tg[:, :, -1]).max()))
+    tvec = np.arange(T1) * dt if dt is not None else np.arange(T1)
+
+    fig = plt.figure(figsize=(3.0 * len(ks), 5.6))
+    gs = fig.add_gridspec(2, len(ks), height_ratios=[3.0, 1.5], hspace=0.35)
+    im = None
+    for j, k in enumerate(ks):
+        ax = fig.add_subplot(gs[0, j])
+        im = ax.imshow(tg[k], cmap="RdBu_r", origin="lower", vmin=-vlim, vmax=vlim)
+        tlab = f"  t={k * dt:.3g}" if dt is not None else ""
+        ax.set_title(f"k={k}{tlab}", fontsize=10)
+        ax.set_xticks([]); ax.set_yticks([])
+    fig.colorbar(im, ax=fig.axes[:len(ks)], fraction=0.02, pad=0.02)
+
+    axd = fig.add_subplot(gs[1, :])
+    axd.plot(tvec, maxabs, "o-", color="#c0392b", lw=1.6, ms=3)
+    axd.set_xlabel("time $t$" if dt is not None else "frame $k$")
+    axd.set_ylabel(r"$\max|u|$", color="#c0392b")
+    axd.tick_params(axis="y", labelcolor="#c0392b"); axd.grid(alpha=0.3)
+    axr = axd.twinx()
+    axr.plot(tvec, l2, "s--", color="#2c3e50", lw=1.4, ms=3)
+    axr.set_ylabel(r"$\|u\|_2$", color="#2c3e50"); axr.tick_params(axis="y", labelcolor="#2c3e50")
+
+    integ = getattr(dataset, "integrator", None)
+    itag = f", integrator={integ}" if integ else ""
+    sup = title or f"Reference trajectory (sample #{sample_idx}, T={T1 - 1} steps{itag})"
+    fig.suptitle(f"{sup}   |   boundary max$|u|$ = {bmax:.1e}", fontsize=12)
+    fig.savefig(save_path, dpi=150, bbox_inches="tight"); plt.close(fig)
+    print(f"Data trajectory -> {save_path}")
+    return save_path

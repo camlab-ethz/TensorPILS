@@ -14,14 +14,15 @@ vector (for the FEM losses, which operate on node values via the physics operato
 from typing import List, Optional
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, IterableDataset
 
 from tensormesh.dataset import PoissonMultiFrequency, WaveMultiFrequency
 
 from .meshing import structured_quad_mesh, node_to_grid
 from .physics import PoissonProblem, WaveProblem, ACProblem
 
-__all__ = ["PoissonDataset", "create_datasets", "WaveDataset", "create_wave_datasets",
+__all__ = ["PoissonDataset", "StreamingPoissonDataset", "create_datasets",
+           "create_scaling_datasets", "WaveDataset", "create_wave_datasets",
            "ACDataset", "create_ac_datasets"]
 
 
@@ -64,8 +65,9 @@ class PoissonDataset(Dataset):
             self._all_data = all_data
         else:
             torch.manual_seed(seed)
-            self.mesh = structured_quad_mesh(nx=grid_resolution, ny=grid_resolution)
-            self.problem = PoissonProblem(self.mesh)
+            self.mesh = mesh if mesh is not None else \
+                structured_quad_mesh(nx=grid_resolution, ny=grid_resolution)
+            self.problem = problem if problem is not None else PoissonProblem(self.mesh)
 
             # Random K x K coefficients in [-1, 1]
             self.l_a = (torch.rand(num_samples, K, K) * 2 - 1)
@@ -116,6 +118,104 @@ def create_datasets(n_train: int, n_val: int, n_test: int,
             mesh=mesh, problem=problem, all_data=all_data, indices=indices,
         )
     return _make(train_idx), _make(val_idx), _make(test_idx)
+
+
+class StreamingPoissonDataset(IterableDataset):
+    """Infinite Poisson dataset: every sample is freshly drawn, none is ever seen twice.
+
+    Items have the exact format of :class:`PoissonDataset` items. One pass of ``__iter__``
+    yields ``samples_per_epoch`` samples (a "virtual epoch"); the coefficient generator's
+    state persists across passes, so successive epochs continue the i.i.d. stream from the
+    source distribution rather than replaying it. Samples are generated in chunks via the
+    same closed-form ``PoissonMultiFrequency`` fields (manufactured solutions — no solve).
+
+    A small fixed set of preview samples (an independent generator, not part of the stream)
+    backs ``__getitem__`` so the end-of-training sample visualization keeps working.
+    """
+
+    def __init__(
+        self,
+        samples_per_epoch: int,
+        K: int = 4,
+        seed: int = 42,
+        grid_resolution: int = 64,
+        mesh=None,
+        problem: Optional[PoissonProblem] = None,
+        chunk_size: int = 256,
+        n_preview: int = 8,
+    ):
+        super().__init__()
+        self.samples_per_epoch = samples_per_epoch
+        self.K = K
+        self.grid_resolution = grid_resolution
+        self.grid_size = (grid_resolution, grid_resolution)   # (nx, ny)
+        self.chunk_size = chunk_size
+
+        self.mesh = mesh if mesh is not None else \
+            structured_quad_mesh(nx=grid_resolution, ny=grid_resolution)
+        self.problem = problem if problem is not None else PoissonProblem(self.mesh)
+
+        self._generator = torch.Generator().manual_seed(seed)
+        self._preview = self._generate(n_preview, torch.Generator().manual_seed(seed + 1))
+
+    def _generate(self, n: int, generator: torch.Generator):
+        """Draw ``n`` fresh (f, u) pairs: random K x K coefficients in [-1, 1] -> closed forms."""
+        l_a = torch.rand(n, self.K, self.K, generator=generator) * 2 - 1
+        equation = PoissonMultiFrequency(a=l_a, r=-0.5)
+        points = self.mesh.points                                        # [N, 2], float64
+        fs = equation.source_term(points, domain="rectangle").float()     # [n, N]
+        us = equation.solution(points).float()                            # [n, N]
+        return fs, us
+
+    def _item(self, f: torch.Tensor, u: torch.Tensor):
+        nx, ny = self.grid_size
+        f_grid = node_to_grid(f, nx, ny).unsqueeze(0)   # [1, H=ny, W=nx]
+        u_grid = node_to_grid(u, nx, ny)                # [H, W]
+        return (f_grid, self.grid_size, f, u), u_grid
+
+    def __iter__(self):
+        remaining = self.samples_per_epoch
+        while remaining > 0:
+            n = min(self.chunk_size, remaining)
+            fs, us = self._generate(n, self._generator)
+            for i in range(n):
+                yield self._item(fs[i], us[i])
+            remaining -= n
+
+    def __len__(self):
+        return self.samples_per_epoch
+
+    def __getitem__(self, idx):
+        """Fixed preview samples — for visualization only, not part of the training stream."""
+        fs, us = self._preview
+        return self._item(fs[idx % len(fs)], us[idx % len(us)])
+
+
+def create_scaling_datasets(n_train: int, n_val: int, n_test: int,
+                            K: int, grid_resolution: int = 64, seed: int = 42,
+                            stream_samples_per_epoch: Optional[int] = None):
+    """Splits for a dataset-size sweep: val/test are drawn from dedicated seeds
+    (``seed+1`` / ``seed+2``), so they are **identical for every** ``n_train`` — all runs
+    of the sweep (including the streaming one) are scored on the same eval sets, making
+    the comparisons paired rather than independently noisy.
+
+    The train split uses ``seed``: finite by default (note the sets are nested across
+    ``n_train`` values, which couples the draws and smooths the scaling curve), or the
+    infinite stream when ``stream_samples_per_epoch`` is given (then ``n_train`` is ignored).
+    """
+    test_ds = PoissonDataset(num_samples=n_test, K=K, seed=seed + 2,
+                             grid_resolution=grid_resolution)
+    mesh, problem, _ = test_ds.get_shared_resources()
+    val_ds = PoissonDataset(num_samples=n_val, K=K, seed=seed + 1,
+                            grid_resolution=grid_resolution, mesh=mesh, problem=problem)
+    if stream_samples_per_epoch is not None:
+        train_ds = StreamingPoissonDataset(
+            samples_per_epoch=stream_samples_per_epoch, K=K, seed=seed,
+            grid_resolution=grid_resolution, mesh=mesh, problem=problem)
+    else:
+        train_ds = PoissonDataset(num_samples=n_train, K=K, seed=seed,
+                                  grid_resolution=grid_resolution, mesh=mesh, problem=problem)
+    return train_ds, val_ds, test_ds
 
 
 class WaveDataset(Dataset):
@@ -250,6 +350,7 @@ class ACDataset(Dataset):
         newton_tol: float = 1e-8,
         newton_max: int = 20,
         ref_chunk: int = 64,
+        integrator: str = "convex_concave",
         mesh=None,
         problem: Optional[ACProblem] = None,
         all_data: Optional[dict] = None,
@@ -264,6 +365,7 @@ class ACDataset(Dataset):
         self.a = a
         self.eps = eps
         self.r = r
+        self.integrator = integrator                          # time discretisation of the reaction
 
         if all_data is not None:
             # Reuse mesh/problem/fields generated by a sibling split.
@@ -292,6 +394,7 @@ class ACDataset(Dataset):
             all_trajs = self.problem.fem_reference(
                 u0.to(solve_dev), a=a, eps=eps, dt=dt, n_steps=n_steps,
                 newton_tol=newton_tol, newton_max=newton_max, chunk=ref_chunk,
+                integrator=integrator,
             ).cpu()                                                 # [num, T+1, N]
 
             self.trajs = [all_trajs[i] for i in range(num_samples)]
@@ -315,13 +418,15 @@ def create_ac_datasets(n_train: int, n_val: int, n_test: int,
                        dt: float = 1e-3, n_steps: int = 20,
                        a: float = 1.0, eps: float = 2.0, r: float = 0.5,
                        newton_tol: float = 1e-8, newton_max: int = 20,
-                       ref_chunk: int = 64, seed: int = 42):
+                       ref_chunk: int = 64, integrator: str = "convex_concave",
+                       seed: int = 42):
     """Build train/val/test Allen–Cahn splits that share one mesh, one :class:`ACProblem`,
     and a single pool of FEM reference trajectories."""
     total = n_train + (n_val if n_val > 0 else 0) + (n_test if n_test > 0 else 0)
     base = ACDataset(num_samples=total, K=K, seed=seed, grid_resolution=grid_resolution,
                      dt=dt, n_steps=n_steps, a=a, eps=eps, r=r,
-                     newton_tol=newton_tol, newton_max=newton_max, ref_chunk=ref_chunk)
+                     newton_tol=newton_tol, newton_max=newton_max, ref_chunk=ref_chunk,
+                     integrator=integrator)
     mesh, problem, all_data = base.get_shared_resources()
 
     train_idx = list(range(n_train))
@@ -335,7 +440,7 @@ def create_ac_datasets(n_train: int, n_val: int, n_test: int,
     def _make(indices):
         return ACDataset(
             num_samples=total, K=K, seed=seed, grid_resolution=grid_resolution,
-            dt=dt, n_steps=n_steps, a=a, eps=eps, r=r,
+            dt=dt, n_steps=n_steps, a=a, eps=eps, r=r, integrator=integrator,
             mesh=mesh, problem=problem, all_data=all_data, indices=indices,
         )
     return _make(train_idx), _make(val_idx), _make(test_idx)

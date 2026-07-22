@@ -1,0 +1,515 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{mathtools}
+\usepackage{hyperref}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\dt}{\Delta t}
+\newcommand{\uhat}{\hat u}
+\DeclareMathOperator{\diag}{diag}
+
+\title{Autoregressive Galerkin training for Allen--Cahn\\
+\large (how the FNO time-stepper and its loss are built)}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+The Allen--Cahn model trains a Fourier Neural Operator (FNO) as a \emph{one-step} time
+integrator $u^{n}\mapsto u^{n+1}$ on the FEM node grid. At train time the one-step map is
+applied \emph{autoregressively} over a short rollout, and the loss sums the fully-implicit
+backward-Euler weak-form residual over the rollout (optionally plus a supervised trajectory
+MSE against a Newton FEM reference). This note fixes the discrete equations and points to the
+code.
+\end{abstract}
+
+\section{Continuous problem and time discretisation}
+
+On $\Omega=(0,1)^2$ with zero Dirichlet boundary conditions,
+\begin{equation}
+  \partial_t u \;=\; a^2\,\Delta u \;+\; \epsilon^2\, u\,(1-u^2),
+  \label{eq:ac}
+\end{equation}
+i.e.\ diffusion with coefficient $a^2$ and a double-well reaction $\epsilon^2 u(1-u^2)
+= -\epsilon^2(u^3-u)$. Equation~\eqref{eq:ac} is the $L^2$ gradient flow of the
+Ginzburg--Landau energy $E(u)=\tfrac12 a^2\!\int|\nabla u|^2 + \epsilon^2\!\int \tfrac14(u^2-1)^2$.
+
+Let $A,M$ be the $Q_1$ stiffness and (consistent) mass matrices on the structured grid
+(the \emph{same} matrices as the Poisson/Wave operators), and let vectors be nodal values with
+the Dirichlet nodes held at $0$. A \textbf{fully-implicit backward-Euler} step with the reaction
+taken at the new level gives the weak-form nodal residual
+\begin{equation}
+  \boxed{\;
+  R(u^{n},u^{n+1}) \;=\; M\,\frac{u^{n+1}-u^{n}}{\dt}
+     \;+\; a^2 A\,u^{n+1}
+     \;-\; \epsilon^2 M\big(u^{n+1}-(u^{n+1})^3\big).
+  \;}
+  \label{eq:res}
+\end{equation}
+A time step is \emph{exact} when $R(u^n,u^{n+1})=0$. Both arguments are projected to zero on
+the boundary and $R$ is zeroed there too.
+
+\section{What the FNO learns}
+
+The network is a \textbf{single-step operator}
+\begin{equation}
+  \mathcal G_\theta:\ u^{n}\ \longmapsto\ u^{n+1},
+\end{equation}
+a grid$\to$grid map with \textbf{one} input channel and one output channel (Allen--Cahn is
+first order in time, so a single previous frame suffices; the wave equation, second order, uses
+two input channels). It does \emph{not} predict a whole trajectory in one shot: it advances time
+by exactly one $\dt$. Longer horizons are produced by \textbf{feeding the prediction back in}:
+\begin{equation}
+  \uhat^{\,1}=\mathcal G_\theta(u^0),\quad
+  \uhat^{\,2}=\mathcal G_\theta(\uhat^{\,1}),\ \dots,\quad
+  \uhat^{\,R}=\mathcal G_\theta(\uhat^{\,R-1}),
+\end{equation}
+seeded by the ground-truth initial frame $u^0$ and rolled forward $R=\texttt{rollout\_steps}$
+times. Every predicted frame is projected onto the zero Dirichlet boundary. Collect the rollout
+as the sequence
+\begin{equation}
+  s \;=\; \big(u^0,\ \uhat^{\,1},\ \dots,\ \uhat^{\,R}\big),\qquad \text{length } L=R+1 .
+\end{equation}
+
+\section{The loss}
+
+The training loss is a weighted sum of a label-free \emph{physics} term and an optional
+\emph{data} term,
+\begin{equation}
+  \mathcal L \;=\; \lambda_{\mathrm{gal}}\,\mathcal L_{\mathrm{gal}}(s)
+    \;+\; \lambda_{\mathrm{data}}\,\mathcal L_{\mathrm{data}}(s).
+\end{equation}
+
+\paragraph{Physics (Galerkin least-squares residual over the rollout).}
+Impose that \emph{each consecutive pair} in the rollout satisfies the discrete step, as a
+\emph{least-squares} penalty on its residual, with a geometric discount $\gamma=\texttt{discount}$
+that can down-weight the later (more error-prone) steps:
+\begin{equation}
+  \mathcal L_{\mathrm{gal}}(s)
+  \;=\; \frac{1}{\sum_{k=0}^{L-2}\gamma^{k}}
+        \sum_{k=0}^{L-2}\gamma^{k}\;
+        \Big\langle\, \tfrac12\big\| R(s^{k},s^{k+1})\big\|_2^2 \,\Big\rangle_{\!\mathrm{batch}} ,
+  \label{eq:lgal}
+\end{equation}
+where $\tfrac12\|\cdot\|_2^2$ \emph{sums} the squared residual over nodes and $\langle\cdot
+\rangle_{\mathrm{batch}}$ averages over the batch. Summing (not averaging) over nodes keeps the
+gradient magnitude $O(1)$ rather than $O(1/N)$, which matters under Adam. The residual $R$ is
+either the backward--Euler \eqref{eq:res} or the convex--concave \eqref{eq:cc} form, both in the
+$/\dt$ scaling of \S\ref{sec:cc} so the penalty is $\dt$-independent; the integrator is chosen by
+a flag (\texttt{ACProblem.residual(\dots, integrator=\dots)}, wired through
+\texttt{ACGalerkinLoss} and \texttt{--ac\_integrator}). The $k=0$ term couples the seed to the
+first prediction $u^0\!\to\!\uhat^{\,1}$; the $k\ge1$ terms couple prediction to prediction. No
+labels are used.
+
+\paragraph{Physics variant: minimizing-movement (JKO) objective.}
+The convex--concave step \eqref{eq:cc} is also the unique minimiser of an \emph{incremental}
+(minimizing-movement) objective, giving a Deep-Ritz-style alternative to the least-squares
+residual \eqref{eq:lgal}. With the energy split $E=E_{\mathrm{cvx}}+E_{\mathrm{ccv}}$,
+$E_{\mathrm{cvx}}(u)=\tfrac{a^2}{2}\!\int|\nabla u|^2+\tfrac{\epsilon^2}{4}\!\int u^4+\tfrac{\epsilon^2}{4}|\Omega|$
+and $E_{\mathrm{ccv}}(u)=-\tfrac{\epsilon^2}{2}\!\int u^2$ (so $DE_{\mathrm{ccv}}(u^k)=-\epsilon^2 u^k$),
+the step is $u^{k+1}=\arg\min_u J(u^k,u)$ with $J=E_{\mathrm{cvx}}(u)+\langle DE_{\mathrm{ccv}}(u^k),u\rangle_{L^2}
++\tfrac{1}{2\dt}\|u-u^k\|_{L^2}^2$. Discretised (mass matrix for the $L^2$ inner products, nodal
+quartic $\int u^4\approx(u^4)^\top M\mathbf 1$),
+\begin{equation}
+  J(u^{k},u^{k+1}) = \tfrac{a^2}{2}(u^{k+1})^\top A u^{k+1}
+    + \tfrac{\epsilon^2}{4}\big[((u^{k+1})^4)^\top M\mathbf 1 + |\Omega|\big]
+    - \epsilon^2 (u^{k})^\top M u^{k+1}
+    + \tfrac{1}{2\dt}(u^{k+1}-u^{k})^\top M(u^{k+1}-u^{k}),
+  \label{eq:mm}
+\end{equation}
+with $|\Omega|=\mathbf 1^\top M\mathbf 1$. The loss uses $J$ in place of $\tfrac12\|R\|^2$:
+$\mathcal L_{\mathrm{mm}}(s)=\big(\sum_k\gamma^k\big)^{-1}\sum_k\gamma^k\,\langle J(s^k,s^{k+1})\rangle_{\mathrm{batch}}$.
+Its gradient is the convex--concave residual with the \emph{lumped} mass on the cubic,
+$\nabla_{u^{k+1}}J = M\tfrac{u^{k+1}-u^{k}}{\dt}+a^2Au^{k+1}
++\epsilon^2\operatorname{diag}(M\mathbf 1)(u^{k+1})^3-\epsilon^2 M u^{k}$, so its minimiser is the
+step \eqref{eq:cc} up to consistent-vs-lumped mass on the reaction — hence a \emph{variant} of $R$.
+Being convex, $J$ is \emph{minimised} rather than driven to zero (the Deep-Ritz analogue for the
+gradient flow). Selected by \texttt{--ac\_loss\_form min\_movement}
+(\texttt{ACProblem.mm\_objective} / \texttt{ACMinMovementLoss}).
+
+\paragraph{Detaching the proximal centre (important).} The step is $u^{k+1}=\arg\min_u J(u^k;u)$
+with $u^k$ \emph{given}: the argmin is over the new frame only, and $u^k$ is the fixed proximal
+centre. Crucially $\nabla_{u^k}J = -\epsilon^2 M u^{k+1}-\tfrac{1}{\dt}M(u^{k+1}-u^k)\neq 0$ even
+at the correct step. So in the autoregressive rollout, where each intermediate frame is also the
+$u^k$ of the next step, backpropagating through $u^k$ injects a spurious gradient that does
+\emph{not} vanish at the true dynamics, and the summed objective's minimiser is a distorted
+trajectory. The loss therefore \textbf{detaches the proximal centre} $u^k$ inside $J$. This is
+necessary but \emph{not} the same as the pushforward trick (it detaches $u^k$ only where it appears
+\emph{explicitly} in $J$, not where it feeds the model); \S\ref{sec:mm-pf} makes the distinction
+precise. The least-squares residual \eqref{eq:lgal} needs no such care because
+$\nabla\tfrac12\|R\|^2=J_R^\top R$ vanishes in \emph{both} arguments when $R=0$.
+
+\paragraph{Data (supervised trajectory MSE).}
+Against the reference frames $u^{1},\dots,u^{R}$ of the FEM trajectory (\S\ref{sec:ref}),
+\begin{equation}
+  \mathcal L_{\mathrm{data}}(s)\;=\;\big\langle (\uhat^{\,k}-u^{k})^2\big\rangle_{k=1,\dots,R}.
+\end{equation}
+
+\paragraph{Presets.} \texttt{--loss galerkin} sets $(\lambda_{\mathrm{gal}},\lambda_{\mathrm{data}})=(1,0)$
+(fully label-free); \texttt{--loss data} sets $(0,1)$ (fully supervised); the two weights can also
+be set explicitly to blend them.
+
+\section{Autoregressive training modes}
+\label{sec:artrain}
+
+The one-step map $\mathcal G_\theta$ is trained over a horizon of $R$ steps, but there are several
+ways to supply its inputs during training. They differ in whether each step is fed the ground-truth
+frame or the model's own prediction, and in whether gradients flow back through earlier steps. The
+central tension is \emph{exposure bias}: a model that only ever sees ground-truth inputs never
+learns to correct its own errors, so its free-running rollout drifts off the training manifold and
+compounds.
+
+\begin{itemize}\itemsep3pt
+  \item \textbf{Teacher forcing (one-step).} Feed the \emph{ground-truth} previous frame at every
+        step: minimise $\sum_k\|\mathcal G_\theta(u^{k})-u^{k+1}\|^2$ over reference pairs. The
+        steps decouple, so the objective is well-conditioned (identity Hessian in $u$) and easy to
+        train --- but exposure bias makes the resulting rollout prone to instability.
+  \item \textbf{Free-running rollout (full BPTT).} Seed with $u^0$, feed the model \emph{its own}
+        predictions $\uhat^{k}$, and backpropagate through the whole unrolled chain (either the data
+        MSE $\sum_k\|\uhat^{k}-u^{k}\|^2$ or the physics residual \eqref{eq:lgal} over the same
+        rollout). This matches deployment and exposes the model to its own error distribution, so it
+        learns to be self-correcting --- but it is badly conditioned in $\theta$ (errors compound
+        through $R$ near-thresholding steps; deep BPTT). At stiff $\epsilon$ the \emph{data-matching}
+        version stalls at the trivial predictor $\uhat\approx 0$, whereas the \emph{physics} version
+        only asks for per-step self-consistency (consecutive frames obey the discrete step),
+        achievable regardless of drift --- which is why the physics losses keep their rollout
+        robustness without the trivial-predictor trap.
+  \item \textbf{Pushforward (detached-input unrolling).} Roll on the model's own predictions but
+        \emph{detach} each step's input, so the gradient is one-step (no backprop through the
+        rollout). The model still sees its own drifted states --- curing exposure bias --- while the
+        objective stays as well-conditioned as teacher forcing (the ``pushforward trick'',
+        Brandstetter, Worrall \& Welling, 2022). Note the minimizing-movement loss as \emph{currently
+        implemented} detaches the proximal centre but still backpropagates through the rollout, so it
+        is \emph{not} the pushforward --- see \S\ref{sec:mm-pf}.
+  \item \textbf{Scheduled sampling / curriculum.} Interpolate: with some probability feed the true
+        frame, otherwise the prediction, annealing toward free-running over training (Bengio et
+        al., 2015); or unroll a truncated horizon $k<R$ and grow $k$. Trades optimisation ease for
+        rollout robustness gradually.
+\end{itemize}
+
+\noindent In all cases \emph{evaluation} is the free-running rollout (the deployment metric), so a
+teacher-forced model is judged on a rollout it was never trained to stabilise --- a direct probe of
+exposure bias.
+
+\section{Minimizing movement: intended pushforward vs.\ implemented hybrid}
+\label{sec:mm-pf}
+
+Write $G_\theta$ for the one-step map. The free-running rollout produces $G^k_\theta(u_0)$ (the map
+applied $k$ times), which carries the \emph{full} autoregressive graph --- gradients flow through
+all $k$ applications. Let
+\begin{equation}
+  \uhat_k \;:=\; \operatorname{detach}\big(G^k_\theta(u_0)\big)
+\end{equation}
+be the same frame with its gradient stopped. The convex--concave minimizing-movement step
+contributes, for the transition $k\!\to\!k+1$, the incremental objective \eqref{eq:mm}
+\begin{equation}
+  J(\uhat_k;\,u) \;=\; E_{\mathrm{cvx}}(u)
+    \;+\; \big\langle DE_{\mathrm{ccv}}(\uhat_k),\,u\big\rangle
+    \;+\; \tfrac{1}{2\dt}\,\|u-\uhat_k\|_M^2 ,
+  \label{eq:mm-inc}
+\end{equation}
+with $E_{\mathrm{cvx}}(u)=\tfrac{a^2}{2}u^\top A u+\tfrac{\epsilon^2}{4}(u^4)^\top M\mathbf 1$ and
+$DE_{\mathrm{ccv}}(\uhat_k)=-\epsilon^2\uhat_k$. The middle term is the concave linearisation
+$-\epsilon^2\uhat_k^\top M u$ --- it must not be dropped (a plain $E(u)+\tfrac1{2\dt}\|u-\uhat_k\|^2$
+with the \emph{full} energy $E$ would be the non-convex backward-Euler minimizing movement, a
+different scheme). Both the proximal centre and the concave coupling use the detached $\uhat_k$. The
+two variants differ \emph{only} in what plays the role of the new frame $u=u^{k+1}$:
+
+\paragraph{Intended (pushforward).} Feed the model the detached previous frame,
+\begin{equation}
+  \mathcal L^{\mathrm{pf}}_k \;=\; J\big(\uhat_k;\ G_\theta(\uhat_k)\big),
+\end{equation}
+so the gradient flows through the \emph{single} application $G_\theta(\uhat_k)$; the $k$ earlier
+applications are detached. This is precisely the pushforward trick of Brandstetter, Worrall \&
+Welling (2022) --- so \textbf{the write-up is the pushforward}.
+
+\paragraph{Implemented (full BPTT + detached proximal centre).} The shared rollout
+(\texttt{RolloutTrainer.\_rollout}) never detaches its inputs, so the new frame is the live
+$G^{k+1}_\theta(u_0)$ and only the proximal centre inside $J$ is detached:
+\begin{equation}
+  \mathcal L^{\mathrm{impl}}_k \;=\; J\big(\uhat_k;\ G^{k+1}_\theta(u_0)\big).
+\end{equation}
+The gradient now backpropagates through \emph{all} $k+1$ applications of $G_\theta$ (full BPTT).
+
+\paragraph{The one-line difference.} $u^{k+1}=G_\theta(\uhat_k)$ (single step) vs.\
+$u^{k+1}=G^{k+1}_\theta(u_0)$ (full graph). Both have the \emph{same forward value} (detaching does
+not change it) but different gradients --- measured, a $\sim\!34\%$ relative difference on a
+three-step rollout. So the current code is a \textbf{hybrid}, not the pushforward.
+
+\paragraph{Both are well-posed; the naive scheme is not.} Detaching the proximal centre matters for
+correctness: $\nabla_{\uhat_k}J=-\epsilon^2 Mu^{k+1}-\tfrac1{\dt}M(u^{k+1}-\uhat_k)\neq 0$ at the
+correct step (measured $\approx 0.072$, vs.\ $\approx 3\times10^{-8}$ for the least-squares
+residual), so a scheme that backpropagates through the proximal centre --- no detach anywhere ---
+is minimised by a \emph{distorted} trajectory. With the proximal centre detached, $\nabla_u J$
+vanishes at the correct step in both $\mathcal L^{\mathrm{pf}}$ and $\mathcal L^{\mathrm{impl}}$, so
+both share the right fixed point; they differ only in the gradient \emph{away} from it.
+
+\paragraph{Which should perform best?} A prediction, to be A/B-tested (the existing figures used the
+hybrid):
+\begin{itemize}\itemsep2pt
+  \item The \textbf{naive} no-detach scheme is worst (wrong fixed point) --- consistent with the poor
+        minimizing-movement result before the proximal-centre detach was added.
+  \item The \textbf{pushforward} should be the most robust, especially at stiff $\epsilon$ and long
+        horizons: one-step gradients avoid backpropagating through many near-thresholding steps (the
+        same deep-BPTT ill-conditioning that stalled the free-running data loss), feeding detached
+        predictions exposes the model to its own drifted states (curing exposure bias), and it is
+        cheaper. It is also the literature-recommended default.
+  \item The \textbf{hybrid} (current) should be competitive where the rollout is short and benign ---
+        its full multi-step gradient carries more information --- but is expected to degrade faster as
+        $\epsilon$ grows, inheriting the compounding-gradient problems of deep BPTT.
+\end{itemize}
+\noindent Net expectation: \emph{pushforward} $\gtrsim$ \emph{hybrid} $\gg$ \emph{naive}, with the
+gap widening in the hard regime.
+
+\section{The FEM reference (discrete target)}
+\label{sec:ref}
+
+Ground-truth trajectories are generated once at dataset-build time by solving
+$R(u^{n+1};u^{n})=0$ at each step with Newton's method on the interior DOFs, Jacobian
+\begin{equation}
+  J \;=\; \frac{M}{\dt} + a^2 A - \epsilon^2 M\,\diag\!\big(1-3\,(u^{n+1})^2\big),
+\end{equation}
+whose constant part $L=M/\dt+a^2A$ is factored once. Since the label-free loss
+\eqref{eq:lgal} drives the \emph{same} residual \eqref{eq:res} to zero, a perfectly trained
+physics model reproduces this FEM reference; evaluation reports the rollout MSE of the
+predicted frames against it.
+
+\section{Reference integrator: convex--concave splitting}
+\label{sec:cc}
+
+The reaction $\epsilon^2 u(1-u^2)=-F'(u)$ comes from the double-well potential
+$F(u)=\tfrac{\epsilon^2}{4}(u^2-1)^2$. Following Eyre, split it into convex minus convex,
+\begin{equation}
+  F = F_c - F_e,\qquad
+  F_c(u)=\tfrac{\epsilon^2}{4}\big(u^4+1\big),\quad
+  F_e(u)=\tfrac{\epsilon^2}{2}u^2 ,
+\end{equation}
+both convex ($F_c''=3\epsilon^2u^2\ge0$, $F_e''=\epsilon^2\ge0$). Taking the convex part
+implicitly and the concave contribution $-F_e$ explicitly at $u^n$ — i.e.\
+$F_c'(u^{n+1})=\epsilon^2(u^{n+1})^3$ implicit, $F_e'(u^{n})=\epsilon^2 u^{n}$ explicit —
+gives the \textbf{convex--concave} step
+\begin{equation}
+  \boxed{\;
+  R^{\mathrm{cc}}(u^{n},u^{n+1}) \;=\;
+  (M+\dt\,a^2 A)\,u^{n+1} \;+\; \dt\,\epsilon^2 M (u^{n+1})^3
+  \;-\; (I+\dt\,\epsilon^2)\,M u^{n} \;=\; 0 .
+  \;}
+  \label{eq:cc}
+\end{equation}
+Equation~\eqref{eq:cc} is written in the ``$\times\dt$'' algebraic form; the reference solve, the
+Jacobian below, and the least-squares loss \eqref{eq:lgal} all use the equivalent
+\textbf{$/\dt$-scaled} residual $R^{\mathrm{cc}}/\dt = M\frac{u^{n+1}-u^n}{\dt}+a^2Au^{n+1}
++\epsilon^2 M((u^{n+1})^3-u^n)$ (same root, but $O(1)$ rather than $O(\dt)$, so gradients do not
+vanish with $\dt$). The cubic is still implicit, so each step is a Newton solve with a
+nodal/collocated nonlinearity ($(u^3)_i=u_i^3$) and Jacobian
+\begin{equation}
+  J^{\mathrm{cc}}(u) \;=\; \frac{M}{\dt} + a^2 A + 3\,\epsilon^2 M\,\diag(u^2),
+  \label{eq:cc-jac}
+\end{equation}
+which is \textbf{symmetric positive definite for every $u$ and every $\dt$} (each summand is
+PSD, $M$ is SPD). That is the scheme's \emph{unconditional energy stability}: the
+Ginzburg--Landau energy $E$ is non-increasing along the discrete trajectory at any step size.
+Contrast the fully-implicit backward--Euler Jacobian
+$J^{\mathrm{be}}(u)=M/\dt + a^2A - \epsilon^2 M\,\diag(1-3u^2)$, whose $-\epsilon^2 M$ term can
+make it indefinite once $\dt\,\epsilon^2$ is large.
+
+\paragraph{Which residual the loss uses.} Data generation defaults to convex--concave
+\eqref{eq:cc}; backward--Euler \eqref{eq:res} stays available through the integrator flag
+(\texttt{ACProblem.fem\_reference(\dots, integrator="convex\_concave"|"backward\_euler")}). The
+label-free training loss \eqref{eq:lgal} still drives the backward--Euler residual
+\eqref{eq:res}; the two discrete solutions agree to $O(\dt)$, so a physics-trained model matches
+the convex--concave reference up to the time-discretisation error.
+
+\section{Numerical soundness of the target regime}
+\label{sec:regime}
+
+The autoregressive experiment fixes a concrete regime --- grid $n\times n=256^2$, diffusion
+$a=1$, reaction strength $\epsilon=64$, step $\dt=10^{-2}$ on $\Omega=(0,1)^2$, tame $K=4$
+initial data --- and its soundness is governed by three dimensionless groups. Write
+$h=1/(n-1)$ for the mesh size and $\ell=a/\epsilon$ for the interface-width scale (balancing
+$a^2u_{xx}+\epsilon^2(u-u^3)=0$ gives the stationary profile $u=\tanh\!\big(x/(\sqrt2\,\ell)\big)$).
+
+\paragraph{(i) Interface resolution $\ell/h$.}
+With $\ell=a/\epsilon=1/64\approx1.56\times10^{-2}$ and $h=1/255\approx3.92\times10^{-3}$,
+\[
+  \ell/h \;=\; a(n-1)/\epsilon \;=\; 255/64 \;\approx\; 4 .
+\]
+Four cells per $\ell$; the visible transition ($u:-0.9\!\to\!0.9$, width $\approx4.16\,\ell$)
+spans $\approx17$ cells --- comfortably resolved. This is the reason to move to $256^2$: at
+$64^2$ ($\ell/h\approx1$) the whole transition would fall in $\sim4$ cells (under-resolved), and
+$128^2$ ($\ell/h\approx2$) is borderline.
+
+\paragraph{(ii) Reaction stiffness per step $\epsilon^2\dt$.}
+The reaction relaxes on $\tau_{\mathrm{react}}=\epsilon^{-2}=2.4\times10^{-4}$ while $\dt=10^{-2}$:
+\[
+  \epsilon^2\dt \;=\; 4096\times10^{-2}\;=\;40.96\;\gg\;1 .
+\]
+The step is $\sim41$ reaction times long, so smooth initial data saturates onto the $\pm1$ wells
+with sharp interfaces within the \emph{first} step (phase separation is essentially instantaneous),
+and an explicit reaction would be violently unstable --- the convex--concave split \eqref{eq:cc}
+(implicit convex part, SPD Jacobian for all $\dt$) is mandatory.
+
+\paragraph{(iii) Diffusion implicitness $a^2\dt/h^2$.}
+\[
+  \frac{a^2\dt}{h^2}\;=\;0.01\times255^2\;\approx\;6.5\times10^2 ,
+\]
+far above the explicit limit $\approx\tfrac14$, so the diffusion is implicit too --- and this same
+group sets the conditioning of the per-step solve.
+
+\paragraph{Conditioning, and why it decides the loss geometry.}
+The convex--concave Jacobian \eqref{eq:cc-jac} $J^{\mathrm{cc}}=M/\dt+a^2A+3\epsilon^2M\diag(u^2)$
+is SPD for every $u,\dt$. Mass-normalised, its spectrum is
+$\lambda\approx\dt^{-1}+a^2\lambda(M^{-1}A)+3\epsilon^2\langle u^2\rangle$; on the regular grid
+$\lambda(M^{-1}A)$ runs from $2\pi^2$ to $\approx24/h^2$ (the exact $Q_1$ tensor spectrum of
+\S\ref{sec:cc}), so
+\[
+  \kappa(J^{\mathrm{cc}})\;\approx\;
+  \frac{\dt^{-1}+24\,a^2/h^2}{\dt^{-1}+2\pi^2a^2}
+  \;\approx\; 24\,\frac{a^2\dt}{h^2}
+  \;\sim\; 1.3\times10^{4}.
+\]
+Two points. First, the conditioning is set by the \emph{diffusion} group $a^2\dt/h^2$ (times an
+$O(20)$ FEM constant), \emph{not} by $\epsilon$: the reaction term $3\epsilon^2u^2$ only
+\emph{raises} eigenvalues where $|u|\approx1$, and the worst-conditioned modes sit exactly where
+$u\approx0$ (the interfaces and the $O(\ell)$ Dirichlet boundary layer), where it vanishes.
+Second, each physics loss inherits this operator \emph{differently}:
+\begin{itemize}\itemsep2pt
+  \item \textbf{Data MSE} $\|\uhat-u^\star\|^2$: output Hessian $=I$, conditioning $O(1)$ --- no PDE
+        operator enters (needs the reference labels).
+  \item \textbf{Minimizing movement} \eqref{eq:mm}: minimises the convex $J$, Hessian $=J^{\mathrm{cc}}$,
+        so $\kappa\sim10^4$ --- ill-conditioned only \emph{linearly} (the Deep-Ritz situation:
+        tractable under Adam, slower/less accurate).
+  \item \textbf{Least squares} \eqref{eq:lgal}: minimises $\tfrac12\|R\|^2$, Hessian
+        $\approx(J^{\mathrm{cc}})^\top J^{\mathrm{cc}}$, so $\kappa^2\sim10^{8}$ --- the squaring that
+        stalls \emph{unpreconditioned} residual training. A left preconditioner
+        $P\approx(J^{\mathrm{cc}})^{-1}$ (or $\approx A^{-1}$; multigrid is the grid-scalable choice at
+        $256^2$) restores $O(1)$ and is the intended fix (preconditioner notes).
+\end{itemize}
+
+\paragraph{Reachable dynamics: what $10/40/100$ steps cover.}
+After separation the interfaces move by mean curvature, $V=a^2\kappa$, and the feature size
+coarsens as $L(t)\sim\sqrt{2a^2t}$:
+\[
+  L(0.1)\approx0.45,\qquad L(0.4)\approx0.89,\qquad L(1.0)\approx1.4\;(>\text{domain}).
+\]
+So the $R=10$ training horizon already sits in the coarsening regime (each step advances an
+interface by $V\dt\approx6$ cells $\approx1.4\,\ell$ --- a substantial, learnable motion), $R=40$
+is well-coarsened, and the $R=100$ rollout runs the domain out toward a single-phase,
+boundary-pinned steady state. Phase separation itself needs no more than the first step; the
+horizon is a choice of how much \emph{coarsening} to expose. Caveat: the first map
+$u^0\!\to\!\uhat^1$ (the stiff near-projection onto the sharp-interface manifold) is qualitatively
+unlike the gentle curvature steps that follow and tends to carry most of the one-step error.
+
+\paragraph{Practical note.} $256^2$ makes both the reference build (batched Newton on
+$\sim6.5\times10^4$-DOF SPD systems per step; a trajectory tensor
+$\sim n_{\text{samples}}\times(R{+}1)\times n^2$ that runs to a few GB at
+$n_{\text{samples}}\sim10^3$) and FNO training markedly heavier than the $64^2$ studies --- budget
+storage and GPU memory accordingly.
+
+\section{Preconditioning the least-squares loss}
+\label{sec:precond}
+
+The least-squares physics loss \eqref{eq:lgal} is a \emph{nonlinear} least-squares problem in the
+new frame: $\ell(u)=\tfrac12\|R(u^n,u)\|_2^2$ with $u=u^{n+1}$. Its Gauss--Newton Hessian is
+$J^\top J$ (the second-order term $\sum_i R_i\nabla^2R_i$ vanishes at the solution $R=0$), so the
+conditioning it presents to the optimiser is $\kappa(J^\top J)=\kappa(J)^2$ --- the squaring of
+\S\ref{sec:regime} that stalls training at $\kappa\sim10^4\Rightarrow\kappa^2\sim10^8$. A left
+preconditioner $P$ acting on the residual, $\ell_P(u)=\tfrac12\|P\,R(u^n,u)\|_2^2$, changes the
+Gauss--Newton Hessian to $(PJ)^\top(PJ)=J^\top P^\top P\,J$; with $P\approx J^{-1}$ this is
+$\approx I$, restoring $O(1)$ conditioning without labels. This is the Allen--Cahn analogue of the
+Poisson preconditioned least-squares (\texttt{pls}) loss.
+
+\paragraph{The residual Jacobian (as coded).} The loss drives the \emph{$/\dt$-scaled} residual
+\eqref{eq:cc} in its $/\dt$ form (\texttt{ACProblem.residual}, \S\ref{sec:cc}),
+\begin{equation}
+  R(u^{n},u^{n+1}) \;=\; M\,\frac{u^{n+1}-u^{n}}{\dt} \;+\; a^2A\,u^{n+1}
+     \;+\; \epsilon^2 M\big((u^{n+1})^3 - u^{n}\big),
+  \label{eq:R-coded}
+\end{equation}
+i.e.\ \textbf{not} multiplied through by $\dt$. Differentiating in the new frame $u^{n+1}$ (the
+argument the model controls; $u^n$ is the fixed/detached previous frame) term by term:
+$\partial_{u^{n+1}}\big[M(u^{n+1}-u^n)/\dt\big]=M/\dt$;
+$\partial_{u^{n+1}}\big[a^2Au^{n+1}\big]=a^2A$; and, since the cubic is nodal/collocated,
+$\partial_{u^{n+1}}\big[\epsilon^2 M(u^{n+1})^3\big]=\epsilon^2 M\diag\!\big(3(u^{n+1})^2\big)
+=3\epsilon^2 M\diag\!\big((u^{n+1})^2\big)$. Hence
+\begin{equation}
+  \boxed{\;
+  J(u) \;=\; \frac{M}{\dt} \;+\; a^2 A \;+\; 3\,\epsilon^2\,M\,\diag(u^2)
+  \;}
+  \label{eq:R-jac}
+\end{equation}
+--- exactly the convex--concave Newton Jacobian \eqref{eq:cc-jac}, in the $/\dt$ normalisation.
+(Multiplying \eqref{eq:R-coded} by $\dt$ instead would give $\tilde J=\dt\,J=M+\dt\,a^2A
++3\dt\,\epsilon^2M\diag(u^2)$; the two differ only by the scalar $\dt$, so as a preconditioner
+they are equivalent up to that constant. We match the code and use \eqref{eq:R-jac}.) The mass on
+the reaction is the consistent $M\diag(u^2)$ (``$M_{u^2}$''), not a lumped $\diag(M\mathbf1\,u^2)$
+--- the loss residual uses the consistent-mass cubic $\epsilon^2M(u^{n+1})^3$.
+
+\paragraph{Frozen-coefficient preconditioner.} $J(u)$ depends on $u$ only through the reaction
+diagonal $\diag(u^2)$. Freezing it at the bulk value of a phase, $u^2\equiv1$, removes that
+dependence and gives the \emph{constant}, symmetric-positive-definite operator
+\begin{equation}
+  J_0 \;=\; \frac{M}{\dt} + a^2A + 3\epsilon^2 M
+      \;=\; a^2 A \;+\; c\,M,\qquad
+      c \;=\; \frac{1}{\dt} + 3\epsilon^2 ,
+  \label{eq:J0}
+\end{equation}
+a \textbf{screened-Poisson / reaction--diffusion} operator (stiffness $a^2A$ plus a positive mass
+shift $cM$). We take $P\approx J_0^{-1}$. Because $J_0$ is $u$-independent it is assembled
+\emph{once}, and the preconditioned Gauss--Newton Hessian $J^\top J_0^{-1}J_0^{-1}J\approx I$
+wherever $J\approx J_0$.
+
+\paragraph{Where the approximation is exact, and where it is not.} Setting $u^2=1$ is exact in the
+bulk of each phase and \emph{over}-shifts the reaction where $u\approx0$ --- the interfaces and the
+$O(\ell)$ Dirichlet boundary layer --- since there the true $J$ has $3\epsilon^2M\diag(u^2)\to0$
+while $J_0$ keeps the full $3\epsilon^2M$. So $P$ is an over-damped approximation of $J^{-1}$ on the
+interface subspace. It remains SPD and still collapses the $\kappa^2$ of the dominant
+(diffusion/bulk) spectrum; it is a preconditioner, not an exact inverse, so a residual solver would
+still need a few iterations there --- but for reshaping the \emph{training} conditioning it is the
+cheap, $u$-independent, grid-scalable choice. For the target regime $c=1/\dt+3\epsilon^2=100+12288
+=12388$, so $J_0$ is strongly mass-dominated and itself well-conditioned
+($\kappa(J_0)\sim c^{-1}\!\cdot\!24a^2/h^2$ down from $\kappa(J)\sim10^4$).
+
+\paragraph{Realisation: multigrid V-cycle on $a^2A+cM$.} We reuse the geometric-multigrid V-cycle
+(\texttt{GeometricMultigrid}) that supplies $P\approx A^{-1}$ for Poisson, with the level operator
+changed from the bare stiffness to $a^2A_\ell + cM_\ell$, \textbf{re-discretised} on each coarsened
+grid (both $A_\ell$ and $M_\ell$ from TensorMesh's \texttt{Laplace}/\texttt{MassElementAssembler},
+Dirichlet rows/cols zeroed with unit diagonal). Weighted-Jacobi smoothing, bilinear
+prolongation/restriction $R=P^\top$, and a dense coarse solve are unchanged; the positive mass
+shift only makes the operator \emph{more} diagonally dominant, so the smoother is at least as
+effective as in the Poisson case. One V-cycle is a differentiable sequence of sparse mat--vecs, so
+autograd flows through $\tfrac12\|P R\|^2$ exactly. Selected by \texttt{--ac\_precond multigrid}
+(only with \texttt{--ac\_loss\_form galerkin}); the coefficients $a^2$ and $c=1/\dt+3\epsilon^2$ are
+formed by \texttt{ACTrainer} from the run's $a,\epsilon,\dt$ and passed to
+\texttt{build\_preconditioner(\dots, mg\_a2, mg\_c)}.
+
+\section{Code pointers}
+
+\begin{itemize}\itemsep2pt
+  \item Discrete residual \eqref{eq:res}, energy, and Newton reference/Jacobian for both
+        integrators \eqref{eq:cc}/\eqref{eq:res}:
+        \texttt{tensorpils/physics.py} $\to$ \texttt{ACProblem.residual / energy / fem\_reference}
+        (the latter takes \texttt{integrator="convex\_concave"} (default) or \texttt{"backward\_euler"}).
+  \item One-step map $\mathcal G_\theta$ and the autoregressive rollout $s$:
+        \texttt{tensorpils/trainer.py} $\to$ \texttt{RolloutTrainer.\_rollout}
+        (\texttt{n\_seed\_frames}$=1$ for AC, set by \texttt{ACTrainer}).
+  \item Discounted least-squares residual sum \eqref{eq:lgal} (integrator-selectable) and the
+        minimizing-movement objective \eqref{eq:mm}:
+        \texttt{tensorpils/losses.py} $\to$ \texttt{ACGalerkinLoss} / \texttt{ACMinMovementLoss}
+        / \texttt{build\_ac\_loss} (residual scheme from \texttt{ACProblem.residual(\dots, integrator)}
+        and objective from \texttt{ACProblem.mm\_objective}, exposed as \texttt{--ac\_integrator} /
+        \texttt{--ac\_loss\_form}).
+  \item Total loss ($\lambda_{\mathrm{gal}}\mathcal L_{\mathrm{gal}}+\lambda_{\mathrm{data}}\mathcal L_{\mathrm{data}}$)
+        and rollout-MSE eval:
+        \texttt{tensorpils/trainer.py} $\to$ \texttt{RolloutTrainer.train\_epoch / \_eval\_loader}.
+  \item $\lambda$ presets and CLI wiring:
+        \texttt{tensorpils/cli.py} $\to$ \texttt{run\_ac}.
+  \item Reference trajectories as data:
+        \texttt{tensorpils/data.py} $\to$ \texttt{ACDataset / create\_ac\_datasets}.
+\end{itemize}
+
+\end{document}

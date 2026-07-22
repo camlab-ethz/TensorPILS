@@ -46,3 +46,6 @@ htmlcov/
 
 # Privatized / scratch (mirror TensorMesh convention)
 _private/
+
+# uv lockfile (project uses pip, not uv)
+uv.lock

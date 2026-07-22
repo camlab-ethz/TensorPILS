@@ -14,7 +14,9 @@ from ._version import __version__
 from .meshing import structured_quad_mesh, node_to_grid, grid_to_node
 from .physics import (FEMOperator, PoissonProblem, WaveProblem, ACProblem,
                       apply_zero_boundary)
-from .multigrid import GeometricMultigrid
+from .preconditioners import (
+    Preconditioner, GeometricMultigrid, SpectralPreconditioner, build_preconditioner,
+)
 from .data import (PoissonDataset, create_datasets, WaveDataset, create_wave_datasets,
                    ACDataset, create_ac_datasets)
 from .losses import build_loss, build_wave_loss, build_ac_loss
@@ -36,7 +38,10 @@ __all__ = [
     "WaveProblem",
     "ACProblem",
     "apply_zero_boundary",
+    "Preconditioner",
     "GeometricMultigrid",
+    "SpectralPreconditioner",
+    "build_preconditioner",
     "PoissonDataset",
     "create_datasets",
     "WaveDataset",

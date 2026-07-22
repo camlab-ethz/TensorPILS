@@ -18,10 +18,10 @@ import torch
 import torch.nn as nn
 
 from .physics import PoissonProblem, WaveProblem, ACProblem, apply_zero_boundary
-from .multigrid import GeometricMultigrid
+from .preconditioners import Preconditioner
 
 __all__ = [
-    "DataLoss", "GalerkinLoss", "DeepRitzLoss",
+    "DataLoss", "DataL2Loss", "DataH1Loss", "GalerkinLoss", "DeepRitzLoss",
     "PreconditionedLSLoss", "PreconditionedDeepRitzLoss", "build_loss",
     "WaveGalerkinLoss", "build_wave_loss",
     "ACGalerkinLoss", "build_ac_loss",
@@ -45,12 +45,53 @@ class DataLoss(nn.Module):
     def forward(self, u_pred: torch.Tensor, u_true: torch.Tensor,
                 f_node: torch.Tensor = None) -> torch.Tensor:
         if self.bc_mode == "hard":
-            return ((u_pred[..., 1:-1, 1:-1] - u_true[..., 1:-1, 1:-1]) ** 2).mean()
-        return ((u_pred - u_true) ** 2).mean()
+            return ((u_pred[..., 1:-1, 1:-1] - u_true[..., 1:-1, 1:-1]) ** 2).mean(dim=0).sum()
+        return ((u_pred - u_true) ** 2).mean(dim=0).sum()
+
+
+class DataL2Loss(nn.Module):
+    r"""Supervised true-``L²`` loss ``½‖u−u★‖²_{L²} = ½ eᵀ M e`` on node values ``[B, N]``.
+
+    Unlike :class:`DataLoss` (flat grid MSE), the error ``e = u_pred − u_true`` is measured in
+    the finite-element ``L²`` norm via the mass matrix ``M`` — the same metric used to report
+    validation error. Requires labels ``u_true``.
+    """
+
+    def __init__(self, problem: PoissonProblem):
+        super().__init__()
+        self.problem = problem
+
+    def forward(self, u_pred_node: torch.Tensor, f_node: torch.Tensor,
+                u_true_node: torch.Tensor = None) -> torch.Tensor:
+        e = u_pred_node - u_true_node
+        Me = self.problem._spmm(self.problem.M, e)      # M e
+        return 0.5 * (e * Me).sum(dim=-1).mean()        # ½ mean_B(eᵀ M e)
+
+
+class DataH1Loss(nn.Module):
+    r"""Supervised ``H¹₀``-norm loss ``½‖u−u★‖²_{H¹₀} = ½ eᵀ A e`` on node values ``[B, N]``.
+
+    Like :class:`DataL2Loss` but with the stiffness matrix ``A`` (``∫∇φ·∇φ``) in place of the
+    mass matrix, measuring the error in the energy / ``H¹₀`` seminorm ``½∫|∇e|²``. The
+    prediction is first projected to zero on the Dirichlet boundary, so ``e = Πu_pred − u★``
+    lies in ``H₀¹`` where the seminorm is a genuine norm (Poincaré) — without this the
+    constant/boundary mode is in the loss nullspace. Requires labels ``u_true``.
+    """
+
+    def __init__(self, problem: PoissonProblem):
+        super().__init__()
+        self.problem = problem
+
+    def forward(self, u_pred_node: torch.Tensor, f_node: torch.Tensor,
+                u_true_node: torch.Tensor = None) -> torch.Tensor:
+        u_bc = apply_zero_boundary(u_pred_node, self.problem.boundary_mask)  # -> H¹₀
+        e = u_bc - u_true_node
+        Ae = self.problem._spmm(self.problem.A, e)      # A e
+        return 0.5 * (e * Ae).sum(dim=-1).mean()        # ½ mean_B(eᵀ A e)
 
 
 class GalerkinLoss(nn.Module):
-    """``‖A u − b‖²`` on node values ``[B, N]`` (no labels needed)."""
+    """``0.5 ‖A u − b‖²`` on node values ``[B, N]`` (no labels needed)."""
 
     def __init__(self, problem: PoissonProblem):
         super().__init__()
@@ -59,7 +100,7 @@ class GalerkinLoss(nn.Module):
     def forward(self, u_pred_node: torch.Tensor, f_node: torch.Tensor,
                 u_true_node: torch.Tensor = None) -> torch.Tensor:
         residual = self.problem.residual(u_pred_node, f_node)
-        return (residual ** 2).mean()
+        return 0.5 * (residual ** 2).sum(dim=-1).mean()
 
 
 class DeepRitzLoss(nn.Module):
@@ -96,23 +137,24 @@ class DeepRitzLoss(nn.Module):
 class PreconditionedLSLoss(nn.Module):
     r"""Preconditioned least-squares loss :math:`L = \tfrac12\|P(Au-b)\|^2`.
 
-    ``P`` is one geometric-multigrid V-cycle (``P ≈ A⁻¹``). The squared-norm form has
-    c-space Hessian ``AᵀPᵀPA ≈ I`` (mesh-independent conditioning) and gradient
-    ``≈ J_θᵀ(u − u⋆)``, recovering supervised training dynamics without labels.
+    ``P`` is a preconditioner ``P ≈ A⁻¹`` (a multigrid V-cycle, or the exact spectral
+    blend/power operator). The squared-norm form has c-space Hessian ``AᵀPᵀPA ≈ I``
+    (mesh-independent conditioning) and gradient ``≈ J_θᵀ(u − u⋆)``, recovering supervised
+    training dynamics without labels.
     """
 
-    def __init__(self, problem: PoissonProblem, mg: GeometricMultigrid):
+    def __init__(self, problem: PoissonProblem, precond: Preconditioner):
         super().__init__()
         self.problem = problem
-        self.mg = mg
+        self.precond = precond
 
     def forward(self, u_pred_node: torch.Tensor, f_node: torch.Tensor,
                 u_true_node: torch.Tensor = None) -> torch.Tensor:
         r = self.problem.residual(u_pred_node, f_node)
         if r.dim() == 1:
             r = r.unsqueeze(0)
-        Pr = self.mg.v_cycle(r)                 # ≈ A⁻¹ r
-        return 0.5 * (Pr * Pr).mean()
+        Pr = self.precond(r)                    # ≈ A⁻¹ r
+        return 0.5 * (Pr * Pr).sum(dim=-1).mean()    # changed to sum, not mean.
 
 
 class PreconditionedDeepRitzLoss(nn.Module):
@@ -124,10 +166,10 @@ class PreconditionedDeepRitzLoss(nn.Module):
     uses validation MSE, so this is harmless.
     """
 
-    def __init__(self, problem: PoissonProblem, mg: GeometricMultigrid):
+    def __init__(self, problem: PoissonProblem, precond: Preconditioner):
         super().__init__()
         self.problem = problem
-        self.mg = mg
+        self.precond = precond
 
     def forward(self, u_pred_node: torch.Tensor, f_node: torch.Tensor,
                 u_true_node: torch.Tensor = None) -> torch.Tensor:
@@ -136,29 +178,33 @@ class PreconditionedDeepRitzLoss(nn.Module):
         if r.dim() == 1:
             r = r.unsqueeze(0)
             u = u.unsqueeze(0)
-        Mr = self.mg.v_cycle(r).detach()        # preconditioned descent direction
+        Mr = self.precond(r).detach()           # preconditioned descent direction
         return (u * Mr).sum(dim=1).mean()       # surrogate: ∂/∂u = M r
 
 
 def build_loss(loss_type: str, problem: PoissonProblem,
                lambda_bc: float, bc_mode: str = "penalty",
-               mg: Optional[GeometricMultigrid] = None,
+               precond: Optional[Preconditioner] = None,
                precondition: bool = False):
     """Factory for the Poisson loss criterion. Add a branch here to register a new loss."""
     if loss_type == "data":
         return DataLoss(bc_mode=bc_mode)
+    if loss_type == "data_l2":
+        return DataL2Loss(problem)
+    if loss_type == "data_h1":
+        return DataH1Loss(problem)
     if loss_type == "galerkin":
         return GalerkinLoss(problem)
     if loss_type == "deepritz":
         if precondition:
-            if mg is None:
-                raise ValueError("preconditioned deepritz requires a GeometricMultigrid")
-            return PreconditionedDeepRitzLoss(problem, mg)
+            if precond is None:
+                raise ValueError("preconditioned deepritz requires a preconditioner")
+            return PreconditionedDeepRitzLoss(problem, precond)
         return DeepRitzLoss(problem, lambda_bc=lambda_bc, bc_mode=bc_mode)
     if loss_type == "pls":
-        if mg is None:
-            raise ValueError("loss_type='pls' requires a GeometricMultigrid")
-        return PreconditionedLSLoss(problem, mg)
+        if precond is None:
+            raise ValueError("loss_type='pls' requires a preconditioner")
+        return PreconditionedLSLoss(problem, precond)
     raise ValueError(f"Unknown loss type {loss_type!r}")
 
 
@@ -205,21 +251,41 @@ def build_wave_loss(problem: WaveProblem, c: float, dt: float, discount: float =
 # ============================ Allen–Cahn losses ============================
 
 class ACGalerkinLoss(nn.Module):
-    r"""Backward-Euler weak-form residual loss for Allen–Cahn (no labels).
+    r"""Least-squares weak-form residual loss for Allen–Cahn (no labels).
 
     Given a node-space trajectory ``seq`` of shape ``[B, L, N]`` — the ground-truth seed frame
-    followed by the model's autoregressive predictions — this sums the squared boundary-masked
-    residual over every consecutive pair :math:`(u^k, u^{k+1})`, weighted by ``discount**k`` so
-    later (more error-prone) rollout steps can be down-weighted. See :meth:`ACProblem.residual`.
+    followed by the model's autoregressive predictions — this penalises the boundary-masked step
+    residual over every consecutive pair :math:`(u^k, u^{k+1})` as ``½‖R‖²`` (sum over nodes,
+    mean over batch), weighted by ``discount**k`` so later (more error-prone) rollout steps can be
+    down-weighted. Summing over nodes (rather than averaging) keeps the gradient magnitude
+    :math:`O(1)` instead of :math:`O(1/N)`.
+
+    ``integrator`` selects the residual form (see :meth:`ACProblem.residual`): ``"backward_euler"``
+    (fully implicit) or ``"convex_concave"`` (Eyre split). Both use the ``/dt`` scaling, so the
+    loss is ``dt``-independent in gradient scale.
+
+    If ``precond`` is given, the loss is the **preconditioned** least-squares residual
+    :math:`\tfrac12\|P R\|^2` with :math:`P\approx J_0^{-1}`, :math:`J_0=a^2A+cM` the frozen
+    (``u²=1``) Newton Jacobian (see ``notes/ac_autoregressive/`` §"Preconditioning the least-squares
+    loss"). The preconditioned Gauss–Newton Hessian :math:`J^\top P^\top P J\approx I` removes the
+    :math:`\kappa^2` squaring that stalls the bare residual at stiff ``eps``.
     """
 
-    def __init__(self, problem: ACProblem, a: float, eps: float, dt: float, discount: float = 1.0):
+    def __init__(self, problem: ACProblem, a: float, eps: float, dt: float, discount: float = 1.0,
+                 integrator: str = "backward_euler", detach_coupling=None,
+                 precond: Optional[Preconditioner] = None):
         super().__init__()
         self.problem = problem
         self.a = a
         self.eps = eps
         self.dt = dt
         self.discount = discount
+        self.integrator = integrator
+        self.precond = precond
+        # Whether to detach the previous frame u^k in R(u^k, u^{k+1}). ½‖R‖² is self-balancing
+        # (∇ vanishes in both args at R=0), so the default is False (no detach) — a valid variant
+        # for the bptt-mode study. None -> class default.
+        self.detach_coupling = False if detach_coupling is None else detach_coupling
 
     def forward(self, seq_node: torch.Tensor) -> torch.Tensor:
         L = seq_node.shape[1]
@@ -228,15 +294,79 @@ class ACGalerkinLoss(nn.Module):
         total = seq_node.new_zeros(())
         wsum = 0.0
         for k in range(L - 1):
-            r = self.problem.residual(seq_node[:, k], seq_node[:, k + 1],
-                                      self.a, self.eps, self.dt)
+            prev = seq_node[:, k].detach() if self.detach_coupling else seq_node[:, k]
+            r = self.problem.residual(prev, seq_node[:, k + 1],
+                                      self.a, self.eps, self.dt, integrator=self.integrator)
+            if self.precond is not None:
+                r = self.precond(r)                                   # ½‖P R‖², P ≈ (a²A+cM)⁻¹
             w = self.discount ** k
-            total = total + w * (r ** 2).mean()
+            total = total + w * (0.5 * (r ** 2).sum(dim=-1).mean())   # sum nodes, mean batch
             wsum += w
         return total / wsum
 
 
-def build_ac_loss(problem: ACProblem, a: float, eps: float, dt: float, discount: float = 1.0):
-    """Factory for the Allen–Cahn physics (Galerkin) criterion. The supervised data term is a
-    plain trajectory MSE handled by the trainer; only the residual loss is assembled here."""
-    return ACGalerkinLoss(problem, a=a, eps=eps, dt=dt, discount=discount)
+class ACMinMovementLoss(nn.Module):
+    r"""Convex–concave minimizing-movement (JKO) objective loss for Allen–Cahn (no labels).
+
+    The Deep-Ritz analogue of :class:`ACGalerkinLoss` for time-stepping: rather than penalising
+    the squared residual ``‖R‖²``, it minimises the convex incremental objective
+    ``J(u^k, u^{k+1})`` (see :meth:`ACProblem.mm_objective`) whose unique minimiser is the
+    convex–concave step. Over a trajectory ``seq`` of shape ``[B, L, N]`` it sums
+    ``discount**k · J(u^k, u^{k+1})`` across consecutive pairs (mean over batch). ``J`` is already
+    a full spatial functional, so no per-node reduction is applied. This is intrinsically the
+    convex–concave scheme (the split is what makes ``J`` convex), so there is no integrator flag.
+    """
+
+    def __init__(self, problem: ACProblem, a: float, eps: float, dt: float, discount: float = 1.0,
+                 detach_coupling=None):
+        super().__init__()
+        self.problem = problem
+        self.a = a
+        self.eps = eps
+        self.dt = dt
+        self.discount = discount
+        # Whether to detach the proximal centre u^k inside J. Default True: ∇_{u^k}J does NOT
+        # vanish at the correct step, so backpropagating through it distorts the trajectory (see
+        # notes §sec:mm-pf). None -> class default. This is the *coupling* detach only; the
+        # *rollout*-input detach (the full pushforward) is a separate knob on the trainer.
+        self.detach_coupling = True if detach_coupling is None else detach_coupling
+
+    def forward(self, seq_node: torch.Tensor) -> torch.Tensor:
+        L = seq_node.shape[1]
+        if L < 2:
+            raise ValueError(f"AC min-movement loss needs at least 2 frames, got L={L}")
+        total = seq_node.new_zeros(())
+        wsum = 0.0
+        for k in range(L - 1):
+            prev = seq_node[:, k].detach() if self.detach_coupling else seq_node[:, k]
+            Jk = self.problem.mm_objective(prev, seq_node[:, k + 1],
+                                           self.a, self.eps, self.dt)   # [B]
+            w = self.discount ** k
+            total = total + w * Jk.mean()                               # mean over batch
+            wsum += w
+        return total / wsum
+
+
+def build_ac_loss(problem: ACProblem, a: float, eps: float, dt: float, discount: float = 1.0,
+                  integrator: str = "backward_euler", form: str = "galerkin",
+                  detach_coupling=None, precond: Optional[Preconditioner] = None):
+    """Factory for the Allen–Cahn physics criterion. The supervised data term is a plain
+    trajectory MSE handled by the trainer; only the label-free physics loss is assembled here.
+
+    ``form`` picks the physics loss:
+      * ``"galerkin"`` — least-squares residual ``½‖R‖²`` (:class:`ACGalerkinLoss`); ``integrator``
+        selects the residual scheme (``backward_euler`` | ``convex_concave``). If ``precond`` is
+        given, this becomes the preconditioned residual ``½‖P R‖²``.
+      * ``"min_movement"`` — convex–concave minimizing-movement objective ``J``
+        (:class:`ACMinMovementLoss`); intrinsically convex–concave, ``integrator`` is ignored.
+    """
+    if form == "galerkin":
+        return ACGalerkinLoss(problem, a=a, eps=eps, dt=dt, discount=discount, integrator=integrator,
+                              detach_coupling=detach_coupling, precond=precond)
+    if form == "min_movement":
+        if precond is not None:
+            raise ValueError("preconditioning applies to the least-squares residual only "
+                             "(form='galerkin'), not the minimizing-movement objective")
+        return ACMinMovementLoss(problem, a=a, eps=eps, dt=dt, discount=discount,
+                                 detach_coupling=detach_coupling)
+    raise ValueError(f"unknown AC loss form {form!r}; expected 'galerkin' or 'min_movement'")

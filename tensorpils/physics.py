@@ -197,20 +197,80 @@ class ACProblem(FEMOperator):
 
     # ------------------------------------------------------------------ residual
     def residual(self, u_curr: torch.Tensor, u_next: torch.Tensor,
-                 a: float, eps: float, dt: float) -> torch.Tensor:
-        r"""Boundary-masked fully-implicit backward-Euler Allen–Cahn residual.
+                 a: float, eps: float, dt: float,
+                 integrator: str = "backward_euler") -> torch.Tensor:
+        r"""Boundary-masked weak-form Allen–Cahn step residual (``/dt`` scaling), by integrator.
 
-        ``u_curr``/``u_next`` are :math:`u^n, u^{n+1}` in ``[N]`` or ``[B, N]``. Both are
-        projected to zero on the Dirichlet boundary before use and the returned residual is
-        also zeroed there. Fully differentiable in the inputs."""
+        ``u_curr``/``u_next`` are :math:`u^n, u^{n+1}` in ``[N]`` or ``[B, N]``. Both are projected
+        to zero on the Dirichlet boundary before use and the returned residual is also zeroed
+        there. Fully differentiable in the inputs. The two schemes differ only in the *linear*
+        reaction term (the cubic is implicit in both):
+
+        * ``"backward_euler"`` — fully implicit:
+          :math:`M\frac{u^{n+1}-u^n}{\dt} + a^2Au^{n+1} - \epsilon^2 M(u^{n+1}-(u^{n+1})^3)`.
+        * ``"convex_concave"`` — Eyre split, linear term explicit at :math:`u^n`:
+          :math:`M\frac{u^{n+1}-u^n}{\dt} + a^2Au^{n+1} + \epsilon^2 M((u^{n+1})^3-u^n)`.
+
+        Both are the ``/dt``-scaled residual (matching :meth:`fem_reference`), so a least-squares
+        loss built on either has a ``dt``-independent gradient scale. This is the same residual
+        the reference solve zeros, so the ``convex_concave`` reference exactly zeros the
+        ``convex_concave`` residual (and likewise for backward Euler)."""
         mask = self.boundary_mask
         uc = apply_zero_boundary(u_curr, mask)
         un = apply_zero_boundary(u_next, mask)
-        reaction = (eps * eps) * (un - un ** 3)                    # ε² u(1-u²) at new level
+        if integrator == "backward_euler":
+            reaction = (eps * eps) * (un - un ** 3)               # linear term implicit (uⁿ⁺¹)
+        elif integrator == "convex_concave":
+            reaction = (eps * eps) * (uc - un ** 3)               # linear term explicit (uⁿ)
+        else:
+            raise ValueError(f"unknown integrator {integrator!r}; "
+                             "expected 'backward_euler' or 'convex_concave'")
         r = self._spmm(self.M, (un - uc) / dt) \
             + (a * a) * self._spmm(self.A, un) \
             - self._spmm(self.M, reaction)
         return apply_zero_boundary(r, mask)
+
+    # ---------------------------------------------- minimizing-movement objective
+    def mm_objective(self, u_curr: torch.Tensor, u_next: torch.Tensor,
+                     a: float, eps: float, dt: float) -> torch.Tensor:
+        r"""Convex–concave minimizing-movement (JKO) objective for one Allen–Cahn step.
+
+        With the Ginzburg–Landau energy split :math:`E = E_{\mathrm{cvx}} + E_{\mathrm{ccv}}`
+        (:math:`E_{\mathrm{cvx}}=\tfrac{a^2}{2}\!\int|\nabla u|^2+\tfrac{\epsilon^2}{4}\!\int u^4
+        + \tfrac{\epsilon^2}{4}|\Omega|`, :math:`E_{\mathrm{ccv}}=-\tfrac{\epsilon^2}{2}\!\int u^2`,
+        so :math:`DE_{\mathrm{ccv}}(u^n)=-\epsilon^2 u^n`), the convex–concave step is the unique
+        minimiser of
+
+        .. math::
+            J(u) = E_{\mathrm{cvx}}(u) + \langle DE_{\mathrm{ccv}}(u^n), u\rangle
+                   + \tfrac{1}{2\dt}\|u-u^n\|_{L^2}^2 .
+
+        Discretised (nodal quartic :math:`\int u^4 \approx (u^4)^\top M\mathbf 1`, lumped mass
+        :math:`M\mathbf 1`), for ``u_next``:math:`=u`, ``u_curr``:math:`=u^n`:
+
+        .. math::
+            J = \tfrac{a^2}{2}u^\top A u + \tfrac{\epsilon^2}{4}\big[(u^4)^\top M\mathbf 1+|\Omega|\big]
+                - \epsilon^2 (u^n)^\top M u + \tfrac{1}{2\dt}(u-u^n)^\top M (u-u^n).
+
+        Its gradient is the convex–concave step residual with the *lumped* mass on the cubic
+        (:math:`\nabla_u J = M\frac{u-u^n}{\dt}+a^2Au+\epsilon^2\operatorname{diag}(M\mathbf 1)u^3
+        -\epsilon^2 M u^n`); minimising :math:`J` is the Deep-Ritz analogue of the least-squares
+        residual loss. Returns ``[B]`` (or scalar for ``[N]``). ``|\Omega|`` is a `u`-independent
+        constant, kept for fidelity to the objective. Boundary-projected like :meth:`residual`."""
+        mask = self.boundary_mask
+        uc = apply_zero_boundary(u_curr, mask)
+        un = apply_zero_boundary(u_next, mask)
+        ones = torch.ones(self.n_nodes, dtype=un.dtype, device=un.device)
+        m1 = self._spmm(self.M, ones)                     # lumped mass vector M·1  [N]
+        omega = m1.sum()                                  # |Ω| = 1ᵀM1
+        Aun = self._spmm(self.A, un)
+        Mun = self._spmm(self.M, un)
+        Muc = self._spmm(self.M, uc)
+        grad_term = 0.5 * (a * a) * (un * Aun).sum(dim=-1)              # a²/2 uᵀA u
+        quartic = 0.25 * (eps * eps) * ((un ** 4) * m1).sum(dim=-1)     # ε²/4 (u⁴)ᵀM1
+        concave = -(eps * eps) * (uc * Mun).sum(dim=-1)                 # -ε² (uⁿ)ᵀM u
+        prox = (0.5 / dt) * ((un - uc) * (Mun - Muc)).sum(dim=-1)       # 1/(2dt)‖u-uⁿ‖²_M
+        return grad_term + quartic + concave + prox + 0.25 * (eps * eps) * omega
 
     # -------------------------------------------------------------------- energy
     def energy(self, u: torch.Tensor, a: float, eps: float,
@@ -230,22 +290,38 @@ class ACProblem(FEMOperator):
             return e.sum()
         return e
 
-    # ---------------------------------------------------------- FEM reference solve
+    # ------------------------------------------ FEM reference solve (legacy dense, kept for now)
     @torch.no_grad()
-    def fem_reference(self, u0: torch.Tensor, a: float, eps: float, dt: float,
-                      n_steps: int, newton_tol: float = 1e-8, newton_max: int = 20,
-                      chunk: int = 64) -> torch.Tensor:
-        r"""Batched implicit-Euler + Newton reference trajectory (build-time ground truth).
+    def fem_reference_old(self, u0: torch.Tensor, a: float, eps: float, dt: float,
+                          n_steps: int, newton_tol: float = 1e-8, newton_max: int = 20,
+                          chunk: int = 64, integrator: str = "convex_concave") -> torch.Tensor:
+        r"""Legacy dense batched Newton reference (superseded by :meth:`fem_reference`; kept for
+        comparison/benchmarking, to be removed). Dense ``torch.linalg.solve`` on the interior
+        block, solves in the caller's dtype.
 
-        Solves ``R(u^{n+1}; u^n) = 0`` (the :meth:`residual` above) each step by Newton on the
-        interior DOFs (Dirichlet nodes held at 0). Uses dense linear algebra on the interior
-        block — appropriate for structured grids up to a few thousand nodes; process ``chunk``
-        samples at a time to bound memory. ``u0``: ``[N]`` or ``[B, N]``. Returns the trajectory
-        ``[B, n_steps+1, N]`` (or ``[n_steps+1, N]`` for a single sample).
+        Batched implicit + Newton reference trajectory (build-time ground truth).
 
-        The Jacobian is :math:`J = M/\Delta t + a^2 A - \epsilon^2 M\,\mathrm{diag}(1-3u^2)`;
-        the constant part ``L = M/\Delta t + a^2 A`` is formed once and the reaction Jacobian
-        is a per-iterate column scaling of ``M``."""
+        Solves ``R(u^{n+1}; u^n) = 0`` each step by Newton on the interior DOFs (Dirichlet nodes
+        held at 0). Uses dense linear algebra on the interior block — appropriate for structured
+        grids up to a few thousand nodes; process ``chunk`` samples at a time to bound memory.
+        ``u0``: ``[N]`` or ``[B, N]``. Returns the trajectory ``[B, n_steps+1, N]`` (or
+        ``[n_steps+1, N]`` for a single sample).
+
+        ``integrator`` selects the time discretisation of the reaction ε²(u−u³):
+
+        * ``"convex_concave"`` (default) — Eyre convex splitting: the convex quartic (cubic term
+          ε²u³) is implicit, the concave part (linear term ε²u) is explicit at ``u^n``. Residual
+          :math:`(M+\Delta t\,a^2A)u+\Delta t\,\varepsilon^2 M u^3-(I+\Delta t\,\varepsilon^2)Mu^n`,
+          Jacobian :math:`J = M/\Delta t + a^2A + 3\varepsilon^2 M\,\mathrm{diag}(u^2)`, which is
+          SPD for every ``u`` and ``Δt`` — unconditionally energy-stable.
+        * ``"backward_euler"`` — fully implicit; the whole reaction is at the new level. Jacobian
+          :math:`J = M/\Delta t + a^2A - \varepsilon^2 M\,\mathrm{diag}(1-3u^2)`.
+
+        The constant part ``L = M/\Delta t + a^2 A`` is formed once; the reaction Jacobian is a
+        per-iterate column scaling of ``M``."""
+        if integrator not in ("convex_concave", "backward_euler"):
+            raise ValueError(f"unknown integrator {integrator!r}; "
+                             "expected 'convex_concave' or 'backward_euler'")
         single = (u0.dim() == 1)
         if single:
             u0 = u0.unsqueeze(0)
@@ -271,18 +347,107 @@ class ACProblem(FEMOperator):
             for step in range(1, n_steps + 1):
                 u = u_old.clone()                                 # Newton initial guess
                 for _ in range(newton_max):
-                    # residual on interior: M(u-u_old)/dt + a²A u - ε²M(u-u³)
-                    reac = (eps * eps) * (u - u ** 3)             # [b, Ni]
+                    # Reaction term and its Jacobian column-scale w (so J = L_ii + M_ii·diag(w)),
+                    # per integrator. Both share the diffusion+mass block L_ii = M/dt + a²A.
+                    if integrator == "backward_euler":
+                        reac = (eps * eps) * (u - u ** 3)         # ε²(u-u³) fully implicit
+                        r_sign = -1.0                             # residual: ... - M·reac
+                        w = (eps * eps) * (3.0 * u * u - 1.0)     # J = L - ε²M diag(1-3u²)
+                    else:                                         # convex_concave (Eyre split)
+                        reac = (eps * eps) * (u ** 3 - u_old)     # cubic implicit, linear explicit
+                        r_sign = +1.0                             # residual: ... + M·reac
+                        w = 3.0 * (eps * eps) * (u * u)           # J = L + 3ε²M diag(u²)  (SPD)
                     r = (M_ii @ ((u - u_old) / dt).T).T \
                         + (a * a) * (A_ii @ u.T).T \
-                        - (M_ii @ reac.T).T                       # [b, Ni]
+                        + r_sign * (M_ii @ reac.T).T              # [b, Ni]
                     if r.norm(dim=1).max() < newton_tol:
                         break
-                    # J = L_ii - ε² M_ii diag(1-3u²)  (column-scale M_ii per sample)
-                    d = 1.0 - 3.0 * u * u                          # [b, Ni]
-                    J = L_ii.unsqueeze(0) - (eps * eps) * (M_ii.unsqueeze(0) * d.unsqueeze(1))
+                    J = L_ii.unsqueeze(0) + (M_ii.unsqueeze(0) * w.unsqueeze(1))   # column-scale
                     du = torch.linalg.solve(J, -r.unsqueeze(-1)).squeeze(-1)   # [b, Ni]
                     u = u + du
                 traj[lo:hi, step, idx] = u
                 u_old = u
         return traj[0] if single else traj
+
+    # ------------------------------------------ FEM reference solve (sparse float64, standard)
+    @torch.no_grad()
+    def fem_reference(self, u0: torch.Tensor, a: float, eps: float, dt: float,
+                      n_steps: int, newton_tol: float = 1e-8, newton_max: int = 20,
+                      chunk: int = 64, integrator: str = "convex_concave",
+                      solver_backend: str = "auto") -> torch.Tensor:
+        r"""Sparse-solve Newton reference trajectory --- the standard build-time ground truth.
+
+        Same contract and output as the legacy dense :meth:`fem_reference_old`, but each
+        Newton system is solved with a **batched sparse** solve (``SparseMatrix.solve_batch``:
+        shared sparsity, per-sample values) instead of a dense ``torch.linalg.solve``. This drops
+        the :math:`O(N_i^2)` memory / :math:`O(N_i^3)` factorisation and sidesteps MAGMA's batched
+        dense LU (which fails at large grids). ``solve_batch`` loops per sample internally, so it is
+        genuinely sparse but not GPU-parallel; SPD is auto-detected for the convex--concave path.
+
+        The interior Jacobian is ``J = M/dt + a^2 A + M diag(w)`` with ``w = 3 eps^2 u^2``
+        (convex_concave) or ``w = eps^2 (3u^2 - 1)`` (backward_euler); its values are assembled per
+        Newton step as ``L.values + M.values * w[:, col]`` on the shared ``(row,col)`` layout of
+        ``L = M/dt + a^2 A``. ``solver_backend`` is passed through (``"auto"`` picks scipy on CPU,
+        cupy/cuDSS on CUDA if installed)."""
+        if integrator not in ("convex_concave", "backward_euler"):
+            raise ValueError(f"unknown integrator {integrator!r}; "
+                             "expected 'convex_concave' or 'backward_euler'")
+        import numpy as np
+        from tensormesh.sparse.matrix import SparseMatrix
+
+        single = (u0.dim() == 1)
+        if single:
+            u0 = u0.unsqueeze(0)
+        device, out_dtype = u0.device, u0.dtype
+        # The reference is build-time ground truth, so always solve in float64 regardless of the
+        # caller's dtype: fp32 cannot reach newton_tol=1e-8 / the solver's inner tolerance (its
+        # residual floor is ~1e-6), which leaves Newton non-converged AND spinning to newton_max
+        # every step. Cast the trajectory back to the caller's dtype only on return.
+        dtype = torch.float64
+        u0 = u0.to(dtype)
+        mask = self.boundary_mask.to(device)
+        idx = torch.nonzero(~mask, as_tuple=False).squeeze(1)
+        idx_np = idx.cpu().numpy()
+
+        # Interior sparse blocks, assembled once, in float64. L = M/dt+a²A is the constant
+        # template; M_ii shares its layout so the reaction is a value update.
+        M_csr = self.M.to_scipy_coo().tocsr()[idx_np][:, idx_np].astype(np.float64).tocoo()
+        A_csr = self.A.to_scipy_coo().tocsr()[idx_np][:, idx_np].astype(np.float64).tocoo()
+        M_ii = SparseMatrix.from_scipy_coo(M_csr).to(dtype=dtype, device=device)
+        A_ii = SparseMatrix.from_scipy_coo(A_csr).to(dtype=dtype, device=device)
+        L_ii = (M_ii * (1.0 / dt) + A_ii * (a * a)).to(dtype=dtype, device=device)
+        col, L_vals, M_vals = L_ii.col_indices, L_ii.values, M_ii.values
+
+        def matvec(mat, x):                                   # [b, Ni] -> [b, Ni]
+            return (mat @ x.T).T
+
+        B = u0.shape[0]
+        traj = torch.zeros(B, n_steps + 1, self.n_nodes, device=device, dtype=dtype)
+        traj[:, 0] = apply_zero_boundary(u0, mask)
+
+        for lo in range(0, B, chunk):
+            hi = min(lo + chunk, B)
+            u_old = traj[lo:hi, 0, idx].clone()               # [b, Ni]
+            for step in range(1, n_steps + 1):
+                u = u_old.clone()
+                for _ in range(newton_max):
+                    if integrator == "backward_euler":
+                        reac = (eps * eps) * (u - u ** 3)     # ε²(u-u³) fully implicit
+                        r_sign = -1.0
+                        w = (eps * eps) * (3.0 * u * u - 1.0)
+                    else:                                     # convex_concave (Eyre split)
+                        reac = (eps * eps) * (u ** 3 - u_old)
+                        r_sign = +1.0
+                        w = 3.0 * (eps * eps) * (u * u)
+                    r = matvec(M_ii, (u - u_old) / dt) \
+                        + (a * a) * matvec(A_ii, u) \
+                        + r_sign * matvec(M_ii, reac)         # [b, Ni]
+                    if r.norm(dim=1).max() < newton_tol:
+                        break
+                    J_vals = L_vals.unsqueeze(0) + M_vals.unsqueeze(0) * w[:, col]   # [b, nnz]
+                    du = L_ii.solve_batch(J_vals, -r, backend=solver_backend)        # [b, Ni]
+                    u = u + du
+                traj[lo:hi, step, idx] = u
+                u_old = u
+        traj = traj[0] if single else traj
+        return traj.to(out_dtype)                     # cast fp64 solve back to caller's dtype
