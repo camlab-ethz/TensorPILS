@@ -24,6 +24,7 @@ self-contained experiment: a `README.md` (description, facts, run & plot command
 | [`compare_bptt/`](allen_cahn/compare_bptt/README.md) | How does the BPTT autodiff mode (full BPTT / detach-prev / pushforward) affect FNO rollout training across the three AC losses over the `ε` axis? |
 | [`long_rollout/`](allen_cahn/long_rollout/README.md) | Extrapolation past the 10-step training horizon: energy + error vs the convex-concave reference, plus 2D field heatmaps. |
 | [`realistic_ac/`](allen_cahn/realistic_ac/README.md) | A realistic FEM regime (`256²`, `eps=64`, `dt=0.01`): with the Newton-Jacobian conditioning `κ~10⁴`, do data-driven / minimizing-movement / **bare** least-squares (which sees `κ²~10⁸`) survive a 100-step pushforward rollout? Error + energy + heatmaps, test & train. Preconditioned-LS arm slots in later. |
+| [`realistic_ac_K8/`](allen_cahn/realistic_ac_K8/README.md) | Same as `realistic_ac` (128²/eps=32/dt=0.01, 4 loss arms) but with `K=8` ICs — the intermediate difficulty between the working K=4 and the non-converging K=16. Separate output tree; reuses the `realistic_ac` analysis scripts. |
 | [`realistic_ac_K16/`](allen_cahn/realistic_ac_K16/README.md) | Same as `realistic_ac` (128²/eps=32/dt=0.01, 4 loss arms) but with `K=16` multi-frequency ICs — a much harder learning problem. Separate output tree; reuses the `realistic_ac` analysis scripts. |
 
 ## Evaluation convention
