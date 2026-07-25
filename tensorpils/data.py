@@ -18,12 +18,13 @@ from torch.utils.data import Dataset, IterableDataset
 
 from tensormesh.dataset import PoissonMultiFrequency, WaveMultiFrequency
 
-from .meshing import structured_quad_mesh, node_to_grid
-from .physics import PoissonProblem, WaveProblem, ACProblem
+from .meshing import structured_quad_mesh, structured_quad9_mesh, node_to_grid
+from .physics import PoissonProblem, WaveProblem, ACProblem, StokesProblem
 
 __all__ = ["PoissonDataset", "StreamingPoissonDataset", "create_datasets",
            "create_scaling_datasets", "WaveDataset", "create_wave_datasets",
-           "ACDataset", "create_ac_datasets"]
+           "ACDataset", "create_ac_datasets",
+           "StokesDataset", "create_stokes_datasets", "stokes_body_force"]
 
 
 class PoissonDataset(Dataset):
@@ -442,5 +443,191 @@ def create_ac_datasets(n_train: int, n_val: int, n_test: int,
             num_samples=total, K=K, seed=seed, grid_resolution=grid_resolution,
             dt=dt, n_steps=n_steps, a=a, eps=eps, r=r, integrator=integrator,
             mesh=mesh, problem=problem, all_data=all_data, indices=indices,
+        )
+    return _make(train_idx), _make(val_idx), _make(test_idx)
+
+
+# ================================ Stokes ================================
+
+def stokes_body_force(coeffs: torch.Tensor, points: torch.Tensor,
+                      r: float = -0.5) -> torch.Tensor:
+    r"""Random multi-frequency body force ``f`` on the unit square — ``[B, N, 2]``.
+
+    Each component is a sine series
+    :math:`f_c(x,y)=\sum_{k,l=1}^{K} a_{ckl}\,(k^2+l^2)^{r}\sin(k\pi x)\sin(l\pi y)`,
+    the vector-valued analogue of TensorMesh's ``PoissonMultiFrequency`` source (same
+    ``r=-0.5`` spectral decay, so the forcing is smooth and dominated by low modes).
+
+    Unlike the Poisson / wave datasets there is no manufactured solution here: the Stokes
+    reference is the *discrete* Taylor-Hood solve of this ``f``
+    (:meth:`~tensorpils.physics.StokesProblem.fem_reference`), which is exactly the state
+    the label-free residual drives toward. ``f`` therefore needs no boundary or
+    divergence constraint of its own.
+
+    Parameters
+    ----------
+    coeffs : torch.Tensor
+        ``[B, 2, K, K]`` coefficients (component, k, l).
+    points : torch.Tensor
+        ``[N, 2]`` node coordinates.
+    """
+    B, _, K, _ = coeffs.shape
+    x, y = points[..., 0], points[..., 1]                                # [N]
+    ks = torch.arange(1, K + 1, dtype=points.dtype, device=points.device)
+    sx = torch.sin(torch.pi * ks[:, None] * x[None, :])                  # [K, N]
+    sy = torch.sin(torch.pi * ks[:, None] * y[None, :])                  # [K, N]
+    decay = ((ks[:, None] ** 2 + ks[None, :] ** 2) ** r)                 # [K, K]
+    w = coeffs.to(points.dtype) * decay                                  # [B, 2, K, K]
+    # f[b, c, n] = sum_{k,l} w[b,c,k,l] * sx[k,n] * sy[l,n]
+    f = torch.einsum("bckl,kn,ln->bcn", w, sx, sy)                       # [B, 2, N]
+    return f.permute(0, 2, 1).contiguous()                               # [B, N, 2]
+
+
+def _rms(t: torch.Tensor) -> float:
+    """Root-mean-square magnitude of a field, over samples and nodes."""
+    return float(t.pow(2).mean().sqrt().clamp_min(1e-30))
+
+
+class StokesDataset(Dataset):
+    r"""Dataset of Taylor-Hood Stokes solutions on a structured Q2/Q1 grid.
+
+    Item: ``(f_grid [2, Ny, Nx], f_node [n_u, 2], u_node [n_u, 2], p_node [n_p])`` —
+    a random body force and the **discrete** velocity/pressure that solve
+    :math:`\mathcal K c = (M_u f, 0)`.
+
+    ``grid_resolution`` is the **velocity** (fine) grid and must be odd; the pressure grid
+    is ``(grid_resolution + 1) // 2``.
+
+    Scaling
+    -------
+    Each sample is first rescaled so its reference velocity has unit FE :math:`L^2` norm.
+    Stokes is linear, so scaling ``f``, ``u`` and ``p`` by one constant is exact.
+
+    That fixes velocity but *not* the other two: the three magnitudes are tied by the
+    physics and cannot be normalized independently — for this forcing
+    :math:`u\sim f/(\mu k^2)` and :math:`p\sim f/k`, so at unit velocity one finds
+    :math:`\|f\|\sim 10^2` and :math:`\|p\|\sim 10^1`. Handing an FNO an input of magnitude
+    :math:`10^2` and asking for two output channels three orders of magnitude apart does not
+    train. The dataset therefore also publishes two **network-facing** constants,
+
+    * ``f_scale`` — RMS of the body force; the trainer feeds ``f / f_scale`` to the FNO,
+    * ``p_scale`` — RMS of the pressure; the trainer reads pressure as ``channel * p_scale``,
+
+    which leave the FEM operator, the residual and the reference untouched — they only put
+    the network's input and both output channels at :math:`O(1)`.
+    """
+
+    def __init__(
+        self,
+        num_samples: int = 512,
+        K: int = 4,
+        seed: int = 42,
+        grid_resolution: int = 65,
+        mu: float = 1.0,
+        r: float = -0.5,
+        ref_chunk: int = 64,
+        normalize: bool = True,
+        mesh=None,
+        problem: Optional[StokesProblem] = None,
+        all_data: Optional[dict] = None,
+        indices: Optional[List[int]] = None,
+    ):
+        super().__init__()
+        if grid_resolution % 2 == 0:
+            raise ValueError(
+                f"Stokes needs an odd velocity grid (Q2 nodes = 2*n_p - 1), got "
+                f"{grid_resolution}. Try {grid_resolution + 1}.")
+        self.K = K
+        self.mu = mu
+        self.r = r
+        self.grid_resolution = grid_resolution
+        self.grid_size = (grid_resolution, grid_resolution)          # velocity (nx, ny)
+        nx_p = (grid_resolution + 1) // 2
+        self.pgrid_size = (nx_p, nx_p)
+
+        if all_data is not None:
+            self.mesh = mesh
+            self.problem = problem
+            sel = indices if indices is not None else range(len(all_data["u"]))
+            self.f = all_data["f"][list(sel)]
+            self.u = all_data["u"][list(sel)]
+            self.p = all_data["p"][list(sel)]
+            self._all_data = all_data                 # p_scale stays the shared pool's
+        else:
+            torch.manual_seed(seed)
+            self.mesh = structured_quad9_mesh(nx=nx_p, ny=nx_p)
+            self.problem = StokesProblem(self.mesh, nx_p=nx_p, ny_p=nx_p, mu=mu)
+
+            coeffs = torch.rand(num_samples, 2, K, K) * 2 - 1
+            f = stokes_body_force(coeffs, self.mesh.points, r=r).float()   # [num, n_u, 2]
+
+            # Discrete Taylor-Hood reference (batched sparse solve, float64 internally).
+            solve_dev = "cuda" if torch.cuda.is_available() else "cpu"
+            prob = self.problem.to(solve_dev)
+            u, p = prob.fem_reference(f.to(solve_dev), chunk=ref_chunk)
+            self.problem = prob.to("cpu")
+            f, u, p = f.cpu(), u.cpu(), p.cpu()
+
+            if normalize:
+                scale = self.problem.velocity_l2(u).clamp_min(1e-30)       # [num]
+                f = f / scale[:, None, None]
+                u = u / scale[:, None, None]
+                p = p / scale[:, None]
+
+            self.f, self.u, self.p = f, u, p
+            self._all_data = {
+                "f": f, "u": u, "p": p, "coeffs": coeffs,
+                "f_scale": _rms(f), "p_scale": _rms(p),
+                # RMS FE-L2 norms: the weights that balance the two fields in any
+                # absolute-error loss or metric.
+                "u_l2_scale": float(self.problem.velocity_l2(u).pow(2).mean().sqrt()),
+                "p_l2_scale": float(self.problem.pressure_l2(p).pow(2).mean().sqrt()),
+            }
+
+        # Network-facing scales (see the class docstring): fixed constants that leave the
+        # physics untouched and only make the FNO's input and output channels O(1).
+        self.f_scale = float(self._all_data["f_scale"])
+        self.p_scale = float(self._all_data["p_scale"])
+        self.u_l2_scale = float(self._all_data["u_l2_scale"])
+        self.p_l2_scale = float(self._all_data["p_l2_scale"])
+
+    def __len__(self):
+        return len(self.f)
+
+    def __getitem__(self, idx):
+        nx, ny = self.grid_size
+        f_node = self.f[idx]                                   # [n_u, 2]
+        f_grid = torch.stack([node_to_grid(f_node[..., 0], nx, ny),
+                              node_to_grid(f_node[..., 1], nx, ny)], dim=0)   # [2, ny, nx]
+        return f_grid, f_node, self.u[idx], self.p[idx]
+
+    def get_shared_resources(self):
+        return self.mesh, self.problem, self._all_data
+
+
+def create_stokes_datasets(n_train: int, n_val: int, n_test: int,
+                           K: int, grid_resolution: int = 65, mu: float = 1.0,
+                           r: float = -0.5, ref_chunk: int = 64,
+                           normalize: bool = True, seed: int = 42):
+    """Build train/val/test Stokes splits sharing one mesh, one :class:`StokesProblem`,
+    and a single pool of reference solutions (one batched factorization for all splits)."""
+    total = n_train + (n_val if n_val > 0 else 0) + (n_test if n_test > 0 else 0)
+    base = StokesDataset(num_samples=total, K=K, seed=seed,
+                         grid_resolution=grid_resolution, mu=mu, r=r,
+                         ref_chunk=ref_chunk, normalize=normalize)
+    mesh, problem, all_data = base.get_shared_resources()
+
+    train_idx = list(range(n_train))
+    val_idx = list(range(n_train, n_train + n_val)) if n_val > 0 else train_idx
+    if n_test > 0:
+        start = n_train + (n_val if n_val > 0 else 0)
+        test_idx = list(range(start, start + n_test))
+    else:
+        test_idx = train_idx
+
+    def _make(indices):
+        return StokesDataset(
+            num_samples=total, K=K, seed=seed, grid_resolution=grid_resolution,
+            mu=mu, r=r, mesh=mesh, problem=problem, all_data=all_data, indices=indices,
         )
     return _make(train_idx), _make(val_idx), _make(test_idx)

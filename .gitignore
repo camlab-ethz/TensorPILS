@@ -17,6 +17,7 @@ env/
 
 # Training artifacts
 output/
+logs/
 checkpoints/
 *.pth
 *.ckpt

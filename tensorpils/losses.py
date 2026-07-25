@@ -17,7 +17,8 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from .physics import PoissonProblem, WaveProblem, ACProblem, apply_zero_boundary
+from .physics import (PoissonProblem, WaveProblem, ACProblem, StokesProblem,
+                      apply_zero_boundary)
 from .preconditioners import Preconditioner
 
 __all__ = [
@@ -25,6 +26,7 @@ __all__ = [
     "PreconditionedLSLoss", "PreconditionedDeepRitzLoss", "build_loss",
     "WaveGalerkinLoss", "build_wave_loss",
     "ACGalerkinLoss", "build_ac_loss",
+    "StokesGalerkinLoss", "StokesPLSLoss", "StokesAppliedPLSLoss", "build_stokes_loss",
 ]
 
 
@@ -370,3 +372,157 @@ def build_ac_loss(problem: ACProblem, a: float, eps: float, dt: float, discount:
         return ACMinMovementLoss(problem, a=a, eps=eps, dt=dt, discount=discount,
                                  detach_coupling=detach_coupling)
     raise ValueError(f"unknown AC loss form {form!r}; expected 'galerkin' or 'min_movement'")
+
+
+# ============================== Stokes losses ==============================
+
+class StokesGalerkinLoss(nn.Module):
+    r"""Bare least-squares saddle-point residual ``½‖K c − b‖²`` (no labels).
+
+    The **negative control**. For the indefinite Stokes operator :math:`\mathcal K` the
+    Gauss--Newton matrix is :math:`J^\top\mathcal K^2 J`, and since :math:`\mathcal K` is
+    symmetric its squared eigenvalues give conditioning :math:`\kappa = O(h^{-4})`. This
+    loss is therefore expected *not* to train — exactly as the bare ``galerkin`` loss
+    stalls for Poisson. It exists so the preconditioned loss has something to beat.
+    """
+
+    def __init__(self, problem: StokesProblem):
+        super().__init__()
+        self.problem = problem
+
+    def forward(self, u_node: torch.Tensor, p_node: torch.Tensor,
+                f_node: torch.Tensor) -> torch.Tensor:
+        r = self.problem.residual(u_node, p_node, f_node)
+        return 0.5 * (r ** 2).sum(dim=-1).mean()          # sum dofs, mean batch
+
+
+class StokesPLSLoss(nn.Module):
+    r"""Preconditioned least-squares loss ``½ rᵀ P r`` with ``r = K c − b``.
+
+    ``P = diag(Â⁻¹, Ŝ⁻¹)`` (see :class:`~tensorpils.preconditioners.stokes.
+    StokesBlockPreconditioner`) is used as a **norm weight**, giving
+
+    .. math::
+        \nabla L = J^\top[\mathcal K\mathcal P\mathcal K c - \mathcal K\mathcal P b],
+        \qquad G(\theta) = J^\top \mathcal K\mathcal P\mathcal K J,
+
+    whose conditioning is governed by :math:`\kappa(\mathcal P)`, i.e. :math:`O(h^{-2})`
+    — versus :math:`O(h^{-4})` for :class:`StokesGalerkinLoss`.
+
+    The ``½‖P r‖²`` variant is deliberately *not* offered: for a saddle-point system it
+    squares the conditioning back to :math:`O(h^{-4})` and is a known dead end (it works
+    for Poisson only because there ``P ≈ A⁻¹`` genuinely approximates the inverse, which
+    no block-diagonal preconditioner does for :math:`\mathcal K`).
+    """
+
+    def __init__(self, problem: StokesProblem, precond: Preconditioner):
+        super().__init__()
+        self.problem = problem
+        self.precond = precond
+
+    def forward(self, u_node: torch.Tensor, p_node: torch.Tensor,
+                f_node: torch.Tensor) -> torch.Tensor:
+        r = self.problem.residual(u_node, p_node, f_node)
+        Pr = self.precond(r)
+        return 0.5 * (r * Pr).sum(dim=-1).mean()          # ½ rᵀPr, mean over batch
+
+
+class StokesAppliedPLSLoss(nn.Module):
+    r"""Applied preconditioned least squares ``½‖P r‖²`` with ``r = K c − b``.
+
+    The form that is only viable when :math:`\mathcal P` is a genuine **approximate inverse** of
+    the saddle-point operator, i.e. :math:`\mathcal{PK}\approx I`:
+
+    .. math::
+        \nabla L = J^\top(\mathcal{PK})^\top(\mathcal{PK}c - \mathcal Pb),
+        \qquad
+        G(\theta) = J^\top(\mathcal{PK})^\top(\mathcal{PK})J,
+
+    whose conditioning is :math:`\kappa_2(\mathcal{PK})^2` — mesh-independent, :math:`O(1)`, for a
+    monolithic multigrid V-cycle
+    (:class:`~tensorpils.preconditioners.stokes_monolithic.StokesMonolithicMultigrid`).
+
+    With a **block-diagonal** :math:`\mathcal P` this is the note's documented dead end: no such
+    operator approximates :math:`\mathcal K^{-1}`, and the conditioning then grows like
+    :math:`O(h^{-3.4})` (measured) rather than staying bounded — worse than the
+    :math:`O(h^{-2})` of the weighted :class:`StokesPLSLoss`. It is not blocked, because measuring
+    that crossover is itself an experiment (``experiments/stokes/conditioning``), but the pairing is
+    warned about at construction.
+
+    ``metric`` selects the norm the squared residual is measured in, and it matters more than one
+    would expect. Since :math:`\mathcal Pr \approx c - c^*`, the default ``'euclidean'`` form
+    :math:`\tfrac12\|\mathcal Pr\|_2^2` measures the error in **nodal** units, where velocity and
+    pressure DOFs count equally — but the physics ties their magnitudes together, and for this
+    dataset :math:`\|p\|\sim50\|u\|`, so the loss comes out pressure-dominated by a measured factor
+    :math:`\sim\!350` and the velocity is barely optimized. That is the same failure the hand-written
+    supervised loss had, reappearing for the same reason. ``'fe'`` divides each block by its own
+    dataset FE norm instead, which turns this loss into a **label-free surrogate for the supervised
+    objective**: with :math:`\mathcal P=\mathcal K^{-1}` exactly it *is*
+    ``StokesTrainer._data_loss``, computed from the residual and no labels at all.
+    """
+
+    def __init__(self, problem: StokesProblem, precond: Preconditioner,
+                 metric: str = "euclidean", u_scale: float = 1.0, p_scale: float = 1.0):
+        super().__init__()
+        if metric not in ("euclidean", "fe"):
+            raise ValueError(f"metric must be 'euclidean' or 'fe', got {metric!r}")
+        self.problem = problem
+        self.precond = precond
+        self.metric = metric
+        self.u_scale = float(u_scale)
+        self.p_scale = float(p_scale)
+
+    def forward(self, u_node: torch.Tensor, p_node: torch.Tensor,
+                f_node: torch.Tensor) -> torch.Tensor:
+        r = self.problem.residual(u_node, p_node, f_node)
+        Pr = self.precond(r)
+        if self.metric == "euclidean":
+            return 0.5 * (Pr ** 2).sum(dim=-1).mean()     # ½‖Pr‖², mean over batch
+        e_u, e_p = self.problem.unpack(Pr)                # Pr ≈ c − c*, so these are the errors
+        lu = self.problem.velocity_l2(e_u) ** 2 / self.u_scale ** 2
+        lp = self.problem.pressure_l2(e_p) ** 2 / self.p_scale ** 2
+        return 0.5 * (lu + lp).mean()
+
+
+def build_stokes_loss(loss_type: str, problem: StokesProblem,
+                      precond: Optional[Preconditioner] = None,
+                      form: str = "weighted", u_scale: float = 1.0, p_scale: float = 1.0):
+    """Factory for the label-free Stokes criterion.
+
+    ``galerkin`` → bare ``½‖r‖²``. ``pls`` needs a ``precond`` and comes in three forms:
+
+    * ``'weighted'`` → ``½ rᵀPr``, for a norm-equivalent block ``P`` (requires ``P`` SPD);
+    * ``'applied'`` → ``½‖Pr‖²`` in nodal units, for a monolithic ``P ≈ K⁻¹``;
+    * ``'applied_fe'`` → the same with each field block divided by its dataset FE norm
+      (``u_scale``, ``p_scale``), which removes the ~350x pressure domination the nodal norm
+      carries for this dataset.
+
+    The supervised ``data`` loss is a plain field MSE handled by the trainer, so it has no entry
+    here.
+    """
+    if loss_type == "galerkin":
+        return StokesGalerkinLoss(problem)
+    if loss_type == "pls":
+        if precond is None:
+            raise ValueError("Stokes loss_type='pls' requires a preconditioner")
+        if form == "weighted":
+            if _is_monolithic(precond):
+                print("[warning] pls form='weighted' with a monolithic P: as a norm weight P must "
+                      "be SPD, and an approximate inverse of an INDEFINITE operator is indefinite, "
+                      "so this loss is unbounded below and will diverge. Use form='applied'.")
+            return StokesPLSLoss(problem, precond)
+        if form in ("applied", "applied_fe"):
+            if not _is_monolithic(precond):
+                print("[warning] pls form='applied' with a preconditioner that is not a monolithic "
+                      "multigrid: no block-diagonal P approximates K^-1, so this is the note's "
+                      "dead-end variant (kappa ~ O(h^-3.4) measured). Intended only as a control.")
+            return StokesAppliedPLSLoss(
+                problem, precond, metric="fe" if form == "applied_fe" else "euclidean",
+                u_scale=u_scale, p_scale=p_scale)
+        raise ValueError(f"unknown Stokes pls form {form!r}; expected 'weighted', 'applied' "
+                         "or 'applied_fe'")
+    raise ValueError(f"unknown Stokes loss {loss_type!r}; expected 'galerkin' or 'pls'")
+
+
+def _is_monolithic(precond) -> bool:
+    return type(precond).__name__ == "StokesMonolithicMultigrid"

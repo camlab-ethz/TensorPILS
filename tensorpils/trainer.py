@@ -11,6 +11,7 @@ Evaluation is **always** grid-space MSE against the analytical solution, regardl
 the training loss, so model selection and the reported error stay comparable.
 """
 
+import math
 import os
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -23,13 +24,15 @@ from tqdm import tqdm
 
 from .meshing import node_to_grid, grid_to_node
 from .physics import apply_zero_boundary
-from .preconditioners import Preconditioner, GeometricMultigrid, build_preconditioner
-from .losses import build_loss, build_wave_loss, build_ac_loss
+from .preconditioners import (Preconditioner, GeometricMultigrid,
+                              StokesBlockPreconditioner, StokesBlendPreconditioner,
+                              StokesMonolithicMultigrid, build_preconditioner)
+from .losses import build_loss, build_wave_loss, build_ac_loss, build_stokes_loss
 from .optim import build_optimizer
 from . import viz
 
 __all__ = ["BaseTrainer", "Trainer", "PoissonTrainer", "RolloutTrainer",
-           "WaveTrainer", "ACTrainer", "TrainingStats"]
+           "WaveTrainer", "ACTrainer", "StokesTrainer", "TrainingStats"]
 
 
 @dataclass
@@ -51,6 +54,9 @@ class TrainingStats:
     best_val_error: float = float("inf")
     # Epoch at which patience-based early stopping fired (-1: ran the full budget).
     stopped_epoch: int = -1
+    # Stokes: the two fields are scored separately (different spaces and grids).
+    val_rel_l2_u: List[float] = field(default_factory=list)
+    val_rel_l2_p: List[float] = field(default_factory=list)
     # Preconditioner identity + conditioning (for the sweep / collapse plot).
     precond_kind: str = ""
     precond_strength: float = float("nan")
@@ -92,6 +98,9 @@ class BaseTrainer:
 
         self.stats = TrainingStats()
         self.best_state = None
+        # Label for the end-of-training test print. Most trainers report a grid MSE; Stokes
+        # selects on a combined relative error, so it says so rather than mislabelling it.
+        self._test_label = "Test MSE"
 
         # Subclasses set these before train() (problem carries A/M + boundary_mask).
         self.problem = None
@@ -154,7 +163,7 @@ class BaseTrainer:
                   f"(val={self.stats.best_val_error:.2e})")
 
         test_err = self.test()
-        print(f"Test MSE: {test_err:.2e}")
+        print(f"{self._test_label}: {test_err:.2e}")
         self.plot_loss_curve()
         self._after_train_viz()
         return test_err
@@ -843,3 +852,272 @@ class ACTrainer(RolloutTrainer):
         return (f"fno_ac_{self.loss_type}_{ftag}{ptag}_{itag}{btag}_a{self.a:g}_eps{self.eps:g}_dt{self.dt:g}_"
                 f"T{self.n_steps}_R{self.rollout_steps}_K{self.K}_"
                 f"samples-{len(self.train_dataset)}-{len(self.val_dataset)}-{len(self.test_dataset)}")
+
+
+class StokesTrainer(BaseTrainer):
+    r"""Trainer for the stationary Stokes saddle-point problem.
+
+    The FNO maps the body force to the *pair* of fields: ``[B, 2, Ny, Nx]`` → ``[B, 3, Ny, Nx]``
+    with channels ``(u_x, u_y, p)``. :meth:`~tensorpils.physics.StokesProblem.from_grid`
+    reads velocity on the full fine grid and pressure on the ``[::2, ::2]`` Q1 subgrid.
+
+    Every prediction — for *every* loss, at train and eval time — is passed through the two
+    projections that encode known structure rather than learned structure:
+
+    * zero Dirichlet velocity on ``∂Ω``;
+    * the zero-mean pressure gauge, since the residual is blind to the constant mode
+      (:math:`B^\top\mathbf 1 = 0`) and could never determine it.
+
+    Evaluation reports FE :math:`L^2` errors against the discrete Taylor-Hood reference,
+    separately for velocity and pressure — they live in different spaces on different grids,
+    so a single grid MSE would be meaningless. Best-model selection uses the combined
+    squared FE error.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        train_dataset,
+        val_dataset,
+        test_dataset,
+        loss_type: str = "pls",
+        optimizer_name: str = "adam",
+        lr: float = 1e-3,
+        lr_min: float = 1e-6,
+        weight_decay: float = 0.0,
+        batch_size: int = 32,
+        epochs: int = 500,
+        device: str = "cuda",
+        output_dir: str = "output",
+        mg_levels: int = 4,
+        mg_pre_smooth: int = 2,
+        mg_post_smooth: int = 2,
+        mg_omega: float = 2.0 / 3.0,
+        schur_omega: float = 0.5,
+        precond_strength: float = 1.0,
+        precond_kind: str = "block",
+        pls_form: str = "auto",
+        uzawa_pre: int = 4,
+        uzawa_post: int = 4,
+        cheb_degree: int = 8,
+        cheb_ratio: float = 30.0,
+    ):
+        super().__init__(model, loss_type, train_dataset.K, optimizer_name,
+                         lr, lr_min, weight_decay, epochs, device, output_dir)
+        self.train_dataset = train_dataset
+        self.val_dataset = val_dataset
+        self.test_dataset = test_dataset
+        self.problem = train_dataset.problem.to(device)
+        self.grid_size = self.problem.grid_size
+        self.mu = self.problem.mu
+        self.f_scale = float(getattr(train_dataset, "f_scale", 1.0))
+        self.p_scale = float(getattr(train_dataset, "p_scale", 1.0))
+        self.u_l2_scale = float(getattr(train_dataset, "u_l2_scale", 1.0))
+        self.p_l2_scale = float(getattr(train_dataset, "p_l2_scale", 1.0))
+        self._test_label = "Test combined rel-L2"
+
+        self.train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        self.val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+        self.test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+        self.precond: Optional[Preconditioner] = None
+        self.schur_omega = schur_omega
+        self.precond_strength = float(precond_strength)
+        self.precond_kind = precond_kind
+        self.mg_settings = (mg_levels, mg_pre_smooth, mg_post_smooth, mg_omega)
+        self.uzawa_settings = (uzawa_pre, uzawa_post, cheb_degree, cheb_ratio)
+        if loss_type == "pls":
+            if precond_kind == "monolithic":
+                # A genuine P ~ K^-1, which is what makes the *applied* form viable at O(1)
+                # conditioning; the block preconditioner below is only norm-equivalent.
+                self.precond = StokesMonolithicMultigrid(
+                    self.problem, n_levels=mg_levels, n_pre=uzawa_pre, n_post=uzawa_post,
+                    cheb_degree=cheb_degree, cheb_ratio=cheb_ratio,
+                    schur_omega=schur_omega).to(device)
+            elif precond_kind == "block":
+                base = StokesBlockPreconditioner(
+                    self.problem, mg_levels=mg_levels, mg_pre_smooth=mg_pre_smooth,
+                    mg_post_smooth=mg_post_smooth, mg_omega=mg_omega,
+                    schur_omega=schur_omega).to(device)
+                # strength < 1 blends toward the identity: P_t = (1-t)*alpha*I + t*P_block, so t=0
+                # reproduces the bare least-squares loss and t=1 the block preconditioner.
+                self.precond = (base if self.precond_strength >= 1.0
+                                else StokesBlendPreconditioner(
+                                    base, self.precond_strength).to(device))
+            else:
+                raise ValueError(f"precond_kind must be 'block' or 'monolithic', "
+                                 f"got {precond_kind!r}")
+
+        # 'auto': the weighted norm for a norm-equivalent block P; for a monolithic approximate
+        # inverse the applied form, in the FE metric — the plain nodal one is ~350x
+        # pressure-dominated for this dataset (see StokesAppliedPLSLoss).
+        self.pls_form = (("applied_fe" if precond_kind == "monolithic" else "weighted")
+                         if pls_form == "auto" else pls_form)
+        self.criterion = (None if loss_type == "data"
+                          else build_stokes_loss(loss_type, self.problem, precond=self.precond,
+                                                 form=self.pls_form,
+                                                 u_scale=self.u_l2_scale, p_scale=self.p_l2_scale))
+        os.makedirs(f"{self.output_dir}/results", exist_ok=True)
+
+    # -------------------- prediction --------------------
+    def _predict(self, f_grid: torch.Tensor):
+        """FNO forward → physical ``(u_node, p_node)``.
+
+        Four fixed, non-trainable steps. Two are *scaling* (see ``StokesDataset``): the
+        input is divided by ``f_scale`` and the pressure channel multiplied by ``p_scale``,
+        so the network sees O(1) on every channel even though the physics ties the three
+        magnitudes orders of magnitude apart. Two are *structural*: the velocity is
+        projected to the zero Dirichlet boundary and the pressure to zero mean.
+        """
+        out = self.model(f_grid / self.f_scale)                    # [B, 3, Ny, Nx]
+        u_node, p_node = self.problem.from_grid(out)
+        return (self.problem.project_velocity_bc(u_node),
+                self.problem.project_pressure_gauge(p_node * self.p_scale))
+
+    def _data_loss(self, u_pred, p_pred, u_true, p_true) -> torch.Tensor:
+        r"""Supervised FE-norm loss ``½(‖u−u*‖²_{M_u}/‖u‖² + ‖p−p*‖²_{M_p}/‖p‖²)``.
+
+        Mass-weighted rather than a flat grid MSE because velocity and pressure live on
+        different spaces and grids. Each term is divided by that field's mean squared FE
+        norm over the dataset: the physics fixes ``‖p‖ ≈ 50‖u‖`` here, so an *unweighted*
+        sum is ~2500x dominated by pressure and the velocity is effectively not optimized
+        at all (measured: 85% velocity error while pressure reaches 9%).
+        """
+        eu = self.problem.velocity_l2(u_pred - u_true) ** 2 / self.u_l2_scale ** 2
+        ep = self.problem.pressure_l2(p_pred - p_true) ** 2 / self.p_l2_scale ** 2
+        return 0.5 * (eu + ep).mean()
+
+    # -------------------- train / eval --------------------
+    def train_epoch(self) -> float:
+        self.model.train()
+        total, nb = 0.0, 0
+        for f_grid, f_node, u_true, p_true in self.train_loader:
+            f_grid, f_node = f_grid.to(self.device), f_node.to(self.device)
+            u_true, p_true = u_true.to(self.device), p_true.to(self.device)
+            u_pred, p_pred = self._predict(f_grid)
+            if self.loss_type == "data":
+                loss = self._data_loss(u_pred, p_pred, u_true, p_true)
+            else:
+                loss = self.criterion(u_pred, p_pred, f_node)
+            self.optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            self.optimizer.step()
+            total += loss.item()
+            nb += 1
+        return total / nb
+
+    @torch.no_grad()
+    def _eval_loader(self, loader):
+        """Returns ``(sq_err, rel_l2_u, rel_l2_p)`` — combined squared FE error and the two
+        dataset-level relative FE ``L2`` errors ``sqrt(sum ‖e‖² / sum ‖ref‖²)``."""
+        self.model.eval()
+        sq, n = 0.0, 0
+        nu = du = np_ = dp = 0.0
+        for f_grid, f_node, u_true, p_true in loader:
+            f_grid = f_grid.to(self.device)
+            u_true, p_true = u_true.to(self.device), p_true.to(self.device)
+            u_pred, p_pred = self._predict(f_grid)
+            eu = self.problem.velocity_l2(u_pred - u_true) ** 2          # [B]
+            ep = self.problem.pressure_l2(p_pred - p_true) ** 2          # [B]
+            sq += (eu + ep).sum().item()
+            nu += eu.sum().item()
+            du += (self.problem.velocity_l2(u_true) ** 2).sum().item()
+            np_ += ep.sum().item()
+            dp += (self.problem.pressure_l2(p_true) ** 2).sum().item()
+            n += f_grid.shape[0]
+        return (sq / n, math.sqrt(nu / max(du, 1e-30)), math.sqrt(np_ / max(dp, 1e-30)))
+
+    def validate(self):
+        sq, ru, rp = self._eval_loader(self.val_loader)
+        self.stats.val_rel_l2_u.append(ru)
+        self.stats.val_rel_l2_p.append(rp)
+        self.stats.val_l2_errors.append(sq)
+        self.stats.val_rel_l2_errors.append(0.5 * (ru + rp))
+        return 0.5 * (ru + rp)
+
+    def test(self):
+        _, ru, rp = self._eval_loader(self.test_loader)
+        return 0.5 * (ru + rp)
+
+    def _before_train(self):
+        if self.precond is not None:
+            self.precond.report()
+
+    def train(self):
+        result = super().train()
+        sq, ru, rp = self._eval_loader(self.test_loader)
+        print(f"Test rel-L2 — velocity: {ru:.2%}   pressure: {rp:.2%}   "
+              f"(combined FE-L2 squared error {sq:.3e})")
+        self._save_results_json((sq, ru, rp))
+        return result
+
+    def _save_results_json(self, test_metrics) -> None:
+        import json
+        from dataclasses import asdict
+        sq, ru, rp = test_metrics
+        record = {
+            "prefix": self._file_prefix(),
+            "pde": "stokes",
+            "loss_type": self.loss_type,
+            "mu": self.mu,
+            "schur_omega": self.schur_omega,
+            "K": self.K,
+            "grid": list(self.grid_size),
+            "pgrid": list(self.problem.pgrid_size),
+            "n_train": len(self.train_dataset),
+            "epochs": self.epochs,
+            "precond_strength": self.precond_strength if self.loss_type == "pls" else None,
+            "precond_alpha": getattr(self.precond, "alpha", None),
+            "precond_kind": self.precond_kind if self.loss_type == "pls" else None,
+            "pls_form": self.pls_form if self.loss_type == "pls" else None,
+            "uzawa": list(self.uzawa_settings) if self.precond_kind == "monolithic" else None,
+            "test_sq_fe_l2": sq, "test_rel_l2_u": ru, "test_rel_l2_p": rp,
+            "best_val_error": self.stats.best_val_error, "best_epoch": self.stats.best_epoch,
+            "stats": asdict(self.stats),
+        }
+        path = f"{self.output_dir}/results/{self._file_prefix()}.json"
+        with open(path, "w") as fh:
+            json.dump(record, fh)
+        print(f"Results -> {path}")
+
+    # -------------------- naming / viz --------------------
+    def _file_prefix(self) -> str:
+        if self.loss_type == "pls" and self.precond_kind == "monolithic":
+            L, _, _, _ = self.mg_settings
+            nu1, nu2, cd, _ = self.uzawa_settings
+            tag = f"_mono-L{L}-u{nu1}{nu2}-c{cd}-w{self.schur_omega:g}"
+            if self.pls_form != "applied":
+                tag += f"-{self.pls_form}"
+        elif self.loss_type == "pls":
+            L, pre, post, _ = self.mg_settings
+            tag = f"_mg-L{L}-s{pre}{post}-w{self.schur_omega:g}"
+            if self.precond_strength < 1.0:
+                tag += f"-t{self.precond_strength:g}"
+            if self.pls_form != "weighted":
+                tag += f"-{self.pls_form}"
+        else:
+            tag = ""
+        nx, _ = self.grid_size
+        return (f"fno_stokes_{self.loss_type}{tag}_mu{self.mu:g}_gr{nx}_K{self.K}_"
+                f"samples-{len(self.train_dataset)}-{len(self.val_dataset)}-{len(self.test_dataset)}")
+
+    @torch.no_grad()
+    def _predict_eval(self, f_grid: torch.Tensor):
+        """``_predict`` in eval mode — the single prediction path handed to ``viz``."""
+        self.model.eval()
+        return self._predict(f_grid)
+
+    def visualize_sample(self, dataset, split: str, sample_idx: int = 0):
+        suffix = "" if sample_idx == 0 else f"_sample{sample_idx}"
+        viz.visualize_stokes_sample(
+            self._predict_eval, dataset, self.problem, self.device, sample_idx=sample_idx,
+            save_path=f"{self.output_dir}/visualization/{self._file_prefix()}_{split}{suffix}.png")
+
+    def compute_error_distribution(self):
+        return viz.compute_stokes_error_distribution(
+            self._predict_eval, self.test_dataset, self.problem, self.device,
+            save_path=f"{self.output_dir}/error/{self._file_prefix()}_error_dist.png")
+
+    def _after_train_viz(self):
+        self.visualize_sample(self.test_dataset, "test", 0)
+        self.compute_error_distribution()

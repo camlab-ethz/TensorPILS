@@ -14,7 +14,8 @@ import torch
 
 __all__ = ["plot_loss_curve", "visualize_sample", "compute_error_distribution",
            "visualize_rollout_sample", "compute_rollout_error_distribution",
-           "visualize_data_trajectory"]
+           "visualize_data_trajectory",
+           "visualize_stokes_sample", "compute_stokes_error_distribution"]
 
 
 def plot_loss_curve(stats, loss_type: str, K: int, save_path: str):
@@ -295,3 +296,122 @@ def visualize_data_trajectory(dataset, sample_idx: int = 0, n_frames: int = 5,
     fig.savefig(save_path, dpi=150, bbox_inches="tight"); plt.close(fig)
     print(f"Data trajectory -> {save_path}")
     return save_path
+
+
+# ------------------------------- Stokes -------------------------------
+
+@torch.no_grad()
+def visualize_stokes_sample(predict, dataset, problem, device, sample_idx: int = 0,
+                            save_path: str = "stokes_sample.png"):
+    """Two-row panel: speed |u| and pressure — reference, prediction, and error.
+
+    ``predict(f_grid) -> (u_node, p_node)`` is the Trainer's own prediction path (input
+    scaling, pressure scaling, BC and gauge projections). It is passed in rather than
+    reconstructed here: a second copy of that pipeline silently drifts out of sync — an
+    earlier version of this file did exactly that and reported 4102 % where the trainer
+    measured 7.7 %.
+
+    Velocity and pressure live on different grids (fine Q2 vs. the Q1 corner subgrid), so
+    each row carries its own colour scale and its own relative FE ``L2`` error.
+    """
+    f_grid, _, u_true, p_true = dataset[sample_idx]
+    u_pred, p_pred = predict(f_grid.unsqueeze(0).to(device))
+    u_pred, p_pred = u_pred[0].cpu(), p_pred[0].cpu()
+
+    err_u = (problem.velocity_l2((u_pred - u_true).unsqueeze(0))
+             / problem.velocity_l2(u_true.unsqueeze(0)).clamp_min(1e-30)).item()
+    err_p = (problem.pressure_l2((p_pred - p_true).unsqueeze(0))
+             / problem.pressure_l2(p_true.unsqueeze(0)).clamp_min(1e-30)).item()
+
+    ug_t, pg_t = problem.to_grid(u_true.unsqueeze(0), p_true.unsqueeze(0))
+    ug_p, pg_p = problem.to_grid(u_pred.unsqueeze(0), p_pred.unsqueeze(0))
+    speed_t = ug_t[0].pow(2).sum(0).sqrt().numpy()
+    speed_p = ug_p[0].pow(2).sum(0).sqrt().numpy()
+    pre_t, pre_p = pg_t[0].numpy(), pg_p[0].numpy()
+    fx, fy = f_grid[0].numpy(), f_grid[1].numpy()
+
+    fig, axes = plt.subplots(3, 3, figsize=(13.5, 11.5))
+
+    def _panel(ax, data, title, **kw):
+        im = ax.imshow(data, origin="lower", extent=[0, 1, 0, 1], **kw)
+        ax.set_title(title, fontsize=10)
+        ax.set_xticks([]); ax.set_yticks([])
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.03)
+
+    # --- row 0: the INPUT (body force) + the reference flow it produces ---------
+    fv = float(np.abs(np.stack([fx, fy])).max())
+    _panel(axes[0, 0], fx, r"INPUT: body force $f_x$", cmap="RdBu_r", vmin=-fv, vmax=fv)
+    _panel(axes[0, 1], fy, r"INPUT: body force $f_y$", cmap="RdBu_r", vmin=-fv, vmax=fv)
+    ax = axes[0, 2]
+    ax.imshow(speed_t, origin="lower", extent=[0, 1, 0, 1], cmap="Blues")
+    ny, nx = speed_t.shape
+    step = max(1, nx // 16)
+    xs = np.linspace(0, 1, nx)[::step]
+    ys = np.linspace(0, 1, ny)[::step]
+    ax.quiver(*np.meshgrid(xs, ys),
+              ug_t[0, 0].numpy()[::step, ::step], ug_t[0, 1].numpy()[::step, ::step],
+              color="#1b2a3a", scale_units="width", scale=None, width=0.005)
+    ax.set_title("reference flow $u$ (quiver)", fontsize=10)
+    ax.set_xticks([]); ax.set_yticks([])
+
+    # --- rows 1-2: ground truth / prediction / error, per field ----------------
+    rows = [("$|u|$", speed_t, speed_p, err_u), ("$p$", pre_t, pre_p, err_p)]
+    for i, (name, ref, pred, rel) in enumerate(rows, start=1):
+        vmin, vmax = float(min(ref.min(), pred.min())), float(max(ref.max(), pred.max()))
+        diff = np.abs(pred - ref)
+        _panel(axes[i, 0], ref, f"GROUND TRUTH: {name} (FEM)",
+               vmin=vmin, vmax=vmax, cmap="jet")
+        _panel(axes[i, 1], pred, f"PREDICTION: {name}", vmin=vmin, vmax=vmax, cmap="jet")
+        _panel(axes[i, 2], diff, f"|error|   rel-$L^2$ = {rel:.2%}", cmap="magma")
+
+    fig.suptitle(f"Stokes Q2/Q1 — sample #{sample_idx}   "
+                 f"velocity grid {speed_t.shape[1]}x{speed_t.shape[0]}, "
+                 f"pressure grid {pre_t.shape[1]}x{pre_t.shape[0]}", fontsize=13)
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150, bbox_inches="tight"); plt.close(fig)
+    print(f"Visualization -> {save_path}")
+
+
+@torch.no_grad()
+def compute_stokes_error_distribution(predict, dataset, problem, device,
+                                      save_path: str = "stokes_error.png",
+                                      batch_size: int = 32):
+    """Per-sample relative FE ``L2`` error for velocity and pressure; returns the medians.
+
+    ``predict`` is the Trainer's prediction path — see :func:`visualize_stokes_sample`.
+    """
+    from torch.utils.data import DataLoader
+
+    eu, ep = [], []
+    for f_grid, _, u_true, p_true in DataLoader(dataset, batch_size=batch_size):
+        u_true, p_true = u_true.to(device), p_true.to(device)
+        u_pred, p_pred = predict(f_grid.to(device))
+        eu.append((problem.velocity_l2(u_pred - u_true)
+                   / problem.velocity_l2(u_true).clamp_min(1e-30)).cpu())
+        ep.append((problem.pressure_l2(p_pred - p_true)
+                   / problem.pressure_l2(p_true).clamp_min(1e-30)).cpu())
+    eu = (torch.cat(eu) * 100).numpy()
+    ep = (torch.cat(ep) * 100).numpy()
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.2))
+    for ax, errs, name, color in [(axes[0], eu, "velocity", "#2980b9"),
+                                  (axes[1], ep, "pressure", "#c0392b")]:
+        med = float(np.median(errs))
+        ax.hist(errs, bins=min(30, max(5, len(errs) // 4)), color=color, alpha=0.75,
+                edgecolor="white")
+        ax.axvline(med, color="k", ls="--", lw=1.6, label=f"median = {med:.2f}%")
+        ax.set_xlabel(r"relative FE $L^2$ error (%)"); ax.set_ylabel("count")
+        ax.set_title(f"{name}: mean {errs.mean():.2f}%  std {errs.std():.2f}%", fontsize=10)
+        ax.legend(); ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150, bbox_inches="tight"); plt.close(fig)
+
+    med_u, med_p = float(np.median(eu)), float(np.median(ep))
+    print("\n" + "=" * 50)
+    print("Stokes test-set error distribution")
+    print(f"  n       : {len(eu)}")
+    print(f"  velocity: median {med_u:.4f}%   mean {eu.mean():.4f}%   max {eu.max():.4f}%")
+    print(f"  pressure: median {med_p:.4f}%   mean {ep.mean():.4f}%   max {ep.max():.4f}%")
+    print(f"  saved -> {save_path}")
+    print("=" * 50 + "\n")
+    return med_u, med_p
