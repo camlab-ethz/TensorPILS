@@ -49,28 +49,31 @@ ETH Zürich \\
 \maketitle
 
 \begin{abstract}
-   We present a novel approach to train neural operators physics-informed, i.e., in a self-supervised fashion, purely relying on the governing physical equations. This enables training on infinite datasets where no sample is visited twice and removes the need to produce training data in an offline phase. While previous attempts for physics-informed training at the operator level were limited to benign problems and performed considerably worse than data-driven learning, our approach matches the gold-standard of data-driven training at a similar optimization cost. Our method is based on modifying the physics-informed loss functions to include a preconditioner such as a multigrid method to drastically reduce the ill-conditioning caused by unbounded PDE operators. We derive the improved conditioning theoretically, and illustrate the potential of the method for the Poisson, Allen-Cahn, and stationary Stokes equation, where it performs virtually identical to data-driven training at a comparable computational cost.
+   We present an approach to train neural operators physics-informed, i.e., in a self-supervised fashion, purely relying on the governing physical equations. This enables training on infinite datasets where no sample is visited twice and removes the need to produce training data in an offline phase. While previous attempts for physics-informed training at the operator level were limited to benign problems and performed considerably worse than data-driven learning, our approach matches the gold-standard of data-driven training at a similar optimization cost. Our method is based on modifying the physics-informed loss functions to include a preconditioner such as a multigrid method to drastically reduce the ill-conditioning caused by unbounded PDE operators. We derive the improved conditioning theoretically, and illustrate the potential of the method for the Poisson, Allen-Cahn, and stationary Stokes equation, where it performs virtually identical to data-driven training at a comparable computational cost.
 \end{abstract}
 
 \section{Introduction}
 
 % Importance of fast solutions of PDEs. A tool for this in the age of AI: neural operators
-\paragraph{Neural Operators} Despite a century of development of numerical methods, partial differential equations (PDEs) remain expansive to solve, even more so in many-query situations, such as uncertainty quantification, optimal control, and inverse problems. The development of fast PDE solution techniques, e.g., through reduced-order/surrogate models therefore is of utmost importance. In the wake of the deep learning revolution, neural operators emerged as a powerful computational tool for surrogate modeling, drastically reducing PDE solution time in many applications. Neural operators approximate maps between infinite-dimensional spaces (operators) by a neural network, and are typically trained in a supervised fashion. They hence require a dataset that is built in an offline fashion, before they can be trained, and eventually used downstream. Data generation can constitute a substantial part of the computation and engineering effort, even more so in the context of physics foundation models that are pre-trained over an array of different PDE instances.
-
-% Physics-Informed Training: desirable but presently infeasible (prior to this work)
-\paragraph{Physics-Informed Training}
+\paragraph{Neural Operators} 
 % ---------------------------------------------------------------------------
 % PLACEHOLDER FIGURE. Numbers are made up; regenerate with the real sweep via
 %   python experiments/poisson/graphical_abstract/plot_graphical_abstract.py \
 %       --out paper/figures/graphical_abstract.pdf
 % ---------------------------------------------------------------------------
 \begin{wrapfigure}{r}{0.47\textwidth}
-\vspace{-\intextsep}
-\includegraphics[width=\linewidth]{figures/graphical_abstract.pdf}
-\caption{Adam on the plain versus the preconditioned Poisson least-squares loss,
-$N\times N$ grid. \emph{Placeholder numbers.}}
-\label{fig:graphical_abstract}
+   \vspace{-\intextsep}
+   \includegraphics[width=\linewidth]{figures/graphical_abstract.pdf}
+   \caption{Adam on the plain versus the preconditioned Poisson least-squares loss,
+   $N\times N$ grid. \emph{Placeholder numbers.}}
+   \label{fig:graphical_abstract}
 \end{wrapfigure}
+
+Despite a century of development of numerical methods, partial differential equations (PDEs) remain expensive to solve, even more so in many-query situations, such as uncertainty quantification, optimal control, and inverse problems. The development of fast PDE solution techniques, e.g., through reduced-order/surrogate models therefore is of utmost importance. In the wake of the deep learning revolution, neural operators emerged as a powerful computational tool for surrogate modeling, drastically reducing PDE solution time in many applications. Neural operators approximate maps between infinite-dimensional spaces (operators) by a neural network, and are typically trained in a supervised fashion. They hence require a dataset that is built in an offline fashion, before they can be trained, and eventually used downstream. Data generation can constitute a substantial part of the computation and engineering effort, even more so in the context of physics foundation models that are pre-trained over an array of different PDE instances.
+
+% Physics-Informed Training: desirable but presently infeasible (prior to this work)
+\paragraph{Physics-Informed Training}
+
 Whenever the governing physics in the form of PDEs are known, neural operators can---in principle---be trained in a self-supervised fashion, relying on the physics residual or variational principles as a loss function. This approach is referred to as \emph{physics-informed neural operator training}, and a natural idea present in the community since the inceptions of neural operators []. However, the success of physics-informed training of neural operators has remained limited to benign equations and learning tasks. More often than not, purely physics-informed learning fails to converge. In fact, supervised learning with its offline data-generation pipeline remains the gold standard for almost all applications. Nevertheless, physics-informed training offers unique advantages, such as the training in the infinite data-limit, where no sample is revisited, and, of course, it removes the need of an expensive dataset generation process.
 
 % We identify the culprit that has prevented physics-informed neural operator learning
@@ -79,38 +82,83 @@ In this manuscript, we show that the pathologies of physics-informed neural oper
 \begin{equation}\label{eq:derivative_operator}
    \frac{d}{dx}: C^1(0,1) \subset L^2(0,1) \to L^2(0,1), \quad u \mapsto u',
 \end{equation}
-which amplifies oscillations: $x\mapsto \sin(\omega x)$ is bounded in $L^2(0,1)$ independent of $\omega \in \mathbb R$, but its derivative $x\mapsto \omega \cos(\omega x)$ grows without bound in $L^2(0,1)$ when $\omega \to \infty$. This phenomenon is inherent in all PDE operators. In the case of Poisson's equation, and for a linear model that is the linear combination of a given basis set $\phi_1, \dots, \phi_N$, the physics-informed least-squares loss\footnote{text} on a single data point $f$ takes the form
+which amplifies oscillations: $x\mapsto \sin(\omega x)$ is bounded in $L^2(0,1)$ independent of $\omega \in \mathbb R$, but its derivative $x\mapsto \omega \cos(\omega x)$ grows without bound in $L^2(0,1)$ when $\omega \to \infty$. This phenomenon is inherent in all PDE operators. In the case of Poisson's equation, and for a linear model that is the linear combination of a given basis set $\phi_1, \dots, \phi_n$, the physics-informed least-squares loss\footnote{If the equation admits, energy formulations (variational principles) are an attractive alternative.} on a single data point $f$ takes the form
 \begin{equation}\label{eq:physics_informed_ls_loss_no_precond}
    L_{\textup{LS}}(u) = \frac12 \| Au - f \|^2, \quad A_{ij} = \int_\Omega \nabla \phi_j \nabla \phi_i\,\mathrm dx,
 \end{equation}
 where $A\in\mathbb R^{N\times N}$ is the stiffness matrix. The condition number of $A$ scales like $h^{-2}$ for standard bases, where $h$ is the characteristic mesh-size. Conditioning thus deteriorates under mesh refinement, as higher oscillating frequencies can be resolved, the same manifestation of the unbounded nature of PDE operators stressed in \ref{eq:derivative_operator}. Note tha $\nabla^2L_{\textup{LS}} = A^2$, hence the condition number governing the convergence speed of gradient descent (GD) scales like $h^{-4}$. Figure \ref{fig:graphical_abstract} illustrates that this ill-conditioning is so severe that training with first-order methods like GD and Adam becomes infeasible already for very coarse meshes, even in the benign case of a linear ansatz (no neural network at all). In the remainder of this article, we show that precisely this ill-conditioning renders physics-informed neural operator learning infeasible.
 
 \paragraph{Preconditioned Physics-Informed Training}
-To counter the ill-conditioning of the least-squares loss \eqref{eq:physics_informed_ls_loss_no_precond}, we rely on \emph{preconditioning}---precisely the tool the numerical analysis community uses to efficiently employ iterative methods in ill-conditioned settings in classical scientific computing. Abstractly, we \emph{modify the least-squares loss} to include a preconditioner $P$ 
-\begin{equation}\label{eq:preconditiones_least_squares_loss}
-   L_{\textup{PLS}}(u) = \frac12 \| P[Au - f] \|^2,
-\end{equation}
-where $P$ maps from the right-hand side space to the solution space of the PDE. We stress that this construction is agnostic to the neural operator architecture employed and adds zero overhead to the inference once training finishes as it only influences the loss function.
 
-On a conceptual level, the preconditioned loss \eqref{eq:preconditiones_least_squares_loss} changes the norm in which the error is measured. For any given $P$ we can recast the 
+To counter the ill-conditioning of the least-squares loss \eqref{eq:physics_informed_ls_loss_no_precond}, we rely on \emph{preconditioning}---precisely the tool the numerical analysis community uses to efficiently employ iterative methods in ill-conditioned settings in classical scientific computing. Abstractly, we \emph{modify the least-squares loss} to include an invertible preconditioner $P$ and a positive definite and symmetric weighting matrix $B$
+\begin{equation}\label{eq:preconditiones_least_squares_loss}
+   L_{\textup{PLS}}(u) = \frac12 \| P[Au - f] \|_B^2,
+\end{equation}
+We stress that this construction is agnostic to the neural operator architecture employed and adds zero overhead to the inference once training finishes as it only influences the loss function. On a conceptual level, the preconditioned loss \eqref{eq:preconditiones_least_squares_loss} changes the norm in which the error is measured. For any given $P$ we can recast the 
 \begin{equation*}
    L_{\textup{PLS}}(u) 
    =
-   \frac12 \| P[Au - f] \|^2 
+   \frac12 \| P[Au - f] \|_B^2 
    =
-   e^\top(A^\top P^\top P A)e
+   \frac12(PAe, PAe)_B
 \end{equation*}
-with the error $e=u - A^{-1}f$. This means a choice of $P$ entails a norm in which $e$ is measured, namely $A^\top P^\top P A$. The choice $P=A^{-1}$ recovers data-driven training and reduces the condition number of $\nabla^2L_{\textup{PLS}}$ to unity. In practice, is realized through fast approximate inverses $P\approx A^{-1}$, e.g., via multigrid methods []. Note that $P\approx A^{-1}$ is not the only choice; for saddle point problems, we alternatively employ block-diagonal preconditioners, Section \ref{} for details. Additionally, whenever applicable, we investigate energy formulations.
+with the error $e=u - A^{-1}f$. This means $P$ maps $Ae$ into a different space and thereby improves conditioning, and $B$ measures the error in this space in an appropriate manner. The choice $P=A^{-1}$ and $B=I$\footnote{Or alternatively, $B=M$, where $M$ is the mass matrix.} recovers data-driven training and reduces the condition number of $\nabla^2L_{\textup{PLS}}$ to unity. In practice, this is realized through fast approximate inverses $P\approx A^{-1}$, e.g., via multigrid methods []. Note that $P\approx A^{-1}$ is not the only choice; for saddle point problems, we alternatively employ block-diagonal preconditioners. Additionally, whenever applicable, we investigate energy formulations, as these are naturally less ill-conditioned.
 
-\paragraph{Main Contributions} The main contributions are
+\subsection{Main Contributions} The main contributions are
 \begin{itemize}
    \item \textbf{Efficient physics-informed neural operator training.} We demonstrate that preconditioned physics-informed neural operator training allows data-free training of neural operators at comparable cost and accuracy of the gold standard of data-driven training. Our approach vastly outperforms previous approaches and is demonstrated for the Poisson, Allen-Cahn, and Stokes equation.
    \item \textbf{Flexibility and inference speed.} Our method can be combined with any neural operator architecture and once trained, adds no additional cost to the inference.
    \item \textbf{Training at infinite data limit.} Physics-informed training allows to practically approximate the infinite data limit, where no sample is visited twice. We demonstrate empirically that this is a favorable training paradigm for neural operators.
 \end{itemize}
 
-\paragraph{Related Literature}
-Leave empty for now.
+\subsection{Related Literature}
+\begin{itemize}
+    \item Discussion of physics-informed training in general, in particular for PINNs and NQS.
+    \item Paper of Wolfgang and Markus on preconditioning.
+    \item OG paper on physics-informed neural operators.
+    \item Papers on suboptimal fixes for physics-informed neural operator training.
+\end{itemize}
+
+\section{Physics-Informed Training of Neural Operators}
+
+Our goal is to approximate an operator $\mathcal G:\mathcal F \to \mathcal U$ between function spaces $\mathcal U$ and $\mathcal F$. We aim to approximate $\mathcal G$ by a neural network $\mathcal G \approx \mathcal G_\theta$. Neural operators are a special class of neural networks well-suited to the infinite-dimensional nature of the function spaces appearing in PDE applications. However, the concrete neural network structure of $\mathcal G_\theta$ is secondary for our proposed training methodology. A simple but crucial observation we make, is that we can always write the neural operator output in the \emph{interpolated form} %I want this representation to get a name
+\begin{equation}\label{eq:neural_operator_interpolated_form}
+   \mathcal G_\theta(f) = \sum_{i=1}^n \mathbf{u}(\theta, f)_i \phi_i,
+\end{equation}
+where $\mathbf u(\theta, f)\in\mathbb R^n$ are coefficients depending on the trainable weights and the functional input $f$. The functions $\phi_1, \dots,\phi_n$ are a fixed basis and span a finite-dimensional function space $\mathcal U_h$, where $h$ denotes a characteristic mesh-size\footnote{Or more general, a quantification of how ``fine'' the space $\mathcal U_h$ is.}. Typical choices are finite element spaces, like piecewise polynomial spaces on a triangulated computational domain. It is crucial to stress that $\phi_1,\dots, \phi_n$, and thus $\mathcal U_h$ is a modeling choice, and a standard neural operator architecture will not automatically map into $\mathcal U_h$. However, we can always interpolate into $\mathcal U_h$. This is a typically sparse, non-trainable operation that adds negligible computational overhead and we will from now on assume that our neural operator is the form described in \eqref{eq:neural_operator_interpolated_form}.
+
+\subsection{Physics-Informed Loss Functions}
+For simplicity of exposition, we will work in the setting of linear PDEs that can be formulated in terms of bilinear forms, and we will restrict the discussion to learning the solution operator of such PDEs, although our experimental evaluation is broader. The operator learning problem is to find $u\in\mathcal U$ such that for given $f\in\mathcal F$ it holds
+\begin{equation}\label{eq:weak_formulation}
+   a(u,v) = f(v), \quad \text{for all }v\in\mathcal U.
+\end{equation}
+Here, $a$ is a bounded and symmetric bilinear form on $\mathcal U$, and the setting implies $\mathcal F=\mathcal U^*$. We assume all spaces to be Hilbert spaces. The solution operator is $\mathcal G:f\mapsto u$, where $u$ solves \eqref{eq:weak_formulation}. The weak equation can be written as a matrix equation, once $u$ is approximated in $\mathcal U_h$, and takes the form
+\begin{equation*}
+   A\mathbf u = \mathbf f, \quad \text{with }A_{ij} = a(\phi_j, \phi_i), \quad \mathbf f_i=f(\phi_i).
+\end{equation*}
+From this equation, we derive the single sample physics-informed loss function
+\begin{equation}\label{eq:LS_loss_in_theta}
+   L_{\textup{LS}}(\theta) = \frac12 \| A \mathbf u(\theta, f) - \mathbf f \|^2.
+\end{equation}
+For analysis purposes, we will frequently ignore that nonlinear parametrization $\mathbf u(\theta, f)$ and work in the Euclidean space of $\mathbf u\in\mathbb R^n$ directly. We indicate this by writing $L_{\textup{LS}}(u) = \frac 12 \| A\mathbf u - \mathbf f \|^2$ with the understanding that everything is in the variable $\mathbf u$.
+% \begin{equation}\label{eq:LS_loss_in_u}
+%    L_{\textup{LS}}(u) = \frac 12 \| A\mathbf u - \mathbf f \|^2
+% \end{equation}
+If $a$ is coercive and symmetric an energy formulation is an attractive alternative to \eqref{eq:weak_formulation}. In this case, we can find the solution $u$ via a variational principle as the minimizer of the energy $\tfrac12 a(v,v)-f(v)$, or in terms of the neural operator
+\begin{equation}
+   L_{\textup{Var}}(\theta)= \frac12 \mathbf u(\theta, f)^\top A \mathbf u(\theta, f) - \mathbf f^\top \mathbf u(\theta, f)
+\end{equation}
+and we can directly utilize $L_{\textup{Var}}$ to train the neural operator.
+
+\subsection{Preconditioning}
+
+\section{Numerical Results}
+
+\subsection{Poisson Equation}
+
+\subsection{Allen-Cahn Equation}
+
+\subsection{Stokes Equation}
 
 \subsection{Style}
 

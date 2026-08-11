@@ -1,14 +1,14 @@
 # Fdb version 4
-["bibtex iclr2027_conference"] 1786396880.26075 "iclr2027_conference.aux" "iclr2027_conference.bbl" "iclr2027_conference" 1786396880.97199 0
+["bibtex iclr2027_conference"] 1786460808.22814 "iclr2027_conference.aux" "iclr2027_conference.bbl" "iclr2027_conference" 1786460808.96897 0
   "./iclr2027_conference.bib" 1786391784.15687 629 874ad2cd193ec8e65abcd05eea606aaf ""
   "./iclr2027_conference.bst" 1786391784.14596 26973 af983813ca1a1414954dbceae7baa2a1 ""
-  "iclr2027_conference.aux" 1786396880.77214 4544 4532cf89b1e31abf7db82e5bcdc7b1cc "pdflatex"
+  "iclr2027_conference.aux" 1786460808.75889 5772 cc26bcaeedf25de2640d34636949ca5d "pdflatex"
   (generated)
   "iclr2027_conference.bbl"
   "iclr2027_conference.blg"
   (rewritten before read)
-["pdflatex"] 1786396880.34222 "/Users/mzeinhofer/Documents/TensorPILS/paper/iclr2027_conference.tex" "iclr2027_conference.pdf" "iclr2027_conference" 1786396880.97211 0
-  "/Users/mzeinhofer/Documents/TensorPILS/paper/iclr2027_conference.tex" 1786396879.42099 27543 e66f16cfa4871a6b9161b33eeb5f88e0 ""
+["pdflatex"] 1786460808.31245 "/Users/mzeinhofer/Documents/TensorPILS/paper/iclr2027_conference.tex" "iclr2027_conference.pdf" "iclr2027_conference" 1786460808.96911 0
+  "/Users/mzeinhofer/Documents/TensorPILS/paper/iclr2027_conference.tex" 1786460807.35614 32317 cba03d3779da4a17e44e62a69eada455 ""
   "/usr/local/texlive/2024/texmf-dist/fonts/enc/dvips/base/8r.enc" 1165713224 4850 80dc9bab7f31fb78a000ccfed0e27cab ""
   "/usr/local/texlive/2024/texmf-dist/fonts/map/fontname/texfonts.map" 1577235249 3524 cb3e574dea2d1052e39280babc910dc8 ""
   "/usr/local/texlive/2024/texmf-dist/fonts/tfm/adobe/courier/pcrr7t.tfm" 1136768653 960 379cc0019370a9e0208a0a3f949f847a ""
@@ -31,12 +31,16 @@
   "/usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmbx10.pfb" 1248133631 34811 78b52f49e893bcba91bd7581cdc144c0 ""
   "/usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmex10.pfb" 1248133631 30251 6afa5cb1d0204815a708a080681d4674 ""
   "/usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi10.pfb" 1248133631 36299 5f9df58c2139e7edcf37c8fca4bd384d ""
+  "/usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi6.pfb" 1248133631 37166 8ab3487cbe3ab49ebce74c29ea2418db ""
   "/usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi7.pfb" 1248133631 36281 c355509802a035cadc5f15869451dcee ""
+  "/usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi9.pfb" 1248133631 36094 798f80770b3b148ceedd006d487db67c ""
   "/usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmmib10.pfb" 1248133631 36912 b448ef9ad9d7228ec3c6e71005136d55 ""
   "/usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmr10.pfb" 1248133631 35752 024fb6c41858982481f6968b5fc26508 ""
   "/usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmr7.pfb" 1248133631 32762 224316ccc9ad3ca0423a14971cfa7fc1 ""
+  "/usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmr9.pfb" 1248133631 33993 9b89b85fd2d9df0482bd47194d1d3bf3 ""
   "/usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy10.pfb" 1248133631 32569 5e5ddc8df908dea60932f3c484a54c0d ""
   "/usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy7.pfb" 1248133631 32716 08e384dc442464e7285e891af9f45947 ""
+  "/usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy9.pfb" 1248133631 32442 c975af247b6702f7ca0c299af3616b80 ""
   "/usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cmextra/cmmib7.pfb" 1248133631 39386 0bb525d495ceab21fe797301a586e0d7 ""
   "/usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/symbols/msbm10.pfb" 1248133631 34694 ad62b13721ee8eda1dcc8993c8bd7041 ""
   "/usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/symbols/msbm7.pfb" 1248133631 35309 940e81a5b9e04201a07e8b33a3ae6e64 ""
@@ -148,11 +152,11 @@
   "/usr/local/texlive/texmf-local/tex/latex/natbib/natbib.cfg" 1298446948 151 c0ca3a82952c9513b9591680d6ddc693 ""
   "fancyhdr.sty" 1786391784.1486 20521 e5d13d98d57bd53d4fed3aa61bd29c86 ""
   "figures/graphical_abstract.pdf" 1786394664.63231 23229 932da6c76501a2014fd14808e6330f5c ""
-  "iclr2027_conference.aux" 1786396880.77214 4544 4532cf89b1e31abf7db82e5bcdc7b1cc "pdflatex"
-  "iclr2027_conference.bbl" 1786396880.34005 970 1b03d7547929c529b7d0b6f2b13bbd7f "bibtex iclr2027_conference"
-  "iclr2027_conference.out" 1786396880.77276 2511 59bc4e9469777eea9116d48e7afabf7c "pdflatex"
+  "iclr2027_conference.aux" 1786460808.75889 5772 cc26bcaeedf25de2640d34636949ca5d "pdflatex"
+  "iclr2027_conference.bbl" 1786460808.31032 970 1b03d7547929c529b7d0b6f2b13bbd7f "bibtex iclr2027_conference"
+  "iclr2027_conference.out" 1786460808.75962 4011 b585f0ece56d3f9675251fa3cb79df19 "pdflatex"
   "iclr2027_conference.sty" 1786391784.13826 9025 1b4bb9c2e12c712c56f4eb1232b88dd6 ""
-  "iclr2027_conference.tex" 1786396879.42099 27543 e66f16cfa4871a6b9161b33eeb5f88e0 ""
+  "iclr2027_conference.tex" 1786460807.35614 32317 cba03d3779da4a17e44e62a69eada455 ""
   "math_commands.tex" 1786391784.15151 12284 a71653715108dc62b66e3a0bde0307d8 ""
   "natbib.sty" 1786391784.14119 45154 40088ce024445d7ee2bca59e704cdd01 ""
   (generated)
