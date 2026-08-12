@@ -697,7 +697,10 @@ class RolloutTrainer(BaseTrainer):
         self.stats.val_rel_l2_steps.append(rel_l2_steps)
         self.stats.val_st_rel_l2.append(st_rel_l2)
         self.stats.val_final_rel_l2.append(rel_l2_steps[-1])
-        return mse                                                       # best-model selection stays on MSE
+        # Model selection AND the per-epoch `val_errors` series track the space-time relative
+        # FEM-L2 (the reported, scale-independent metric), not the scale-dependent rollout MSE.
+        # (mse is still computed in the same pass but no longer drives checkpointing.)
+        return st_rel_l2
 
     def test(self):
         return self._eval_full(self.test_loader)[0]
@@ -711,9 +714,9 @@ class RolloutTrainer(BaseTrainer):
         return result
 
     def _save_results_json(self) -> None:
-        """Dump stats + config to ``results/{prefix}.json`` for cross-run aggregation. Metric is
-        the rollout MSE (mean over batch, rollout steps, and grid) recorded per epoch in
-        ``stats.val_errors``."""
+        """Dump stats + config to ``results/{prefix}.json`` for cross-run aggregation. The per-epoch
+        validation metric (``stats.val_errors``, and the selection metric ``best_val_st_rel_l2``) is
+        the space-time relative FEM-L2; ``stats.train_losses`` is the optimization-health signal."""
         import json
         from dataclasses import asdict
         test_mse, test_rel_l2_steps, test_st_rel_l2 = self._eval_full(self.test_loader)
@@ -729,7 +732,7 @@ class RolloutTrainer(BaseTrainer):
             "a": getattr(self, "a", None), "eps": getattr(self, "eps", None),
             "dt": self.dt, "n_steps": self.n_steps, "rollout_steps": self.rollout_steps,
             "K": self.K, "n_train": len(self.train_dataset), "epochs": self.epochs,
-            "best_val_mse": self.stats.best_val_error, "best_epoch": self.stats.best_epoch,
+            "best_val_st_rel_l2": self.stats.best_val_error, "best_epoch": self.stats.best_epoch,
             # test-set (best model): rollout MSE + FEM-L2 space-time / final / per-step series
             "test_mse": test_mse,
             "test_st_rel_l2": test_st_rel_l2,

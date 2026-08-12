@@ -1,0 +1,169 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage[hidelinks]{hyperref}
+
+% Figures live in the git-ignored output tree, referenced relative to this file.
+\graphicspath{{../../output/}}
+
+\newcommand{\Ainv}{A^{-1}}
+
+\title{Paper story: experiments}
+%\author{Marius }
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\noindent This is a progress report: the story of the paper told through the figures we have
+produced so far. It is organised by PDE --- steady-state Poisson first, then the time-dependent
+Allen--Cahn stepper --- and closes with what comes next (Stokes). \textbf{I am sorry for the language, but making Claude make this is so much faster.}
+
+\section{Poisson}
+
+\subsection{Least-squares loss and spectral preconditioning}
+
+\begin{itemize}
+  \item Physics-informed neural operators often \textbf{do not train}, and the culprit is
+        \emph{spectral ill-conditioning} inherited from the unbounded PDE operator: the loss
+        landscape is a long, narrow valley that first-order optimisers cannot descend.
+  \item To demonstrate this cleanly we use the \textbf{least-squares residual loss} based on the stiffness matrix $A$ on a $Q1$ finite element space. We insert a
+        parametrised preconditioner $P_t$,
+        \begin{equation*}
+          \mathcal{L}(\theta) \;=\; \tfrac12\,\big\| P_t\,(A\,u_\theta - b) \big\|_2^2,
+          \qquad
+          P_t \;=\; (1-t)\,I \;+\; t\,\Ainv,
+        \end{equation*}
+        so $P_0 = I$ (no preconditioning) and $P_1 = \Ainv$ (full preconditioning), with a convex
+        interpolation in between. The interpolation is made tractable either through the discrete
+        sine transform (exact on the regular grid) or a dense eigenvalue solve.
+  \item The sweep over $t$ (Figure~\ref{fig:pls-overlay}) shows the two extremes: \textbf{without}
+        preconditioning ($t=0$) training \textbf{stalls}; with \textbf{full} preconditioning
+        ($t=1$) we \textbf{recover the gold standard of data-driven training}. The reason is the
+        squaring: the least-squares Hessian conditioning scales like $h^{-4}$ --- already
+        $\approx 6.5\times 10^{5}$ on a $64^2$ grid, which is horrible.
+  \item In practice $\Ainv$ is never formed; a \textbf{multigrid} V-cycle supplies $P\approx\Ainv$
+        at \emph{optimal complexity}. The multigrid-preconditioned run matches data-driven training
+        (rightmost curve in Figure~\ref{fig:pls-overlay}). The whole story is summarised by plotting
+        the final validation error \emph{against the condition number} (Figure~\ref{fig:pls-collapse}):
+        the runs collapse onto a single monotone curve, error rising with conditioning.
+\end{itemize}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.92\linewidth]{poisson/sweep_blend/pls/sweep_overlay.png}
+  \caption{Poisson, least-squares loss. Validation error vs.\ epoch as the preconditioner strength
+  $t$ is swept from $0$ (identity) to $1$ ($\Ainv$), plus the multigrid V-cycle and the data-driven
+  reference. Unpreconditioned training stalls; full / multigrid preconditioning recovers the
+  data-driven gold standard.}
+  \label{fig:pls-overlay}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.80\linewidth]{poisson/sweep_blend/pls/sweep_collapse.png}
+  \caption{The same runs, final validation error against the condition number of the preconditioned
+  operator. Error grows monotonically with conditioning --- the mechanism, made explicit.}
+  \label{fig:pls-collapse}
+\end{figure}
+
+\subsection{Deep Ritz: the variational formulation is milder}
+
+The story changes for the \textbf{variational (Deep Ritz) formulation}: its conditioning scales
+like $h^{-2}$ rather than $h^{-4}$. This is mild enough that on a $64^2$ grid training
+\textbf{succeeds without any preconditioning} (Figure~\ref{fig:deepritz-overlay}). Preconditioning
+can still be added and yields a small further speed-up --- it reduces the conditioning from
+$\approx 800$ down to $1$. (On finer grids the $h^{-2}$ growth does become a real problem; there is
+a figure for that, but it is not important enough to include here.)
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.92\linewidth]{poisson/sweep_blend/deepritz/sweep_overlay.png}
+  \caption{Poisson, Deep Ritz (variational) loss. Because the conditioning is only $h^{-2}$,
+  training already succeeds unpreconditioned on $64^2$; preconditioning gives a modest speed-up.}
+  \label{fig:deepritz-overlay}
+\end{figure}
+
+\subsection{The infinite-data limit}
+
+Because we generate \textbf{no labelled data}, we are not bound to a fixed dataset. For
+Figure~\ref{fig:data-scaling} we fix the optimisation budget (500 epochs' worth of forward passes
+at a dataset of 1024) and grow the training-set size from $32$ up to $4096$. Crucially, we also add
+the \textbf{infinite dataset} --- one that never revisits a sample --- as the dashed black line.
+
+This is a genuine selling point of physics-informed operator learning: you want to maximise what
+you extract from your samples, and \emph{never revisiting a sample is an option}. We believe one can
+show theoretically that this \textbf{eliminates one of the classical errors} in the statistical-
+learning error decomposition --- the estimation error tied to the finiteness of the dataset.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.80\linewidth]{poisson/data_scaling/scaling_test_rl2.png}
+  \caption{Test relative $L^2$ vs.\ training-set size at a fixed optimisation budget. Error decreases
+  with dataset size and saturates at the infinite-data (streaming, never-revisit) limit, the dashed
+  black line.}
+  \label{fig:data-scaling}
+\end{figure}
+
+\section{Allen--Cahn}
+
+We now move to the time-dependent setting: an FNO trained as a one-step Allen--Cahn integrator and
+rolled out autoregressively.
+
+\paragraph{Opening question --- backprop through time.} Do we know the best way to handle
+backpropagation through the unrolled rollout? Here we \textbf{detached the inputs and never
+backpropagated through the unrolled operator} --- the \emph{pushforward trick} (Brandstetter et
+al.). It performed best across all losses in our tests, and it is cheaper. This deserves discussion,
+but it is our current default.
+
+\paragraph{Setup.} We train on a \textbf{10-step} rollout, $128^2$ grid, $\mathrm{dt}=0.01$, and
+reaction strength $\varepsilon = 32$ --- note $\varepsilon$ enters the equation \emph{squared}, and
+here it is large, not small. Data generation now defaults to a \textbf{convex--concave (Eyre)
+splitting} on the $128^2$ grid at this time step, and we train the FNO in exactly the same setting.
+From that splitting we derive two physics-informed losses: the natural \textbf{minimizing-movement}
+objective, and its \textbf{least-squares} variant. We abandoned the implicit-Euler scheme. Finally
+we benchmark against \textbf{data-driven} training. The least-squares variant is preconditioned with
+multigrid again --- the problem is nonlinear, but we hand-wave the Jacobian into a constant operator
+so multigrid applies.
+
+\paragraph{Findings.}
+\begin{itemize}
+  \item Physics-informed \textbf{least squares without preconditioning fails} (those curves are not
+        in the figure yet).
+  \item The \textbf{other three all work quite well} (Figure~\ref{fig:ac-rollout}). Minimizing
+        movement appears to have an edge, though that may be down to learning-rate details.
+  \item \textbf{Rollouts stay stable out to 100 steps} even though the models were trained on only
+        10 steps --- which is quite nice.
+\end{itemize}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth]{allen_cahn/realistic_ac/rollout_error.png}
+  \caption{Allen--Cahn, relative $L^2$ vs.\ the convex--concave reference along the rollout (solid =
+  test, dashed = train), one colour per training loss. Trained on 10 steps, rolled out to 100; the
+  error stays controlled well past the training horizon.}
+  \label{fig:ac-rollout}
+\end{figure}
+
+For a qualitative feel, Figure~\ref{fig:ac-heatmap} shows the 2D fields: rows are rollout timesteps,
+columns are the reference next to each learned stepper.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.5\linewidth]{allen_cahn/realistic_ac/heatmaps/heatmap_test_sample0.png}
+  \caption{Allen--Cahn rollout fields for one test sample: rows are timesteps, columns are the
+  convex--concave reference and each trained model, annotated with the per-panel relative $L^2$.}
+  \label{fig:ac-heatmap}
+\end{figure}
+
+\section{Future plans}
+
+\paragraph{Stokes.} First results using a \textbf{block-diagonal preconditioner} are promising. We
+expect this to land next week.
+
+\paragraph{Fine-tune Poseidon} We can finetune Poseidon physics informed for some PDEs, certainly the Poisson.
+
+\end{document}

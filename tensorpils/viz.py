@@ -19,18 +19,25 @@ __all__ = ["plot_loss_curve", "visualize_sample", "compute_error_distribution",
 
 
 def plot_loss_curve(stats, loss_type: str, K: int, save_path: str):
-    """Three-panel figure: training loss, validation MSE, and validation FEM-L2."""
+    """Training-diagnostics figure. Panel 0 is always the training loss (optimization health).
+    For the rollout trainers (Allen–Cahn / Wave) the validation panels are the space-time and
+    final-time relative FEM-L2 (the reported, scale-independent metric that also drives model
+    selection); for the static Poisson trainer they stay MSE + FEM-L2 + relative FEM-L2."""
+    is_rollout = bool(getattr(stats, "val_st_rel_l2", []))
     has_l2 = bool(getattr(stats, "val_l2_errors", []))
     has_rel_l2 = bool(getattr(stats, "val_rel_l2_errors", []))
-    n_panels = 2 + has_l2 + has_rel_l2
+    n_panels = 3 if is_rollout else 2 + has_l2 + has_rel_l2
     fig, axes = plt.subplots(n_panels, 1, figsize=(10, 4 * n_panels))
     epochs = range(len(stats.train_losses))
 
+    # Panel 0 — training loss. A variational-energy loss (minimizing-movement, Deep Ritz) can go
+    # non-positive, which log-scale cannot render; fall back to symlog whenever any value ≤ 0.
     axes[0].plot(epochs, stats.train_losses, label="Train Loss", linewidth=2)
     axes[0].axvline(stats.best_epoch, color="r", linestyle="--",
                     label=f"best epoch ({stats.best_epoch})")
-    if loss_type == "deepritz":
-        min_abs = min((abs(v) for v in stats.train_losses if v != 0), default=1e-6)
+    tl = stats.train_losses
+    if tl and min(tl) <= 0:
+        min_abs = min((abs(v) for v in tl if v != 0), default=1e-6)
         axes[0].set_yscale("symlog", linthresh=max(min_abs * 0.1, 1e-6))
     else:
         axes[0].set_yscale("log")
@@ -38,32 +45,52 @@ def plot_loss_curve(stats, loss_type: str, K: int, save_path: str):
     axes[0].set_title(f"FNO Training Loss ({loss_type}, K={K})")
     axes[0].legend(); axes[0].grid(alpha=0.4)
 
-    axes[1].plot(epochs, stats.val_errors, label="Val MSE", linewidth=2, color="orange")
-    axes[1].axvline(stats.best_epoch, color="r", linestyle="--")
-    axes[1].axhline(stats.best_val_error, color="g", linestyle=":",
-                    label=f"best val={stats.best_val_error:.2e}")
-    axes[1].set_yscale("log")
-    axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("MSE")
-    axes[1].set_title("Validation MSE")
-    axes[1].legend(); axes[1].grid(alpha=0.4)
+    if is_rollout:
+        # Panel 1 — validation space-time relative L2 (the selection metric = best_val_error).
+        pct = [v * 100 for v in stats.val_st_rel_l2]
+        axes[1].plot(epochs, pct, label="Val rel-L2 space-time (%)", linewidth=2, color="teal")
+        axes[1].axvline(stats.best_epoch, color="r", linestyle="--")
+        axes[1].axhline(stats.best_val_error * 100, color="g", linestyle=":",
+                        label=f"best={stats.best_val_error * 100:.2f}%")
+        axes[1].set_yscale("log")
+        axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("rel-L2 (%)")
+        axes[1].set_title("Validation relative L2 — space-time  (√ΣΣ‖ê−u‖²_M / ΣΣ‖u‖²_M)")
+        axes[1].legend(); axes[1].grid(alpha=0.4)
+        # Panel 2 — validation final-rollout-step relative L2.
+        pctf = [v * 100 for v in stats.val_final_rel_l2]
+        axes[2].plot(epochs, pctf, label="Val rel-L2 final step (%)", linewidth=2, color="darkorange")
+        axes[2].axvline(stats.best_epoch, color="r", linestyle="--")
+        axes[2].set_yscale("log")
+        axes[2].set_xlabel("Epoch"); axes[2].set_ylabel("rel-L2 (%)")
+        axes[2].set_title("Validation relative L2 — final rollout step")
+        axes[2].legend(); axes[2].grid(alpha=0.4)
+    else:
+        axes[1].plot(epochs, stats.val_errors, label="Val MSE", linewidth=2, color="orange")
+        axes[1].axvline(stats.best_epoch, color="r", linestyle="--")
+        axes[1].axhline(stats.best_val_error, color="g", linestyle=":",
+                        label=f"best val={stats.best_val_error:.2e}")
+        axes[1].set_yscale("log")
+        axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("MSE")
+        axes[1].set_title("Validation MSE")
+        axes[1].legend(); axes[1].grid(alpha=0.4)
 
-    panel = 2
-    if has_l2:
-        axes[panel].plot(epochs, stats.val_l2_errors, label="Val FEM-L2", linewidth=2, color="purple")
-        axes[panel].axvline(stats.best_epoch, color="r", linestyle="--")
-        axes[panel].set_yscale("log")
-        axes[panel].set_xlabel("Epoch"); axes[panel].set_ylabel("FEM-L2")
-        axes[panel].set_title("Validation FEM-L2  (√eᵀMe)")
-        axes[panel].legend(); axes[panel].grid(alpha=0.4)
-        panel += 1
-    if has_rel_l2:
-        pct = [v * 100 for v in stats.val_rel_l2_errors]
-        axes[panel].plot(epochs, pct, label="Val rel-L2 (%)", linewidth=2, color="teal")
-        axes[panel].axvline(stats.best_epoch, color="r", linestyle="--")
-        axes[panel].set_yscale("log")
-        axes[panel].set_xlabel("Epoch"); axes[panel].set_ylabel("rel-L2 (%)")
-        axes[panel].set_title("Validation relative FEM-L2  (√eᵀMe / √uᵀMu)")
-        axes[panel].legend(); axes[panel].grid(alpha=0.4)
+        panel = 2
+        if has_l2:
+            axes[panel].plot(epochs, stats.val_l2_errors, label="Val FEM-L2", linewidth=2, color="purple")
+            axes[panel].axvline(stats.best_epoch, color="r", linestyle="--")
+            axes[panel].set_yscale("log")
+            axes[panel].set_xlabel("Epoch"); axes[panel].set_ylabel("FEM-L2")
+            axes[panel].set_title("Validation FEM-L2  (√eᵀMe)")
+            axes[panel].legend(); axes[panel].grid(alpha=0.4)
+            panel += 1
+        if has_rel_l2:
+            pct = [v * 100 for v in stats.val_rel_l2_errors]
+            axes[panel].plot(epochs, pct, label="Val rel-L2 (%)", linewidth=2, color="teal")
+            axes[panel].axvline(stats.best_epoch, color="r", linestyle="--")
+            axes[panel].set_yscale("log")
+            axes[panel].set_xlabel("Epoch"); axes[panel].set_ylabel("rel-L2 (%)")
+            axes[panel].set_title("Validation relative FEM-L2  (√eᵀMe / √uᵀMu)")
+            axes[panel].legend(); axes[panel].grid(alpha=0.4)
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=200, bbox_inches="tight"); plt.close()

@@ -386,9 +386,15 @@ class ACDataset(Dataset):
 
             # Random K x K coefficients in [-1, 1]; multi-frequency initial condition.
             self.l_a = (torch.rand(num_samples, K, K) * 2 - 1)
-            ic = WaveMultiFrequency(a=self.l_a, r=r)
             points = self.mesh.points                               # [N, 2], float64
-            u0 = ic.initial_condition(points).float()               # [num, N]
+            # WaveMultiFrequency.initial_condition broadcasts to [chunk, N, K, K] before summing the
+            # K^2 modes, so doing all samples at once costs num*N*K^2 (~47 GB at K=16, 128^2, 1408
+            # samples -> host OOM). Chunk over samples (reusing ref_chunk) to cap it at ref_chunk*N*K^2;
+            # the per-sample computation is independent, so the result is identical to the single call.
+            u0 = torch.cat([
+                WaveMultiFrequency(a=self.l_a[s:s + ref_chunk], r=r).initial_condition(points).float()
+                for s in range(0, num_samples, ref_chunk)
+            ], dim=0)                                               # [num, N]
             # FEM implicit-Euler + Newton reference trajectory (no analytical solution exists).
             # Run the (dense, batched) solve on the GPU when available; store results on CPU.
             solve_dev = "cuda" if torch.cuda.is_available() else "cpu"
