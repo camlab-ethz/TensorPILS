@@ -4,7 +4,7 @@
 
 TensorPILS trains neural operators (currently a Fourier Neural Operator, FNO) to
 solve PDEs with loss functions built from TensorMesh's finite-element machinery — so
-most of them need **no labelled solutions**. Three PDEs are supported, selected with
+most of them need **no labelled solutions**. Four PDEs are supported, selected with
 `--pde` (all on the unit square with homogeneous Dirichlet BC):
 
 | `--pde` | Equation | Kind | Operator |
@@ -12,6 +12,7 @@ most of them need **no labelled solutions**. Three PDEs are supported, selected 
 | `poisson` | −Δu = f | static | source → solution |
 | `wave` | uₜₜ = c²Δu | time-dependent (2nd order) | autoregressive stepper `[uⁿ⁻¹, uⁿ] → uⁿ⁺¹` |
 | `ac` | uₜ = a²Δu + ε²u(1−u²) | time-dependent, nonlinear (1st order) | autoregressive stepper `uⁿ → uⁿ⁺¹` |
+| `stokes` | −μΔu + ∇p = f, ∇·u = 0 | static, **saddle point** (mixed Q2/Q1) | `f → (u, p)` in one pass |
 
 The FEM stiffness `A`, mass `M`, the analytical fields / reference solvers, and the
 boundary handling all come from TensorMesh; TensorPILS contributes the structured-grid
@@ -41,6 +42,48 @@ training loop.
 Wave has an analytical multi-frequency solution; Allen–Cahn has **none**, so its
 reference/labels come from a FEM implicit-Euler + Newton solver assembled from TensorMesh
 (`ACProblem.fem_reference`, run at dataset-build time).
+
+**Stokes** is a *mixed* problem: a **Taylor-Hood Q2/Q1** discretisation on a structured
+`quad9` mesh gives the symmetric indefinite saddle-point system `K = [[A, Bᵀ], [B, 0]]`,
+and the FNO emits velocity and pressure together (`(u_x, u_y, p)`, pressure read on the
+Q1 corner subgrid). Reference solutions are the discrete Taylor-Hood solve of the same
+right-hand side the residual uses.
+
+| Loss | Idea | Labels? |
+|------|------|---------|
+| `data` | supervised FE-norm error against the discrete solution, each field scaled by its own magnitude | yes |
+| `galerkin` | bare least squares ½‖Kc − b‖² — **the negative control** | no |
+| `pls` | preconditioned least squares ½ rᵀ**P**r, P = diag(Â⁻¹, Ŝ⁻¹) | no |
+
+The saddle point changes what preconditioning means. `K` is indefinite, so the bare
+residual gives a Gauss–Newton matrix `JᵀK²J` with κ = O(h⁻⁴) — measured 1.9 × 10¹¹ at `65²`,
+which costs it an order of magnitude in error at a fixed budget. And no
+block-diagonal `P` approximates `K⁻¹`, so the Poisson trick of *applying* `P` (½‖P r‖²)
+would square the conditioning right back. What works is using `P` as a **norm weight**:
+½ rᵀPr has Gauss–Newton matrix `JᵀKPKJ` and conditioning O(h⁻²). Here `Â⁻¹` is a
+geometric-multigrid V-cycle on the velocity block and `Ŝ⁻¹ = ω·μ·diag(M_p)⁻¹` the lumped
+pressure-mass surrogate for the inverse Schur complement.
+
+Two knobs on top of that, both measured in
+[`experiments/stokes/`](experiments/stokes/) rather than assumed:
+
+- `--stokes_precond monolithic` builds a **monolithic** Stokes V-cycle with an inexact
+  symmetric Uzawa smoother instead. That *is* an approximate inverse, so it unlocks the
+  applied form at **O(1)** conditioning (measured κ ≈ 11 at `33²`, against 8.7·10⁶ for the
+  weighted block form) — and mesh-independently so. But conditioning alone is not enough: the
+  nodal norm `½‖Pr‖²` is ~350× pressure-dominated for this dataset, so the metric has to be
+  fixed too (`--stokes_pls_form applied_fe`, the `auto` choice, divides each field block by its
+  own FE norm). That single change moves velocity error 19.34 % → **4.33 %**, the best
+  label-free result and better than supervised training. Since `Pr ≈ c − c*`, that loss *is*
+  the supervised objective computed from the residual.
+  Conversely the weighted form is impossible with a monolithic `P`: an approximate inverse of an
+  indefinite operator is indefinite, so `½rᵀPr` is unbounded below and diverges.
+- `--stokes_precond_strength t` blends `P_t = (1−t)·αI + t·P`, so `t=0` reproduces the bare
+  loss and `t=1` the preconditioner — one knob spanning the whole conditioning axis.
+
+`--schur_omega` means opposite things in the two: as a *norm weight* it is unconstrained and
+wants ω ≈ 16 (15× better conditioning than the default 0.5), while inside the Uzawa
+*iteration* the ω ∈ (0,1] restriction is real and ω = 2 diverges.
 
 ## Install
 
@@ -165,24 +208,41 @@ tensorpils --pde wave --loss data --wave_c 1.0 -k 4            # supervised vari
 # --- Allen–Cahn (nonlinear; builds a FEM Newton reference at startup) ---
 tensorpils --pde ac --loss galerkin --ac_a 1 --ac_eps 2 --dt 1e-3 --n_steps 20 --rollout_steps 4 --epochs 300
 tensorpils --pde ac --loss data -k 4                          # supervised variant
+
+# --- Stokes (Taylor-Hood Q2/Q1 saddle point; --grid_resolution is the VELOCITY grid, odd) ---
+tensorpils --pde stokes --loss pls --grid_resolution 65 --n_train 512 --epochs 300
+tensorpils --pde stokes --loss galerkin                       # negative control (~10x slower)
+tensorpils --pde stokes --loss data                           # supervised reference
+tensorpils --pde stokes --loss pls --schur_omega 16            # the measured conditioning optimum
+tensorpils --pde stokes --loss pls --stokes_precond monolithic  # P ~ K^-1, applied form, O(1)
+tensorpils --pde stokes --loss pls --stokes_precond_strength 0.9  # blend: t=0 bare -> t=1 P
 ```
 
-Useful flags: `--pde {poisson,wave,ac}`, `--bc_mode {penalty,hard}` (Poisson
+Useful flags: `--pde {poisson,wave,ac,stokes}`, `--bc_mode {penalty,hard}` (Poisson
 `data`/`deepritz`), `--precondition` (multigrid-preconditioned Deep Ritz),
 `--grid_resolution`, `--n_modes`, `--hidden_dim`, `--num_layers`, `--optimizer`,
 `--device`, `--eval_only --checkpoint <path>`. Time-dependent PDEs add `--dt`,
 `--n_steps`, `--rollout_steps`, `--discount_factor`, `--lambda_galerkin`,
-`--lambda_data`; Allen–Cahn adds `--ac_a`, `--ac_eps`, `--ac_r`. Run
+`--lambda_data`; Allen–Cahn adds `--ac_a`, `--ac_eps`, `--ac_r`; Stokes adds
+`--stokes_mu`, `--stokes_r`, `--schur_omega`, `--stokes_precond {block,monolithic}`,
+`--stokes_pls_form {auto,weighted,applied}`, `--stokes_precond_strength`, and (monolithic)
+`--uzawa_pre/--uzawa_post/--cheb_degree/--cheb_ratio`. Run
 `tensorpils --help` for the full list.
 
 ## Example results
 
-One **label-free** training case per PDE, all on a `64×64` grid with `K=4` and the same
-FNO (`n_modes=(16,16)`, `hidden=64`, 5 layers, ~3.0 M params) on a single GPU. The FNO
+One **label-free** training case per scalar PDE, all on a `64×64` grid with `K=4` and the
+same FNO (`n_modes=(16,16)`, `hidden=64`, 5 layers, ~3.0 M params) on a single GPU. The FNO
 sees no labelled solutions during training — the reference is used only for evaluation.
 The reported error is the **median relative L² error** on the held-out test set
 (grid-space vs. the analytical/FEM reference — the same metric across every loss and PDE);
-for the time-dependent PDEs it is the error of the autoregressive rollout.
+for the time-dependent PDEs it is the error of the autoregressive rollout. Stokes has its
+own table below (two fields, two spaces).
+
+> Note: these three numbers predate the always-on evaluation-time boundary projection
+> (2026-07-07), the change of loss reduction to sum-over-nodes, and the Allen–Cahn switch
+> to the convex–concave integrator. They need a re-run before being compared against new
+> results.
 
 | PDE | `--loss` | test rel-L² (median) | val MSE | run |
 |-----|----------|----------------------|---------|-----|
@@ -197,6 +257,32 @@ For Poisson, the loss choice illustrates the library's central point: plain `gal
 (the raw residual ‖Au − b‖²) is badly conditioned and stalls at **~64 %** under this
 budget, while `pls` — the *same* residual preconditioned by one geometric-multigrid
 V-cycle (P ≈ A⁻¹) — recovers supervised-like accuracy (2.52 %) with no labels.
+
+### Stokes
+
+Stokes is reported separately because velocity and pressure live in different spaces on
+different grids, so each is scored in its own FE `L²` norm. Velocity grid `65²`
+(pressure `33²`), `K=4`, 512 training samples, 300 epochs, same FNO — only the loss differs:
+
+| `--loss` | velocity rel-L² | pressure rel-L² | labels? | κ of the Gauss–Newton matrix |
+|----------|-----------------|-----------------|---------|------------------------------|
+| `data` (supervised) | 4.00 ± 0.47 % | 3.70 ± 0.51 % | yes | — |
+| `galerkin` (bare ½‖Kc−b‖²) | 51.6 ± 4.5 % | 14.1 ± 0.3 % | no | 1.9 × 10¹¹ |
+| **`pls`** (½ rᵀPr) | **5.89 ± 0.65 %** | **3.70 ± 0.57 %** | **no** | 3.5 × 10⁷ |
+
+Mean ± sample standard deviation over three seeds. The label-free preconditioned loss lands
+within 1.5 pp of supervised training on velocity and **ties it on pressure**, while the bare
+least-squares residual — the *same* residual without the norm weight — is 9× worse.
+
+Under mesh refinement (`33²/65²/129²`, everything else fixed) `pls` is **flat** —
+5.82 / 5.59 / 5.82 % velocity — while `galerkin` degrades to 82 % at `129²`.
+
+**The bare residual is slow, not stuck.** Its validation curve is still descending steeply at
+epoch 300; given 5× the budget at `65²` it reaches 10.3 % velocity, i.e. within 2× of `pls`.
+That is what a conditioning argument actually predicts — a first-order method in a valley of
+aspect ratio 10¹¹ descends slowly, not never — so "does not train" overstates it. The
+`galerkin` spread is large because that arm is nowhere near converged, and no single number
+should be quoted for it at this budget.
 
 ## Experiments
 
@@ -228,23 +314,32 @@ the training loss, so results are comparable across losses and PDEs:
   batched FEM implicit-Euler + Newton solver (`ACProblem.fem_reference`, run once at
   dataset-build time, on the GPU when available). It solves the *same* discrete residual
   the `galerkin` loss minimizes, so a perfectly trained label-free model matches it.
+- **Stokes** — the discrete Taylor-Hood solution of `K c = (M_u f, 0)`
+  (`StokesProblem.fem_reference`: one batched sparse float64 factorization for the whole
+  dataset). Again the *same* system the residual measures. Velocity and pressure are scored
+  **separately** in their own FE `L²` norms, since they live in different spaces on
+  different grids; the velocity is projected to the zero Dirichlet boundary and the pressure
+  to zero mean (the residual is blind to the constant pressure mode, so it is fixed by
+  projection rather than learned).
 
 ## Package layout
 
 ```
 tensorpils/
-├── meshing.py        # structured quad grid -> tensormesh.Mesh; grid<->node reshapes
-├── physics.py        # FEMOperator base + PoissonProblem / WaveProblem / ACProblem (A, M, residuals)
-├── preconditioners/  # P ≈ A⁻¹ for Poisson (shared Preconditioner interface + factory)
+├── meshing.py        # structured quad (Q1) and quad9 (Q2) grids -> tensormesh.Mesh; grid<->node
+├── physics.py        # FEMOperator base + PoissonProblem / WaveProblem / ACProblem / StokesProblem
+├── preconditioners/  # P for the physics losses (shared Preconditioner interface + factory)
 │   ├── base.py       #   Preconditioner ABC: forward(r)->Pr, report()
 │   ├── multigrid.py  #   GeometricMultigrid V-cycle (computational path)
 │   ├── spectral.py   #   SpectralPreconditioner: convex blend / fractional power
+│   ├── stokes.py     #   StokesBlockPreconditioner: diag(mg/mu, w*mu/diag(M_p)); + blend family
+│   ├── stokes_monolithic.py  #   StokesMonolithicMultigrid: P ~ K^-1 (symmetric Uzawa smoother)
 │   └── factory.py    #   build_preconditioner(kind, ...)
-├── data.py           # create_datasets / create_wave_datasets / create_ac_datasets
+├── data.py           # create_datasets / create_wave_datasets / create_ac_datasets / create_stokes_datasets
 ├── models.py         # FNOModel (wraps neuralop.models.FNO)
-├── losses.py         # Poisson (build_loss) + WaveGalerkinLoss / ACGalerkinLoss (build_*_loss)
+├── losses.py         # Poisson (build_loss) + Wave / AC / Stokes losses (build_*_loss)
 ├── optim.py          # build_optimizer
-├── trainer.py        # BaseTrainer; PoissonTrainer; RolloutTrainer -> WaveTrainer / ACTrainer
+├── trainer.py        # BaseTrainer; PoissonTrainer; StokesTrainer; RolloutTrainer -> Wave / AC
 ├── viz.py            # loss curves / sample panels / (rollout) error distribution
 └── cli.py            # argparse entry point (the `tensorpils` command), dispatch on --pde
 ```

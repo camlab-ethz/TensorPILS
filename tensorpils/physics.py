@@ -7,6 +7,8 @@ interface used by the physics-informed losses:
 * :class:`PoissonProblem` — static :math:`-\\Delta u = f`
 * :class:`WaveProblem`    — time-dependent :math:`u_{tt} = c^2 \\Delta u`
 * :class:`ACProblem`      — time-dependent Allen–Cahn :math:`u_t = a^2 \\Delta u + \\epsilon^2 u(1-u^2)`
+* :class:`StokesProblem`  — static Stokes saddle point :math:`-\\mu\\Delta u + \\nabla p = f`,
+  :math:`\\nabla\\cdot u = 0`, on a Taylor-Hood Q2/Q1 pair
 
 They share :class:`FEMOperator`, which assembles the stiffness ``A`` and mass ``M``
 matrices (via TensorMesh's ``LaplaceElementAssembler`` / ``MassElementAssembler``),
@@ -18,9 +20,13 @@ required by sparse mat–vec products. All public methods take/return node field
 import torch
 import torch.nn as nn
 
-from tensormesh import LaplaceElementAssembler, MassElementAssembler
+from tensormesh import (Condenser, Field, LaplaceElementAssembler,
+                        MassElementAssembler, MixedElementAssembler)
 
-__all__ = ["FEMOperator", "PoissonProblem", "WaveProblem", "ACProblem", "apply_zero_boundary"]
+from .meshing import structured_quad_mesh, node_to_grid, grid_to_node
+
+__all__ = ["FEMOperator", "PoissonProblem", "WaveProblem", "ACProblem", "StokesProblem",
+           "apply_zero_boundary"]
 
 
 def apply_zero_boundary(u: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -451,3 +457,261 @@ class ACProblem(FEMOperator):
                 u_old = u
         traj = traj[0] if single else traj
         return traj.to(out_dtype)                     # cast fp64 solve back to caller's dtype
+
+
+# ============================== Stokes (saddle point) ==============================
+
+class _StokesBilinearForm(MixedElementAssembler):
+    r"""Taylor-Hood Stokes bilinear form
+    :math:`\mu\,\nabla u : \nabla v - p\,\nabla\cdot v - q\,\nabla\cdot u`.
+
+    Mirrors TensorMesh's ``examples/fluid/stokes_taylor_hood``; the only difference is
+    that we hand it a *structured* ``quad9`` mesh, so the Q2 velocity field is Q2 and the
+    order-1 pressure field is Q1 on the cell corners.
+    """
+
+    fields = [Field(trial="u", test="v", order=2, components=2),
+              Field(trial="p", test="q", order=1)]
+
+    def __post_init__(self, mu=1.0):
+        self.mu = mu
+
+    def forward(self, gradu, p, gradv, q):
+        return (self.mu * (gradu * gradv).sum()
+                - p * gradv.diagonal().sum()
+                - q * gradu.diagonal().sum())
+
+
+class StokesProblem(FEMOperator):
+    r"""Discrete Taylor-Hood (Q2/Q1) operator for the stationary Stokes equations
+
+    .. math::
+        -\mu\Delta u + \nabla p = f,\qquad \nabla\cdot u = 0,\qquad u|_{\partial\Omega}=0,
+
+    assembled as the symmetric **saddle-point** system
+
+    .. math::
+        \mathcal K c = \begin{pmatrix} A & B^\top \\ B & 0\end{pmatrix}
+        \begin{pmatrix}\mathbf u \\ \mathbf p\end{pmatrix}
+        = \begin{pmatrix}\mathbf b \\ \mathbf 0\end{pmatrix}.
+
+    Unlike the three scalar PDEs above, the unknown is a *pair* of fields living on two
+    grids: velocity on the fine Q2 node grid ``[Ny, Nx]`` (2 components) and pressure on
+    the Q1 corner grid ``[ny_p, nx_p] = [(Ny+1)/2, (Nx+1)/2]`` — the ``[::2, ::2]``
+    subgrid. :meth:`from_grid` performs exactly that split on the FNO's 3-channel output,
+    and :meth:`pack` assembles the monolithic DOF vector in TensorMesh's block layout
+    (velocity first, node-major/component-minor; then pressure).
+
+    Two structural facts drive the design:
+
+    * ``A`` decouples across velocity components and equals :math:`\mu` times the Q2
+      scalar stiffness that :class:`FEMOperator` already assembles — so the geometric
+      multigrid built for the scalar Laplacian preconditions the velocity block directly.
+    * :math:`B^\top \mathbf 1 = 0` on the zero-BC velocity space, i.e. the residual is
+      **invariant** under a constant pressure shift. The constant mode is therefore a pure
+      gauge: it is fixed by :meth:`project_pressure_gauge` (zero mean in the FE
+      :math:`L^2` inner product), never by the loss.
+
+    Parameters
+    ----------
+    mesh : tensormesh.Mesh
+        A structured ``quad9`` mesh from :func:`meshing.structured_quad9_mesh`.
+    nx_p, ny_p : int
+        Pressure (cell-corner) grid size; the fine grid is ``2nx_p-1`` by ``2ny_p-1``.
+    mu : float
+        Dynamic viscosity :math:`\mu`.
+    """
+
+    def __init__(self, mesh, nx_p: int, ny_p: int, mu: float = 1.0,
+                 quadrature_order: int = 5):
+        # FEMOperator gives us the Q2 scalar stiffness A and Q2 scalar mass M on the fine
+        # grid. A is the per-component velocity block (up to mu); M builds the load vector.
+        super().__init__(mesh, quadrature_order=quadrature_order)
+        self.mu = float(mu)
+        self.nx_p, self.ny_p = int(nx_p), int(ny_p)
+        self.nx_u, self.ny_u = 2 * nx_p - 1, 2 * ny_p - 1
+        self.n_u = self.n_nodes                                   # fine (Q2) nodes
+        self.n_p = self.nx_p * self.ny_p
+
+        # --- monolithic saddle-point operator -------------------------------------
+        asm = _StokesBilinearForm.from_mesh(mesh, quadrature_order=quadrature_order, mu=mu)
+        layout = asm.layout
+        assert layout.n_nodes("u") == self.n_u, "velocity field is not the mesh node set"
+        assert layout.n_nodes("p") == self.n_p, (
+            f"pressure field has {layout.n_nodes('p')} nodes, expected {self.n_p}")
+        self.K = asm()
+        self.n_dofs = int(layout.n_dofs)
+        self.off_p = int(layout.offsets["p"])                     # = 2 * n_u
+
+        # Dirichlet DOFs: all velocity components on the boundary. The pressure gauge is
+        # handled by projection, but the reference solve needs a pin to make K invertible.
+        self.register_buffer("dirichlet_mask", layout.dof_mask("u", self.boundary_mask))
+        self._pressure_pin = int(layout.dof_index("p", int(layout.node_ids("p")[0])))
+
+        # --- pressure mass matrix (Q1 on the corner grid) --------------------------
+        # The Q1 pressure space on the quad9 mesh is exactly the Q1 space of the corner
+        # grid, so we can assemble M_p with the ordinary scalar machinery.
+        p_mesh = structured_quad_mesh(nx=nx_p, ny=ny_p)
+        self.M_p = MassElementAssembler.from_mesh(
+            p_mesh, quadrature_order=quadrature_order)(p_mesh.points)
+        # lumped pressure mass (row sums) — the Schur-complement surrogate and the weight
+        # of the zero-mean pressure gauge.
+        self.register_buffer(
+            "m_p_lumped",
+            self._spmm(self.M_p, torch.ones(self.n_p, dtype=self.M_p.dtype)).float())
+
+    # -- device/dtype management ------------------------------------------------
+    def to(self, *args, **kwargs):
+        super().to(*args, **kwargs)
+        self.K = self.K.to(*args, **kwargs)
+        self.M_p = self.M_p.to(*args, **kwargs)
+        return self
+
+    # ------------------------------------------------------------------ packing
+    @property
+    def grid_size(self):
+        """Velocity (fine) grid ``(nx, ny)`` — what the FNO consumes and emits."""
+        return (self.nx_u, self.ny_u)
+
+    @property
+    def pgrid_size(self):
+        """Pressure (corner) grid ``(nx, ny)``."""
+        return (self.nx_p, self.ny_p)
+
+    def from_grid(self, out_grid: torch.Tensor):
+        """FNO output ``[B, 3, Ny, Nx]`` → ``(u_node [B, n_u, 2], p_node [B, n_p])``.
+
+        Channels are ``(u_x, u_y, p)``. The pressure channel is read on the ``[::2, ::2]``
+        subgrid — the Q1 corner nodes — which is why the two spaces need no index table.
+        """
+        nx, ny = self.grid_size
+        ux = grid_to_node(out_grid[:, 0], nx, ny)
+        uy = grid_to_node(out_grid[:, 1], nx, ny)
+        u_node = torch.stack([ux, uy], dim=-1)                    # [B, n_u, 2]
+        p_grid = out_grid[:, 2, ::2, ::2]                         # [B, ny_p, nx_p]
+        p_node = grid_to_node(p_grid, self.nx_p, self.ny_p)       # [B, n_p]
+        return u_node, p_node
+
+    def to_grid(self, u_node: torch.Tensor, p_node: torch.Tensor):
+        """Inverse of :meth:`from_grid` for visualization: ``(u [B,2,Ny,Nx], p [B,ny_p,nx_p])``."""
+        nx, ny = self.grid_size
+        u_grid = torch.stack([node_to_grid(u_node[..., 0], nx, ny),
+                              node_to_grid(u_node[..., 1], nx, ny)], dim=-3)
+        return u_grid, node_to_grid(p_node, self.nx_p, self.ny_p)
+
+    def pack(self, u_node: torch.Tensor, p_node: torch.Tensor) -> torch.Tensor:
+        """``(u [B,n_u,2], p [B,n_p])`` → monolithic DOF vector ``[B, n_dofs]``.
+
+        Velocity is node-major / component-minor, matching TensorMesh's
+        ``dof = offset + n_local * c + comp`` block layout.
+        """
+        return torch.cat([u_node.reshape(*u_node.shape[:-2], 2 * self.n_u), p_node], dim=-1)
+
+    def unpack(self, c: torch.Tensor):
+        """Monolithic DOF vector ``[B, n_dofs]`` → ``(u [B, n_u, 2], p [B, n_p])``."""
+        u = c[..., :self.off_p].reshape(*c.shape[:-1], self.n_u, 2)
+        return u, c[..., self.off_p:]
+
+    # ------------------------------------------------------ boundary & gauge
+    def project_velocity_bc(self, u_node: torch.Tensor) -> torch.Tensor:
+        """Zero both velocity components on the Dirichlet boundary. ``[..., n_u, 2]``."""
+        mask = self.boundary_mask.to(u_node.device)
+        return u_node.masked_fill(mask.reshape(*([1] * (u_node.dim() - 2)), -1, 1), 0.0)
+
+    def project_pressure_gauge(self, p_node: torch.Tensor) -> torch.Tensor:
+        r"""Remove the constant mode: :math:`p \leftarrow p - \frac{\mathbf 1^\top M_p p}
+        {\mathbf 1^\top M_p \mathbf 1}`.
+
+        The saddle-point residual is blind to this mode (:math:`B^\top\mathbf 1 = 0`), so
+        it is never determined by a label-free loss. Fixing the gauge the same way for the
+        prediction and the reference is what makes the pressure error meaningful.
+        """
+        w = self.m_p_lumped.to(dtype=p_node.dtype, device=p_node.device)
+        mean = (p_node * w).sum(dim=-1, keepdim=True) / w.sum()
+        return p_node - mean
+
+    def _mask_dirichlet(self, r: torch.Tensor) -> torch.Tensor:
+        """Zero the residual on constrained (boundary velocity) DOFs. ``[..., n_dofs]``."""
+        mask = self.dirichlet_mask.to(r.device)
+        return r.masked_fill(mask, 0.0)
+
+    # ------------------------------------------------------------------ operators
+    def load_vector(self, f_node: torch.Tensor) -> torch.Tensor:
+        r"""Consistent monolithic load :math:`b = (M_u f,\ 0)`. ``f_node``: ``[B, n_u, 2]``.
+
+        ``M_u`` is the Q2 vector mass matrix, which is the scalar ``M`` applied to each
+        component — the same ``b = Mf`` convention :class:`PoissonProblem` uses, so the
+        reference solve and the physics residual share one right-hand side by construction.
+        """
+        b_u = torch.stack([self._spmm(self.M, f_node[..., 0]),
+                           self._spmm(self.M, f_node[..., 1])], dim=-1)      # [B, n_u, 2]
+        b_p = f_node.new_zeros(*f_node.shape[:-2], self.n_p)
+        return self.pack(b_u, b_p)
+
+    def residual(self, u_node: torch.Tensor, p_node: torch.Tensor,
+                 f_node: torch.Tensor) -> torch.Tensor:
+        r"""Boundary-masked saddle-point residual :math:`R = \mathcal K c - b`.
+
+        ``u_node``: ``[B, n_u, 2]``, ``p_node``: ``[B, n_p]``, ``f_node``: ``[B, n_u, 2]``.
+        The velocity is projected to zero on the Dirichlet boundary first and the returned
+        residual is zeroed on those DOFs. Fully differentiable in ``u`` and ``p``.
+        Returns ``[B, n_dofs]``: momentum rows then continuity rows.
+        """
+        c = self.pack(self.project_velocity_bc(u_node), p_node)
+        r = self._spmm(self.K, c) - self.load_vector(f_node)
+        return self._mask_dirichlet(r)
+
+    # ------------------------------------------------------------ reference solve
+    @torch.no_grad()
+    def fem_reference(self, f_node: torch.Tensor, chunk: int = 64):
+        r"""Discrete Taylor-Hood solution of :math:`\mathcal K c = (M_u f, 0)`.
+
+        This is the build-time ground truth: it zeroes exactly the residual that
+        :meth:`residual` computes, so a perfectly trained label-free model reproduces it.
+        The system is solved once per chunk with a **batched right-hand side** (one sparse
+        factorization, many RHS) in float64 — the pressure pin makes ``K`` invertible and
+        the pin is removed afterwards by the zero-mean gauge.
+
+        ``f_node``: ``[B, n_u, 2]``. Returns ``(u [B, n_u, 2], p [B, n_p])`` in the
+        caller's dtype, with zero velocity boundary and zero-mean pressure.
+        """
+        single = (f_node.dim() == 2)
+        if single:
+            f_node = f_node.unsqueeze(0)
+        out_dtype, device = f_node.dtype, f_node.device
+        B = f_node.shape[0]
+
+        K = self.K.to(dtype=torch.float64, device=device)
+        mask = self.dirichlet_mask.clone().to(device)
+        mask[self._pressure_pin] = True
+        condenser = Condenser(mask, torch.zeros(int(mask.sum()), dtype=torch.float64,
+                                                device=device))
+
+        u_out = torch.zeros(B, self.n_u, 2, dtype=torch.float64, device=device)
+        p_out = torch.zeros(B, self.n_p, dtype=torch.float64, device=device)
+        for lo in range(0, B, chunk):
+            hi = min(lo + chunk, B)
+            rhs = self.load_vector(f_node[lo:hi].to(torch.float64))                 # [b, n_dofs]
+            K_i, f_i = condenser(K, rhs.transpose(0, 1).contiguous())               # [n_i, b]
+            sol = condenser.recover(K_i.solve(f_i))
+            if sol.dim() == 1:                       # a single RHS may come back squeezed
+                sol = sol.unsqueeze(-1)
+            u_out[lo:hi], p_out[lo:hi] = self.unpack(sol.transpose(0, 1))           # [b, n_dofs]
+
+        p_out = self.project_pressure_gauge(p_out)
+        u_out = self.project_velocity_bc(u_out)
+        if single:
+            u_out, p_out = u_out[0], p_out[0]
+        return u_out.to(out_dtype), p_out.to(out_dtype)
+
+    # ------------------------------------------------------------------- FE norms
+    def velocity_l2(self, u_node: torch.Tensor) -> torch.Tensor:
+        r"""FE :math:`L^2` norm :math:`\sqrt{u^\top M_u u}` per sample — ``[B]``."""
+        acc = sum((u_node[..., k] * self._spmm(self.M, u_node[..., k])).sum(dim=-1)
+                  for k in range(2))
+        return acc.clamp_min(0).sqrt()
+
+    def pressure_l2(self, p_node: torch.Tensor) -> torch.Tensor:
+        r"""FE :math:`L^2` norm :math:`\sqrt{p^\top M_p p}` per sample — ``[B]``."""
+        Mp = self._spmm(self.M_p, p_node)
+        return (p_node * Mp).sum(dim=-1).clamp_min(0).sqrt()

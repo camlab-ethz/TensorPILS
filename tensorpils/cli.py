@@ -1,12 +1,14 @@
 """Command-line entry point: ``tensorpils`` (or ``python -m tensorpils.cli``).
 
-Trains an FNO to solve one of three PDEs (``--pde``):
+Trains an FNO to solve one of four PDEs (``--pde``):
 
 * ``poisson`` (static) with one of four losses: ``data`` / ``galerkin`` / ``deepritz`` / ``pls``.
 * ``wave`` (time-dependent) as an autoregressive time-stepper with a ``galerkin`` (label-free
   central-difference residual) and/or ``data`` (supervised) loss.
 * ``ac`` (Allen–Cahn, time-dependent nonlinear) as an autoregressive time-stepper with a
   ``galerkin`` (label-free backward-Euler residual) and/or ``data`` (supervised) loss.
+* ``stokes`` (static saddle point) on a Taylor-Hood Q2/Q1 pair, with ``data`` (supervised),
+  ``galerkin`` (bare ``½‖Kc−b‖²``) or ``pls`` (block-preconditioned ``½ rᵀPr``).
 """
 
 from argparse import ArgumentParser
@@ -15,16 +17,17 @@ import numpy as np
 import torch
 
 from .data import (create_datasets, create_scaling_datasets, PoissonDataset,
-                   create_wave_datasets, create_ac_datasets)
+                   create_wave_datasets, create_ac_datasets, create_stokes_datasets)
 from .models import FNOModel
-from .trainer import PoissonTrainer, WaveTrainer, ACTrainer
+from .trainer import PoissonTrainer, WaveTrainer, ACTrainer, StokesTrainer
 
 
 def build_parser() -> ArgumentParser:
-    p = ArgumentParser(description="FNO training for 2D Poisson / wave "
+    p = ArgumentParser(description="FNO training for 2D Poisson / wave / Allen-Cahn / Stokes "
                                    "(data / Galerkin / Deep Ritz / PLS losses).")
-    p.add_argument("--pde", choices=["poisson", "wave", "ac"], default="poisson",
-                   help="Which PDE to train on. 'poisson' (static), 'wave' or 'ac' (time-dependent).")
+    p.add_argument("--pde", choices=["poisson", "wave", "ac", "stokes"], default="poisson",
+                   help="Which PDE to train on. 'poisson'/'stokes' (static), "
+                        "'wave'/'ac' (time-dependent).")
     p.add_argument("--loss",
                    choices=["data", "data_l2", "data_h1", "galerkin", "deepritz", "pls"],
                    default="galerkin",
@@ -160,6 +163,55 @@ def build_parser() -> ArgumentParser:
                    help="Number of samples per OOD eval dataset.")
     p.add_argument("--ood_seed", type=int, default=123,
                    help="Seed for the OOD eval datasets (fixed across runs for fair comparison).")
+
+    # -------- Stokes (saddle point, Taylor-Hood Q2/Q1) --------
+    p.add_argument("--stokes_mu", type=float, default=1.0,
+                   help="Stokes: dynamic viscosity mu.")
+    p.add_argument("--stokes_r", type=float, default=-0.5,
+                   help="Stokes: spectral decay exponent of the random body force "
+                        "(amplitude ~ (k^2+l^2)^r), matching the Poisson source convention.")
+    p.add_argument("--stokes_ref_chunk", type=int, default=64,
+                   help="Stokes: right-hand sides per batched reference solve (memory control).")
+    p.add_argument("--stokes_no_normalize", action="store_true",
+                   help="Stokes: do NOT rescale each sample to unit reference velocity norm "
+                        "(the rescaling is exact — Stokes is linear — and just fixes the "
+                        "output scale the FNO must hit).")
+    p.add_argument("--schur_omega", type=float, default=0.5,
+                   help="Stokes pls: relaxation omega on the lumped-pressure-mass Schur surrogate "
+                        "S^-1 = omega*mu*diag(M_p)^-1. The note's (0,1] restriction applies to "
+                        "omega inside an Uzawa *iteration*; as a norm weight it is unconstrained, "
+                        "and kappa(KPK) is minimized near omega=16 (see "
+                        "experiments/stokes/conditioning/omega_scan.py).")
+    p.add_argument("--stokes_precond", choices=["block", "monolithic"], default="block",
+                   help="Stokes pls: 'block' = P = diag(A_hat^-1, S_hat^-1), only NORM-equivalent "
+                        "to K^-1, used as a norm weight (kappa = O(h^-2)). 'monolithic' = a full "
+                        "Stokes V-cycle with a symmetric Uzawa smoother, a genuine P ~ K^-1, which "
+                        "unlocks the applied form at O(1) conditioning.")
+    p.add_argument("--stokes_pls_form",
+                   choices=["auto", "weighted", "applied", "applied_fe"], default="auto",
+                   help="Stokes pls: 'weighted' = 0.5*r^T P r; 'applied' = 0.5*||P r||^2 in nodal "
+                        "units; 'applied_fe' = the same with each field block divided by its "
+                        "dataset FE norm, which removes the ~350x pressure domination the nodal "
+                        "norm carries here. 'auto' (default) picks weighted for --stokes_precond "
+                        "block and applied_fe for monolithic. Forcing applied+block is the note's "
+                        "documented dead end and exists only as a control.")
+    p.add_argument("--uzawa_pre", type=int, default=4,
+                   help="Stokes monolithic: symmetric Uzawa sweeps before the coarse-grid "
+                        "correction (nu_1).")
+    p.add_argument("--uzawa_post", type=int, default=4,
+                   help="Stokes monolithic: symmetric Uzawa sweeps after (nu_2).")
+    p.add_argument("--cheb_degree", type=int, default=8,
+                   help="Stokes monolithic: Chebyshev-Jacobi degree for A_hat^-1 inside the Uzawa "
+                        "smoother (0 falls back to weighted Jacobi).")
+    p.add_argument("--cheb_ratio", type=float, default=30.0,
+                   help="Stokes monolithic: Chebyshev targets [lambda_max/ratio, lambda_max] of "
+                        "D^-1 A — a smoother damps the top of the spectrum and leaves the rest to "
+                        "the coarse grid.")
+    p.add_argument("--stokes_precond_strength", type=float, default=1.0,
+                   help="Stokes pls: blend strength t in [0,1] for P_t = (1-t)*alpha*I + "
+                        "t*P_block. t=1 (default) is the block preconditioner; t=0 reproduces the "
+                        "bare least-squares loss. Sweeping t moves kappa(KPK) continuously from "
+                        "O(h^-4) to O(h^-2).")
 
     # -------- FNO model --------
     p.add_argument("--hidden_dim", type=int, default=64)
@@ -354,10 +406,77 @@ def run_ac(args, device):
     _run(trainer, train_ds, test_ds, args)
 
 
-def _build_model(args, in_channels: int):
+def run_stokes(args, device):
+    if args.loss not in ("data", "galerkin", "pls"):
+        raise SystemExit(f"--pde stokes supports --loss data|galerkin|pls, got {args.loss!r}")
+    if args.grid_resolution % 2 == 0:
+        raise SystemExit(
+            f"--pde stokes needs an odd --grid_resolution (the Q2 velocity grid has "
+            f"2*n_p-1 nodes), got {args.grid_resolution}. Try {args.grid_resolution + 1}.")
+    n_p = (args.grid_resolution + 1) // 2
+
+    mono = (args.stokes_precond == "monolithic")
+    applied = args.stokes_pls_form.startswith("applied") or (args.stokes_pls_form == "auto" and mono)
+    blurb = {
+        "data": "supervised FE-L2 vs the discrete Taylor-Hood solution",
+        "galerkin": "bare least squares ½‖Kc−b‖²  (kappa = O(h^-4): the negative control)",
+        "pls": (("applied preconditioned least squares ½‖Pr‖²" if applied
+                 else "preconditioned least squares ½ rᵀPr")
+                + (",  P = monolithic Stokes V-cycle ~ K^-1" if mono
+                   else ",  P = diag(mg/mu, w*mu/diag(M_p))")),
+    }[args.loss]
+    print(f"loss        : {args.loss}  ({blurb})")
+    print(f"stokes      : mu={args.stokes_mu}  force decay r={args.stokes_r}")
+    print(f"spaces      : Taylor-Hood Q2/Q1 — velocity {args.grid_resolution}^2 (2 comps), "
+          f"pressure {n_p}^2")
+    if args.loss == "pls" and mono:
+        print(f"precond     : monolithic MG, levels={args.mg_levels}, "
+              f"Uzawa pre/post={args.uzawa_pre}/{args.uzawa_post}, "
+              f"cheb_degree={args.cheb_degree} (ratio {args.cheb_ratio:g}), "
+              f"schur_omega={args.schur_omega}")
+    elif args.loss == "pls":
+        print(f"precond     : block, mg_levels={args.mg_levels} "
+              f"(pre/post={args.mg_pre_smooth}/{args.mg_post_smooth}), "
+              f"schur_omega={args.schur_omega}, "
+              f"blend t={args.stokes_precond_strength:g}")
+    print("reference   : discrete Taylor-Hood solve of K c = (M_u f, 0) "
+          "(batched sparse, float64)")
+    _print_common(args, device)
+
+    print("Building datasets (Stokes reference solve; may take a moment)...")
+    train_ds, val_ds, test_ds = create_stokes_datasets(
+        n_train=args.n_train, n_val=args.n_val, n_test=args.n_test,
+        K=args.k, grid_resolution=args.grid_resolution, mu=args.stokes_mu,
+        r=args.stokes_r, ref_chunk=args.stokes_ref_chunk,
+        normalize=not args.stokes_no_normalize, seed=args.seed,
+    )
+    print(f"  train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}, "
+          f"velocity grid={train_ds.grid_size}, pressure grid={train_ds.pgrid_size}\n")
+
+    # f = (f_x, f_y) in; (u_x, u_y, p) out — pressure is read on the [::2, ::2] subgrid.
+    model = _build_model(args, in_channels=2, out_channels=3)
+    trainer = StokesTrainer(
+        model=model,
+        train_dataset=train_ds, val_dataset=val_ds, test_dataset=test_ds,
+        loss_type=args.loss,
+        optimizer_name=args.optimizer,
+        lr=args.lr, lr_min=args.lr_min, weight_decay=args.weight_decay,
+        batch_size=args.batch_size, epochs=args.epochs,
+        device=device, output_dir=args.output_dir,
+        mg_levels=args.mg_levels, mg_pre_smooth=args.mg_pre_smooth,
+        mg_post_smooth=args.mg_post_smooth, mg_omega=args.mg_omega,
+        schur_omega=args.schur_omega, precond_strength=args.stokes_precond_strength,
+        precond_kind=args.stokes_precond, pls_form=args.stokes_pls_form,
+        uzawa_pre=args.uzawa_pre, uzawa_post=args.uzawa_post,
+        cheb_degree=args.cheb_degree, cheb_ratio=args.cheb_ratio,
+    )
+    _run(trainer, train_ds, test_ds, args)
+
+
+def _build_model(args, in_channels: int, out_channels: int = 1):
     print("Building model...")
     cfg = dict(n_modes=tuple(args.n_modes), hidden_channels=args.hidden_dim,
-               in_channels=in_channels, out_channels=1, n_layers=args.num_layers)
+               in_channels=in_channels, out_channels=out_channels, n_layers=args.num_layers)
     model = FNOModel(**cfg)
     # Stash the constructor config so a checkpoint can be reloaded without re-guessing it later
     # (e.g. the long_rollout analysis rebuilds the model from this).
@@ -383,7 +502,7 @@ def _run(trainer, train_ds, test_ds, args):
     if args.eval_only:
         if not trainer.load_checkpoint(args.checkpoint):
             return
-        _report_test(trainer.test())
+        _report_test(trainer.test(), args.pde)
         for idx in args.sample_idx:
             if idx < len(train_ds):
                 trainer.visualize_sample(train_ds, "train", idx)
@@ -395,15 +514,20 @@ def _run(trainer, train_ds, test_ds, args):
         print("\n" + "=" * 60)
         print("Done.")
         print(f"  best val       : {trainer.stats.best_val_error:.2e}")
-        _report_test(result)
+        _report_test(result, args.pde)
         print("=" * 60)
 
 
-def _report_test(result):
-    """Poisson trainers return (mse, l2, rel_l2); rollout trainers return a single rollout MSE."""
+def _report_test(result, pde: str = "poisson"):
+    """Poisson trainers return (mse, l2, rel_l2); rollout trainers a rollout MSE; Stokes the
+    mean of the velocity and pressure relative FE-L2 errors (the per-field numbers are
+    printed by the trainer) — a squared error would be dominated by pressure, whose scale
+    is set by the physics and cannot be normalized independently of velocity."""
     if isinstance(result, tuple):
         mse, l2, rl2 = result
         print(f"  final test     : MSE {mse:.2e}  FEM-L2 {l2:.2e}  rel-L2 {rl2:.2%}")
+    elif pde == "stokes":
+        print(f"  final test     : combined rel-L2 (velocity+pressure)/2 = {result:.2%}")
     else:
         print(f"  final test     : rollout MSE {result:.2e}")
 
@@ -426,6 +550,8 @@ def main():
         run_wave(args, device)
     elif args.pde == "ac":
         run_ac(args, device)
+    elif args.pde == "stokes":
+        run_stokes(args, device)
     else:
         run_poisson(args, device)
 

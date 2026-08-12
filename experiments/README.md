@@ -1,6 +1,6 @@
 # Experiments
 
-Experiments are grouped by PDE: **`poisson/`** and **`allen_cahn/`**. Each leaf subfolder is one
+Experiments are grouped by PDE: **`poisson/`**, **`allen_cahn/`** and **`stokes/`**. Each leaf subfolder is one
 self-contained experiment: a `README.md` (description, facts, run & plot commands), the SLURM
 `*.sbatch` sweep script, and the aggregation plot script. Run artifacts land in
 `output/<domain>/<name>/` (git-ignored); pull them back from the cluster with
@@ -26,6 +26,22 @@ self-contained experiment: a `README.md` (description, facts, run & plot command
 | [`realistic_ac/`](allen_cahn/realistic_ac/README.md) | A realistic FEM regime (`256²`, `eps=64`, `dt=0.01`): with the Newton-Jacobian conditioning `κ~10⁴`, do data-driven / minimizing-movement / **bare** least-squares (which sees `κ²~10⁸`) survive a 100-step pushforward rollout? Error + energy + heatmaps, test & train. Preconditioned-LS arm slots in later. |
 | [`realistic_ac_K8/`](allen_cahn/realistic_ac_K8/README.md) | Same as `realistic_ac` (128²/eps=32/dt=0.01, 4 loss arms) but with `K=8` ICs — the intermediate difficulty between the working K=4 and the non-converging K=16. Separate output tree; reuses the `realistic_ac` analysis scripts. |
 | [`realistic_ac_K16/`](allen_cahn/realistic_ac_K16/README.md) | Same as `realistic_ac` (128²/eps=32/dt=0.01, 4 loss arms) but with `K=16` multi-frequency ICs — a much harder learning problem. Separate output tree; reuses the `realistic_ac` analysis scripts. |
+
+### `stokes/`
+
+The saddle-point case, where the Poisson recipe (`P ≈ A⁻¹` applied *inside* the square) does not
+carry over, because no block-diagonal `P` approximates `K⁻¹`. The loss form is then **determined by
+the preconditioner**, not chosen: a block-diagonal `P` is SPD but not an inverse, so it can only be a
+**norm weight** (`½rᵀPr`); a monolithic V-cycle *is* an inverse but inherits `K`'s indefiniteness, so
+it can only be **applied** (`½‖Pr‖²`). Mismatching them diverges. Velocity and pressure are always
+scored separately, each in its own FE-`L²` norm.
+
+| Experiment | Question |
+|---|---|
+| [`conditioning/`](stokes/conditioning/README.md) | **No training.** Measure in float64 what the theory claims: `κ(K²)=O(h⁻⁴)` vs `κ(KPK)=O(h⁻²)`, and the `O(1)` eigenvalue ratio underneath both. Includes an exact-block check against the note's `{1,(1±√5)/2}` and an `omega_scan.py` that finds `schur_omega` 30× off its optimum. |
+| [`h_refinement/`](stokes/h_refinement/README.md) | The learning side of the same claim: 3 losses × 3 velocity grids (`33/65/129`) at a fixed budget — does the bare-residual gap widen under refinement? The `65²` column reproduces the paper's headline table. |
+| [`blend_sweep/`](stokes/blend_sweep/README.md) | Sweep `P_t=(1−t)αI+tP` from the bare loss (`t=0`) to the block preconditioner (`t=1`) and collapse the final error onto the *measured* `κ(KP_tK)` — the Stokes analogue of `poisson/sweep_blend/`. |
+| [`monolithic/`](stokes/monolithic/README.md) | The note's monolithic multigrid with a symmetric Uzawa smoother: a genuine `P ≈ K⁻¹`, `O(1)` conditioning instead of `O(h⁻²)`. Also the sharpest result here — `O(1)` conditioning alone makes training *worse*, and fixing the loss **metric** is what turns it into the best label-free arm (19.34 % → 4.33 % velocity). |
 
 ## Evaluation convention
 
