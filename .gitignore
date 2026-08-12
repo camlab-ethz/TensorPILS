@@ -50,3 +50,26 @@ _private/
 
 # uv lockfile (project uses pip, not uv)
 uv.lock
+
+# LaTeX build artifacts
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz
+*.toc
+*.lof
+*.lot
+*.nav
+*.snm
+*.vrb
+*.bcf
+*.run.xml
+
+# Compiled documents. Figure PDFs (e.g. paper/figures/*.pdf) are LaTeX *inputs*
+# and stay tracked, so these are listed by name rather than globbing *.pdf.
+paper/iclr2027_conference.pdf
+notes/paper_story/paper_story_experiments.pdf
