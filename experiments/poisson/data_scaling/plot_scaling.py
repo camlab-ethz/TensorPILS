@@ -49,6 +49,10 @@ def main():
     ap.add_argument("--metric", choices=["test_rl2", "best_val"], default="test_rl2",
                     help="y-axis: final test relative-L2 (default; the honest number) or the "
                          "best validation relative-L2 (diagnostic).")
+    ap.add_argument("--figsize", type=float, nargs=2, default=[7.0, 5.0], metavar=("W", "H"),
+                    help="Figure size in inches (default: 7 5). A squat aspect (e.g. 6 2.8) is "
+                         "what fits a LaTeX wrapfigure, which can only wrap as many lines as the "
+                         "adjacent paragraph provides.")
     args = ap.parse_args()
 
     runs = load_runs(args.results_dir)
@@ -72,7 +76,7 @@ def main():
     hi = np.array([np.max(finite[n]) for n in ns])
     multi_seed = any(len(v) > 1 for v in finite.values())
 
-    fig, ax = plt.subplots(figsize=(7, 5))
+    fig, ax = plt.subplots(figsize=tuple(args.figsize))
     ax.plot(ns, mean, "o-", lw=1.8, label="finite dataset")
     if multi_seed:
         ax.fill_between(ns, lo, hi, alpha=0.2)
@@ -100,8 +104,12 @@ def main():
     out_dir = args.out_dir or os.path.dirname(os.path.abspath(args.results_dir))
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, f"scaling_{args.metric}.png")
+    # Raster for quick viewing and the working notes; vector for the paper. Note that
+    # *.png is git-ignored repo-wide, so only the .pdf can be committed under paper/figures/.
     fig.savefig(out_path, dpi=150)
-    print(f"scaling -> {out_path}")
+    pdf_path = os.path.splitext(out_path)[0] + ".pdf"
+    fig.savefig(pdf_path)
+    print(f"scaling -> {out_path}\n        -> {pdf_path}")
 
 
 if __name__ == "__main__":

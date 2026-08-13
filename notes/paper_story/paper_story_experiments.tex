@@ -5,6 +5,9 @@
 \usepackage{graphicx}
 \usepackage{float}
 \usepackage[hidelinks]{hyperref}
+% Long file:line paths in \texttt would otherwise overflow the margin.
+\usepackage[htt]{hyphenat}
+\sloppy
 
 % Figures live in the git-ignored output tree, referenced relative to this file.
 \graphicspath{{../../output/}}
@@ -23,6 +26,150 @@ produced so far. It is organised by PDE --- steady-state Poisson first, then the
 Allen--Cahn stepper --- and closes with what comes next (Stokes). \textbf{I am sorry for the language, but making Claude make this is so much faster.}
 
 \section{Poisson}
+
+\subsection{Setup: the discrete problem, and where it lives in the code}
+\label{sec:poisson-setup}
+
+Everything below is what the code actually does, checked against the source rather than
+reconstructed from memory. File references are \texttt{path:line} at the time of writing.
+The reference configuration is the one both Poisson figures come from
+(\texttt{experiments/poisson/sweep\_blend/pls/sweep.sbatch}).
+
+\paragraph{Continuous problem and finite element space.}
+We solve $-\Delta u = f$ on $\Omega = (0,1)^2$ with homogeneous Dirichlet boundary conditions.
+The discretisation is the space of \textbf{bilinear quadrilateral ($Q_1$) elements} on a
+structured tensor-product grid, built by \texttt{structured\_quad\_mesh}
+(\texttt{tensorpils/meshing.py:24}) as a genuine \texttt{tensormesh.Mesh} with a single
+\texttt{"quad"} cell block and row-major node numbering $k = i\,n_x + j$. At the default
+$64\times 64$ nodes this gives $N = 4096$ degrees of freedom, $63^2 = 3969$ cells, node spacing
+$h = 1/63$, and $252$ boundary nodes. The stiffness $A$ and mass $M$ are assembled once, at
+construction, by TensorMesh's \texttt{LaplaceElementAssembler} and \texttt{MassElementAssembler}
+(\texttt{tensorpils/physics.py:64--65}) using Gauss quadrature of order $4$ per axis
+(\texttt{physics.py:59}), which integrates the $Q_1$ stiffness and mass exactly on rectangular
+cells.
+
+\paragraph{How the boundary condition is imposed.}
+The Dirichlet condition is \textbf{not} statically condensed. Instead boundary nodes are
+\emph{masked}: the prediction is projected to zero on the boundary, the residual is formed, and
+the residual is zeroed on the boundary again (\texttt{apply\_zero\_boundary},
+\texttt{physics.py:32}; \texttt{PoissonProblem.residual}, \texttt{physics.py:100--108}),
+\begin{equation*}
+  r(u,f) \;=\; \Pi_0\big(A\,\Pi_0 u \;-\; M f\big),
+\end{equation*}
+where $\Pi_0$ zeroes boundary entries. The operator that effectively acts is therefore the
+\emph{interior block} $A_{II}$ of size $3844 \times 3844$, and this is also the block the spectral
+preconditioner is built from. Note that the right-hand side is the \textbf{consistent finite
+element load} $b = Mf$ (\texttt{load\_vector}, \texttt{physics.py:83}), not the pointwise nodal
+$f$ --- which matters, because $\tfrac12\|Au-b\|^2$ and $\tfrac12\|Au - f\|^2$ are different
+problems.
+
+\paragraph{Distribution over right-hand sides.}
+Sources are random truncated sine series (\texttt{tensorpils/data.py:74--78}, wrapping
+TensorMesh's \texttt{PoissonMultiFrequency}). We draw $a_{ij} \sim \mathrm{Unif}[-1,1]$
+i.i.d.\ for $i,j = 1,\dots,K$ and set
+\begin{align*}
+  f(x,y) &\;=\; \frac{\pi}{K^2}\sum_{i,j=1}^{K} a_{ij}\,(i^2+j^2)^{1/2}\,\sin(\pi i x)\sin(\pi j y), \\
+  u^\star(x,y) &\;=\; \frac{1}{\pi K^2}\sum_{i,j=1}^{K} a_{ij}\,(i^2+j^2)^{-1/2}\,\sin(\pi i x)\sin(\pi j y),
+\end{align*}
+so that $-\Delta u^\star = f$ exactly. All experiments here use $\mathbf{K=4}$, i.e.\ $16$ active
+modes with maximum frequency $4$ --- very comfortably resolved on the $64^2$ grid. Two points are
+worth stating explicitly because they are easy to get backwards:
+\begin{itemize}
+  \item The source is \textbf{amplified} at high frequency (weight $|k| = (i^2+j^2)^{1/2}$) while
+        the solution \emph{decays} like $|k|^{-1}$. The sources are rough, the solutions smooth.
+  \item TensorMesh's own docstring for \texttt{source\_term} advertises the exponent as
+        $(i^2+j^2)^{r}$ with $r=-0.5$, i.e.\ the \emph{opposite} tilt. The code computes
+        $(i^2+j^2)^{-r}$ (\texttt{tensormesh/dataset/equation/poisson.py:81}). The code is
+        internally consistent --- I verified numerically that $-\Delta u^\star = f$ holds for the
+        pair as implemented --- so this is a documentation bug upstream, not a data bug. Do not
+        quote the docstring formula in the paper.
+\end{itemize}
+The reference $u^\star$ is the \textbf{analytical} solution sampled at the nodes, \emph{not} the
+Galerkin solution $A^{-1}b$. The reported relative $L^2$ therefore carries a floor at the $Q_1$
+discretisation error; at $K=4$ on $64^2$ that floor is orders of magnitude below the errors
+plotted, but it is not zero, and it will matter if we ever push these curves much lower.
+
+\paragraph{Splits.} A single pool of samples is generated once from \texttt{seed=42} and sliced
+sequentially into $n_{\text{train}} = 1024$, $n_{\text{val}} = 128$, $n_{\text{test}} = 256$
+(\texttt{data.py:99--121}); all three splits share one mesh and one assembled operator.
+
+\paragraph{The loss that is actually optimised.}
+For \texttt{--loss pls} (\texttt{PreconditionedLSLoss}, \texttt{tensorpils/losses.py:159}),
+\begin{equation*}
+  \mathcal{L}(\theta) \;=\; \frac{1}{B}\sum_{b=1}^{B} \frac12 \big\| P\,r(u_\theta(f_b), f_b) \big\|_2^2,
+\end{equation*}
+i.e.\ \textbf{summed over nodes, averaged over the batch}. Because the residual hard-projects the
+boundary, the PLS loss ignores \texttt{--lambda\_bc} and \texttt{--bc\_mode} entirely; there is no
+boundary penalty term in these runs.
+
+\paragraph{The multigrid V-cycle.}
+\texttt{GeometricMultigrid} (\texttt{tensorpils/preconditioners/multigrid.py}) supplies
+$P \approx \Ainv$ as \textbf{exactly one V-cycle} per loss evaluation, with the CLI defaults:
+\begin{itemize}
+  \item \textbf{Hierarchy:} $4$ levels, coarsening $(n+1)//2$ per axis (floored at $3$). At $64^2$
+        the levels are $64^2 \to 32^2 \to 16^2 \to 8^2$ (verified by instantiation).
+  \item \textbf{Level operators are re-discretised, not Galerkin.} Each level assembles its own
+        stiffness on its own structured mesh via \texttt{LaplaceElementAssembler}
+        (\texttt{multigrid.py:111--125}); we do \emph{not} form $R A P$. Dirichlet rows and columns
+        are then zeroed with a unit diagonal, so a residual with zero boundary entries keeps a zero
+        boundary through the whole cycle.
+  \item \textbf{Smoother:} weighted Jacobi, $\omega = 2/3$, $2$ pre- and $2$ post-smoothing sweeps
+        (\texttt{multigrid.py:148--153}). Symmetric pre/post counts make $P$ symmetric, which is
+        what the $\tfrac12\|Pr\|^2$ form wants.
+  \item \textbf{Transfer:} bilinear prolongation respecting the row-major node order, restriction
+        $R = P^\top$ (\texttt{multigrid.py:44--48}).
+  \item \textbf{Coarsest level:} solved exactly, by a dense inverse precomputed at construction
+        (\texttt{multigrid.py:97}) --- at $8^2$ that is cheap.
+  \item \textbf{Differentiability:} the cycle is a sequence of sparse mat--vecs and element-wise
+        operations, so autograd flows through it and the gradient of $\tfrac12\|Pr\|^2$ is exact
+        rather than a surrogate.
+\end{itemize}
+
+\paragraph{The spectral (blend) preconditioner.}
+For the $t$-sweep, $P$ is built as an exact function of the interior stiffness,
+$P = Q\,p(\Lambda)\,Q^\top$ with $p(\lambda) = (1-t) + t/\lambda$
+(\texttt{spectral.py:29}), which is precisely $P_t = (1-t)I + t\Ainv$ on the interior block. The
+eigendecomposition is always taken in \texttt{float64}. At $64^2$ this is the dense
+\texttt{eigh} (\texttt{--precond\_method dense}, the default); at $128^2$/$256^2$ the dense solve is
+infeasible and the identical operator is realised through the fast discrete sine transform
+(\texttt{--precond\_method sine}). Measured on the $64^2$ interior block: $\kappa(A_{II}) = 8.04\times 10^{2}$
+and $\kappa(H) = \kappa(A)^2 = 6.47\times 10^{5}$, which is where the numbers quoted in the next
+two subsections come from.
+
+\paragraph{Model, optimisation, and the reported metric.}
+The neural operator is \texttt{neuralop}'s FNO (\texttt{tensorpils/models.py}) with
+$16\times 16$ Fourier modes, width $64$, and $5$ layers. Training is Adam with cosine-annealed
+learning rate $10^{-3} \to 10^{-4}$, $500$ epochs, batch size $32$, no weight decay. The metric in
+every figure is the \textbf{mass-matrix (FEM) relative $L^2$},
+$\|u_\theta - u^\star\|_M / \|u^\star\|_M$, computed per sample and then averaged over the split
+(\texttt{trainer.py:367--373}) --- not a plain Euclidean norm on nodal values. At evaluation the
+prediction's boundary is projected to zero for \emph{every} loss (\texttt{trainer.py:303}), so no
+method is charged for a boundary the BC already fixes.
+
+\begin{table}[H]
+  \centering
+  \begin{tabular}{ll}
+    \hline
+    Domain / space & $(0,1)^2$, bilinear $Q_1$ on a structured quad grid \\
+    Grid & $64\times 64$ nodes, $N=4096$, $h=1/63$, $3844$ interior dofs \\
+    Quadrature & Gauss order $4$ per axis (exact for $Q_1$ on rectangles) \\
+    BC & homogeneous Dirichlet, imposed by masking (not condensation) \\
+    Right-hand side & $K=4$ sine series, $a_{ij}\sim\mathrm{Unif}[-1,1]$, weight $(i^2+j^2)^{1/2}$ \\
+    Reference & analytical $u^\star$ (not the Galerkin solution) \\
+    Load vector & consistent, $b = Mf$ \\
+    Splits / seed & $1024$ / $128$ / $256$, seed $42$ \\
+    Model & FNO, modes $16^2$, width $64$, $5$ layers \\
+    Optimiser & Adam, cosine $10^{-3}\!\to\!10^{-4}$, $500$ epochs, batch $32$ \\
+    Multigrid & $4$ levels, weighted Jacobi $\omega=2/3$, $2{+}2$ sweeps, one V-cycle \\
+    Metric & mass-matrix relative $L^2$, per sample, averaged \\
+    Conditioning & $\kappa(A_{II}) = 8.04\times10^{2}$, $\kappa(H) = 6.47\times10^{5}$ \\
+    \hline
+  \end{tabular}
+  \caption{Reference Poisson configuration. Source:
+  \texttt{experiments/poisson/sweep\_blend/pls/sweep.sbatch} plus CLI defaults in
+  \texttt{tensorpils/cli.py}.}
+  \label{tab:poisson-setup}
+\end{table}
 
 \subsection{Least-squares loss and spectral preconditioning}
 

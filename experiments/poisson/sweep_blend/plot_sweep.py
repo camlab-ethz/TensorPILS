@@ -117,6 +117,21 @@ def stamp_annotation(ax, runs, loc=("left", "bottom")):
             bbox=dict(boxstyle="round,pad=0.4", fc="white", ec="0.6", alpha=0.9))
 
 
+def save_figure(fig, out_path, dpi=150):
+    """Write both a raster and a vector copy of ``out_path``, returning the PDF path.
+
+    The ``.png`` is for quick viewing and the working notes in ``notes/paper_story/``; the
+    ``.pdf`` is what the paper includes. Two reasons the vector copy matters: it stays sharp
+    when a reviewer zooms, and ``*.png`` is git-ignored repo-wide (``.gitignore``), so a raster
+    figure dropped under ``paper/figures/`` would never be committed and the paper would fail
+    to build on a fresh clone or in Overleaf.
+    """
+    fig.savefig(out_path, dpi=dpi)
+    pdf_path = os.path.splitext(out_path)[0] + ".pdf"
+    fig.savefig(pdf_path)
+    return pdf_path
+
+
 def plot_overlay(runs, out_path, smooth=False, window=15, annotate=True):
     fig, ax = plt.subplots(figsize=(7, 5))
     for r in runs:
@@ -142,8 +157,7 @@ def plot_overlay(runs, out_path, smooth=False, window=15, annotate=True):
     if annotate:
         stamp_annotation(ax, runs, loc=("left", "bottom"))
     fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    print(f"overlay  -> {out_path}")
+    print(f"overlay  -> {out_path}\n         -> {save_figure(fig, out_path)}")
 
 
 def plot_collapse(runs, out_path, annotate=True):
@@ -176,8 +190,7 @@ def plot_collapse(runs, out_path, annotate=True):
     if annotate:
         stamp_annotation(ax, runs, loc=("right", "top"))
     fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    print(f"collapse -> {out_path}")
+    print(f"collapse -> {out_path}\n         -> {save_figure(fig, out_path)}")
 
 
 def main():

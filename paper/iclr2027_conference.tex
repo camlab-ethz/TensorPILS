@@ -236,6 +236,44 @@ and similarly $\nabla_u^2 \tilde L_{\textup{Var}}(\mathbf u) = P^\top A P$. Howe
 \section{Numerical Results}
 
 \subsection{Poisson Equation}
+We are interested in approximating the solution operator $\mathcal G$ of the Poisson equation
+\begin{align}\label{eq:poisson_equation}
+   \begin{split}
+      -\Delta u &= f \quad \text{in }\Omega,
+      \\
+      u &= 0 \quad \text{on }\partial\Omega,
+   \end{split}
+\end{align}
+on the domain $\Omega = [0,1]$ by a Fourier Neural Operator (FNO) $\mathcal G_\theta$. More precisely, $\mathcal G$ maps $f$ to the solution $u$ of \eqref{eq:poisson_equation}. We work on a structured tensor-product grid, and the output of the FNO is interpolated into the space $\mathcal U_h = Q_1^h$ of bilinear quadrilateral finite elements, with (global) basis functions denoted by $\phi_1, \dots,\phi_n$. The corresponding stiffness matrix $A_{ij} = \int_\Omega \nabla \phi_j \nabla \phi_i\,\mathrm dx$ is symmetric and positive definite, which makes both the least-squares formulation and variational formulation available. As an $\mathcal O(n)$ complexity preconditioner $P_{\textup{GMG}}$, we employ a single di-adic V-cycle geometric multigrid method, which falls in the approximate inverse setting []. For details we refer to Appendix [].
+
+\subsubsection{Ill-Conditioning Prevents Physics-Informed Training}
+In this experiment, we show that the ill-conditioning of the stiffness matrix $A$ is the reason physics-informed training fails without a preconditioner. To demonstrate this, we use the physics-informed least-squares loss with $B=I$ and a parametrized preconditioner
+\begin{equation}
+   L^t_\textup{PLS}(\mathbf u) = \frac12 \|P_t[A\mathbf u - \mathbf f] \|^2_2, \quad P_t = (1-t)I + t A^{-1}.
+\end{equation}
+The preconditioner $P_t$ is a convex mixing between no preconditioning $P_0=I$ and data-driven training $P_1 = A^{-1}$. This pedagogical choice is possible on a small $64\times 64$ grid, and serves to illustrate the effect of preconditioning on the training dynamics. We monitor the relative $L^2(\Omega)$ error averaged over the validation set during training for a number of $t$-values, and compare to the single di-adic V-cycle geometric multigrid preconditioner. The results are reported in Figure [], where we additionally report the condition number of the Hessian $H_t=\nabla_u^2 L_\textup{PLS}^t = AP_t^2A$.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.49\linewidth]{figures/sweep_overlay.pdf}
+  \hfill
+  \includegraphics[width=0.49\linewidth]{figures/sweep_collapse.pdf}
+  \caption{Preconditioned least-squares training for the Poisson equation. \textbf{Left:} validation relative $L^2$ vs.\ epoch as the preconditioner $P_t$ is swept from $I$ to $A^{-1}$, together with the geometric multigrid preconditioner \textbf{Right:} best validation error of the $P_t$ preconditioned sweeps against the condition number $\kappa(H_t)$ of the preconditioned loss Hessian.}
+  \label{fig:pls-overlay}
+\end{figure}
+
+\begin{wrapfigure}{r}{0.40\textwidth}
+   \vspace{-\intextsep}
+   \includegraphics[width=\linewidth]{figures/scaling_test_rl2.pdf}
+   \caption{Test error vs.\ dataset size at a fixed budget; dashed is the infinite-data limit.}
+   \label{fig:data-scaling}
+\end{wrapfigure}
+Figure \ref{fig:pls-overlay} shows that that preconditioning is essential to obtain efficient physics-informed training. The un-preconditioned run ($t=0$) converges to $\approx 30\%$ relative $L^2$ error after 500 epochs of training with Adam., while data-driven training ($t=1$) lands at below $1\%$ error for the same amount of training epochs. Intermediate values of $t$ interpolate the training dynamics, which leads us to conclude that ill-conditioning prevents efficient physics-informed neural operator training, and preconditioning is an effective strategy to mitigate this. This is further supported by tracking the condition numbers of $H_t$ in dependence on $t$. For $t=0$, we have $\kappa(H_t)=6.5e+05$ and of course for data-driven training it holds $\kappa(H_1)=1$. Interestingly, as visualized on the right of Figure \ref{fig:pls-overlay} below a conditioning of $approx 10^3-10^4$ (corresponding to $t\in[0.05, 0.1]$) we observe diminishing returns for making the preconditioners more accurate. We attribute this to ill-conditioning induced by the neural network parametrization, which is not resolved in our analysis. This suggests, that a highly-accurate preconditioner may not be needed for accurate physics-informed training, and in fact, the geometric multigrid preconditioner performs virtually identical to the gold standard of data-driven training.
+
+\emph{The deep Ritz results come here, or if space is scarce, we put them in the Appendix. They are nice, but not fundamental.}
+
+\subsubsection{Training at The Infinite Data Limit}
+Physics-informed training is not bound to a dataset. Instead, we may draw a fresh batch of samples for every update of the model's parameters. We refer to this as \emph{training at the infinite data limit}. To illustrate the benefit of training in this regime, we fix an optimization budget: 500 epochs' worth of forward passes at a dataset size of 1024 and compare the final relative test $L^2$ error achieved for datasets of growing size, see Figure []. We clearly see the benefit of training in the infinite data regime, even for a fixed finite training budget. 
 
 \subsection{Allen-Cahn Equation}
 
