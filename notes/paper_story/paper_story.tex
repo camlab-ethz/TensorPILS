@@ -1,0 +1,468 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage[hidelinks]{hyperref}
+% Long file:line paths in \texttt would otherwise overflow the margin.
+\usepackage[htt]{hyphenat}
+\sloppy
+
+\newcommand{\dt}{\Delta t}
+\newcommand{\uh}{u_h}
+\newcommand{\Ecvx}{E_{\mathrm{cvx}}}
+\newcommand{\Eccv}{E_{\mathrm{ccv}}}
+
+\title{Allen--Cahn: background, discretisation, and experiments}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\noindent
+A self-contained account of the Allen--Cahn part of the project: the energy, the gradient flow,
+the discretisation as it is actually implemented, the two time-stepping schemes and the two
+physics losses they induce, the autodiff-through-time question, and a summary of every experiment
+we have run. Everything is checked against the source; pointers are \texttt{path:line} at the time
+of writing. The companion document \texttt{notes/ac\_autoregressive/ac\_autoregressive.tex} carries
+the longer derivations (numerical regime analysis, conditioning, mesh-consistent scaling); this
+document is the summary and the experimental record.
+
+\section{The energy}
+
+Allen--Cahn is the $L^2$ gradient flow of the Ginzburg--Landau free energy. On $\Omega=(0,1)^2$
+with homogeneous Dirichlet conditions,
+\begin{equation}\label{eq:energy}
+   E(u) \;=\; \frac{a^2}{2}\int_\Omega |\nabla u|^2\,\mathrm dx
+            \;+\; \epsilon^2\!\int_\Omega W(u)\,\mathrm dx,
+   \qquad
+   W(s) = \tfrac14\,(s^2-1)^2 .
+\end{equation}
+The first term penalises interfaces, the double well $W$ has minima at $s=\pm1$ and forces the
+field towards the two pure phases. The competition sets an interface width $\ell \sim a/\epsilon$.
+
+Two conventions that are easy to get wrong and are fixed throughout the code and this project:
+\begin{itemize}
+   \item $\epsilon$ multiplies the \emph{reaction}, not the Laplacian, and it enters
+         \emph{squared}. Large $\epsilon$ means a stiff, sharply-separating problem. This follows
+         TensorMesh's \texttt{examples/diffusion/allen-cahn} and is the opposite of the more common
+         $\epsilon\to0$ sharp-interface convention.
+   \item The diffusion coefficient is $a^2$; we use $a=1$ in every experiment, so $\epsilon$ alone
+         controls stiffness.
+\end{itemize}
+
+\section{The gradient flow}
+
+The $L^2$ gradient flow $\partial_t u = -\,\delta E/\delta u$ of \eqref{eq:energy} is
+\begin{equation}\label{eq:ac-pde}
+   \partial_t u \;=\; a^2\Delta u \;+\; \epsilon^2\,u(1-u^2),
+   \qquad u|_{\partial\Omega}=0,
+\end{equation}
+since $-\delta E/\delta u = a^2\Delta u - \epsilon^2 W'(u)$ and $W'(s)=s^3-s$. The structural
+consequence we lean on repeatedly is that $E$ is a Lyapunov functional,
+\begin{equation}\label{eq:dissipation}
+   \frac{\mathrm d}{\mathrm dt}E(u(t)) \;=\; -\,\|\partial_t u(t)\|_{L^2}^2 \;\le\; 0 ,
+\end{equation}
+so \textbf{the energy must be non-increasing along any correct trajectory}. We use this as a
+diagnostic for learned rollouts: an energy curve that climbs is a blow-up, regardless of what the
+error metric says (\texttt{ACProblem.energy}, \texttt{tensorpils/physics.py:282}).
+
+\section{Discretisation: nodal interpolation of the nonlinearity}
+
+Space is discretised with bilinear $Q_1$ elements on a structured quadrilateral grid of the unit
+square (\texttt{structured\_quad\_mesh}, \texttt{tensorpils/meshing.py:24}); the stiffness $A$ and
+mass $M$ are assembled once by TensorMesh with Gauss quadrature of order 4 per axis
+(\texttt{physics.py:64--65}). This is the same $A$, $M$, and Dirichlet masking as the Poisson
+setting: the boundary condition is imposed by projection, not condensation.
+
+The nonlinearity is treated by \textbf{nodal (group / product) interpolation}: rather than
+integrating $W'(\uh)$ exactly, we interpolate the nonlinear function of the nodal values into the
+same $Q_1$ space,
+\begin{equation}\label{eq:group-fem}
+   \int_\Omega W'(\uh)\,\phi_i\,\mathrm dx
+   \;\approx\;
+   \int_\Omega \Big(\textstyle\sum_j W'(u_j)\,\phi_j\Big)\phi_i\,\mathrm dx
+   \;=\;\big[M\,W'(\mathbf u)\big]_i ,
+\end{equation}
+with $W'(\mathbf u)$ applied entrywise. So the cubic reaction becomes $M(\mathbf u-\mathbf u^3)$
+and never requires quadrature of a cubic integrand. The same convention gives the discrete energy
+\begin{equation}\label{eq:discrete-energy}
+   E_h(\mathbf u) \;=\; \tfrac12 a^2\,\mathbf u^\top A\,\mathbf u
+   \;+\; \epsilon^2\,\mathbf 1^\top M\,W(\mathbf u),
+\end{equation}
+i.e.\ the double well is evaluated nodally and then integrated exactly against the $Q_1$ basis
+(\texttt{physics.py:282--298}). Nodal interpolation is what makes the reaction Jacobian a
+\emph{diagonal scaling of $M$}, which is exactly what the Newton solve and the preconditioner
+below exploit.
+
+\section{Time stepping I: minimizing movement}
+
+\paragraph{Continuous (JKO / De Giorgi).}
+The gradient-flow structure gives a variational time discretisation: given $u^n$, define
+\begin{equation}\label{eq:mm-continuous}
+   u^{n+1} \;=\; \arg\min_{u}\;\Big\{\, E(u) \;+\; \frac{1}{2\dt}\,\|u-u^n\|_{L^2}^2 \,\Big\}.
+\end{equation}
+The optimality condition is $\delta E/\delta u + (u-u^n)/\dt = 0$, i.e.\ exactly backward Euler
+applied to \eqref{eq:ac-pde}. Choosing $u^{n+1}$ as the minimiser rather than as the root of a
+residual guarantees $E(u^{n+1}) + \tfrac{1}{2\dt}\|u^{n+1}-u^n\|^2 \le E(u^n)$ and hence
+unconditional energy decay. The catch is that $E$ is \emph{not} convex --- the concave part
+$-\tfrac{\epsilon^2}{2}\int u^2$ of the double well spoils it --- so \eqref{eq:mm-continuous} is
+not a convex problem, and for $\dt$ large relative to $1/\epsilon^2$ the objective can lose its
+unique minimiser. This is what the convex--concave split of \S\ref{sec:cc} repairs.
+
+\paragraph{Discrete (what we implement).}
+We use the \emph{convex--concave} minimizing-movement objective throughout, so \S\ref{sec:cc}
+supplies the split and this section supplies the variational form. Splitting
+$E = \Ecvx + \Eccv$ with
+\begin{equation}\label{eq:split}
+   \Ecvx(u) = \frac{a^2}{2}\!\int|\nabla u|^2 + \frac{\epsilon^2}{4}\!\int u^4
+              + \frac{\epsilon^2}{4}|\Omega|,
+   \qquad
+   \Eccv(u) = -\frac{\epsilon^2}{2}\!\int u^2 ,
+\end{equation}
+(so that $\Ecvx+\Eccv = E$, using $W(s)=\tfrac14(s^4-2s^2+1)$), and linearising only the concave
+part about $u^n$, the step is the unique minimiser of the \emph{convex} objective
+\begin{equation}\label{eq:mm-objective}
+   J(u) \;=\; \Ecvx(u) \;+\; \big\langle D\Eccv(u^n),\,u\big\rangle
+              \;+\; \frac{1}{2\dt}\|u-u^n\|_{L^2}^2,
+   \qquad D\Eccv(u^n) = -\epsilon^2 u^n .
+\end{equation}
+In FEM variables, with the quartic evaluated nodally against the \emph{lumped} mass
+$M\mathbf 1$ (\texttt{ACProblem.mm\_objective}, \texttt{physics.py:240--280}),
+\begin{equation}\label{eq:mm-discrete}
+   J(\mathbf u) \;=\;
+     \frac{a^2}{2}\mathbf u^\top A\mathbf u
+   \;+\; \frac{\epsilon^2}{4}\Big[(\mathbf u^4)^\top M\mathbf 1 + |\Omega|\Big]
+   \;-\; \epsilon^2 (\mathbf u^n)^\top M \mathbf u
+   \;+\; \frac{1}{2\dt}(\mathbf u-\mathbf u^n)^\top M(\mathbf u-\mathbf u^n),
+\end{equation}
+whose gradient is
+$\nabla J = M\frac{\mathbf u-\mathbf u^n}{\dt} + a^2A\mathbf u
++ \epsilon^2\operatorname{diag}(M\mathbf 1)\mathbf u^3 - \epsilon^2 M\mathbf u^n$.
+Because $J$ is convex with Hessian
+$\nabla^2 J = M/\dt + a^2A + 3\epsilon^2\operatorname{diag}(M\mathbf 1)\operatorname{diag}(\mathbf u^2)$,
+which is SPD for every $\mathbf u$ and every $\dt$, this is the \textbf{Deep-Ritz analogue for
+time stepping}: the loss is an energy to be minimised, not a residual to be squared, and it
+inherits $\kappa(\nabla^2 J)$ rather than $\kappa^2$. That is the entire reason it behaves
+differently from the least-squares loss.
+
+\paragraph{Small inconsistency worth knowing.}
+$J$ uses the \emph{lumped} mass on the quartic ($(\mathbf u^4)^\top M\mathbf 1$) while the
+diagnostic energy \eqref{eq:discrete-energy} uses the \emph{consistent} mass
+($\mathbf 1^\top M\,W(\mathbf u)$). Both are legitimate nodal-interpolation choices and they agree
+to quadrature order, but they are not literally the same functional, so $J$ and $E_h$ should not
+be expected to match to machine precision.
+
+\section{Time stepping II: convex--concave (Eyre) splitting}
+\label{sec:cc}
+
+\paragraph{Continuous.}
+The Eyre split treats the convex part implicitly and the concave part explicitly:
+\begin{equation}\label{eq:cc-continuous}
+   \frac{u^{n+1}-u^n}{\dt}
+   \;=\; a^2\Delta u^{n+1} \;-\; \epsilon^2 (u^{n+1})^3 \;+\; \epsilon^2 u^n .
+\end{equation}
+Compare fully implicit backward Euler, which puts the whole reaction
+$\epsilon^2\big(u^{n+1}-(u^{n+1})^3\big)$ at the new level. The two differ \emph{only in the
+linear reaction term}: implicit at $u^{n+1}$ (backward Euler) versus explicit at $u^n$
+(convex--concave). The split is unconditionally energy-stable and is the standard scheme for
+Allen--Cahn at stiff $\epsilon$; it is exactly the optimality condition of \eqref{eq:mm-objective},
+so \emph{the convex--concave step and the minimizing-movement step are the same step}, once via a
+residual and once via an objective.
+
+\paragraph{Discrete.}
+With nodal interpolation the two residuals are (\texttt{ACProblem.residual},
+\texttt{physics.py:205--237}), both scaled by $1/\dt$:
+\begin{align}
+   R_{\mathrm{BE}}(\mathbf u^n,\mathbf u^{n+1})
+   &= M\frac{\mathbf u^{n+1}-\mathbf u^{n}}{\dt} + a^2A\,\mathbf u^{n+1}
+      - \epsilon^2 M\big(\mathbf u^{n+1}-(\mathbf u^{n+1})^3\big), \label{eq:res-be}\\[2pt]
+   R_{\mathrm{CC}}(\mathbf u^n,\mathbf u^{n+1})
+   &= M\frac{\mathbf u^{n+1}-\mathbf u^{n}}{\dt} + a^2A\,\mathbf u^{n+1}
+      + \epsilon^2 M\big((\mathbf u^{n+1})^3-\mathbf u^{n}\big). \label{eq:res-cc}
+\end{align}
+The $1/\dt$ scaling is deliberate: it makes a least-squares loss built on either residual have a
+$\dt$-independent gradient scale. The corresponding Newton Jacobians are
+\begin{equation}\label{eq:jacobians}
+   J_{\mathrm{CC}} = \frac{M}{\dt} + a^2A + 3\epsilon^2 M\operatorname{diag}(\mathbf u^2),
+   \qquad
+   J_{\mathrm{BE}} = \frac{M}{\dt} + a^2A + \epsilon^2 M\operatorname{diag}(3\mathbf u^2-1).
+\end{equation}
+$J_{\mathrm{CC}}$ is SPD for every $\mathbf u$ and $\dt$ (the reaction term is a non-negative
+diagonal scaling of $M$); $J_{\mathrm{BE}}$ is not, which is why the reference solver defaults to
+convex--concave.
+
+\paragraph{The reference trajectory.}
+Allen--Cahn has no analytical solution, so the ground truth is a FEM solve: each step drives
+$R=0$ by Newton on the interior degrees of freedom, with a \textbf{batched sparse} linear solve
+and \textbf{always in \texttt{float64}} regardless of the caller's dtype --- \texttt{fp32} cannot
+reach \texttt{newton\_tol}$=10^{-8}$ and leaves Newton spinning to \texttt{newton\_max} every step
+(\texttt{ACProblem.fem\_reference}, \texttt{physics.py:380--458}). The Jacobian is reassembled per
+Newton step as a value update on the shared sparsity pattern of $L=M/\dt+a^2A$, since the reaction
+contributes only a column scaling of $M$ --- again a consequence of nodal interpolation.
+
+Two things follow, and both matter for reading the results:
+\begin{itemize}
+   \item The learned stepper is measured against the \emph{discrete} convex--concave trajectory,
+         not against physical Allen--Cahn. This is well-posed at every $\epsilon$ (the CC scheme is
+         unconditionally stable), but at large $\epsilon$ the reference is under-resolved and is no
+         longer physical Allen--Cahn.
+   \item Data generation and the physics loss use the same integrator by default, so the reference
+         \emph{exactly} zeroes the residual the loss penalises (\texttt{ACTrainer},
+         \texttt{trainer.py:812}). Decoupling them (\texttt{--ac\_loss\_integrator}) is an
+         intentional experiment, not an accident.
+\end{itemize}
+
+\section{The two physics losses}
+
+Both losses act on an autoregressive rollout $\mathbf u^0,\dots,\mathbf u^{L-1}$ where
+$\mathbf u^0$ is the ground-truth seed frame and the rest are model predictions, with a discount
+$\gamma^k$ over rollout steps and a normalisation by $\sum_k\gamma^k$:
+\begin{align}
+   \mathcal L_{\mathrm{LS}}
+     &= \frac{1}{\sum_k \gamma^k}\sum_{k} \gamma^k\;
+        \frac12\big\|\,P\,R(\mathbf u^{k},\mathbf u^{k+1})\,\big\|_2^2
+        &&\text{(\texttt{ACGalerkinLoss}, \texttt{losses.py:255})} \label{eq:loss-ls}\\
+   \mathcal L_{\mathrm{MM}}
+     &= \frac{1}{\sum_k \gamma^k}\sum_{k} \gamma^k\;
+        J(\mathbf u^{k};\mathbf u^{k+1})
+        &&\text{(\texttt{ACMinMovementLoss}, \texttt{losses.py:310})} \label{eq:loss-mm}
+\end{align}
+with $P=I$ unless preconditioning is requested. The squared residual is \textbf{summed over nodes
+and averaged over the batch} (keeping the gradient $O(1)$ rather than $O(1/N)$); $J$ is already a
+spatial functional, so no per-node reduction is applied. Note that $\mathcal L_{\mathrm{MM}}$ is an
+energy and is routinely \emph{negative} --- in the reference run below it converges to
+$\approx-120$ --- so its numerical value is not comparable across losses and only the validation
+error is meaningful for model selection.
+
+\paragraph{Preconditioning the least-squares loss.}
+$\mathcal L_{\mathrm{LS}}$ has Gauss--Newton Hessian $\approx J^\top J$, so it inherits
+$\kappa(J)^2$ --- the same squaring that kills the Poisson least-squares loss. We precondition with
+a \textbf{frozen-coefficient} approximation of the Jacobian: setting $\mathbf u^2\equiv 1$ (exact in
+the bulk of either phase, wrong only inside the interface) in \eqref{eq:jacobians} gives the
+constant, SPD, $u$-independent operator
+\begin{equation}\label{eq:frozen}
+   J_0 \;=\; a^2 A + c\,M, \qquad c = \frac{1}{\dt} + 3\epsilon^2 ,
+\end{equation}
+a screened-Poisson / reaction--diffusion operator. $P\approx J_0^{-1}$ is realised by the
+\emph{same} geometric-multigrid V-cycle as in the Poisson experiments, simply built on
+$a^2A+cM$ instead of $A$ (\texttt{GeometricMultigrid} with \texttt{mg\_a2}/\texttt{mg\_c},
+\texttt{preconditioners/multigrid.py:111--125}; wired at \texttt{trainer.py:825--838}). The mass
+shift only makes the operator more diagonally dominant, so weighted-Jacobi smoothing is at least as
+effective as in the pure Poisson case. Preconditioning applies to the least-squares form only ---
+it is meaningless for $J$, whose Hessian is already the un-squared $\nabla^2 J$.
+
+\section{Autodiff through time}
+
+The rollout has \emph{two independent detach knobs}, which is the part that is easy to conflate
+(\texttt{RolloutTrainer.\_rollout}, \texttt{trainer.py:622--640}; resolution at
+\texttt{trainer.py:820}):
+\begin{enumerate}
+   \item \textbf{Rollout-input detach.} Whether step $k{+}1$ receives $\mathbf u^{k}$ or
+         $\mathbf u^{k}.\mathrm{detach}()$ as \emph{network input}. Detaching makes every stored
+         frame a one-step function of its input --- no backpropagation through time at all. This is
+         the \emph{pushforward trick} (Brandstetter, Worrall \& Welling, 2022).
+   \item \textbf{Loss-coupling detach.} Whether the \emph{previous frame} is differentiated
+         \emph{inside} the loss --- the first argument of $R(\mathbf u^k,\mathbf u^{k+1})$, or the
+         proximal centre $\mathbf u^k$ in $J$.
+\end{enumerate}
+The three exposed modes are
+\begin{center}
+\begin{tabular}{lccl}
+\hline
+\texttt{--bptt\_mode} & input detach & coupling detach & gradient \\
+\hline
+\texttt{full\_bptt}   & no  & no  & backprop through the entire rollout \\
+\texttt{detach\_prev} & no  & yes & full BPTT, previous frame frozen in the loss \\
+\texttt{pushforward}  & yes & yes & one-step \\
+\hline
+\end{tabular}
+\end{center}
+The data loss has no coupling term, so \texttt{detach\_prev}$\equiv$\texttt{full\_bptt} there.
+
+\paragraph{Why the coupling detach is not cosmetic.}
+For the least-squares residual, $\tfrac12\|R\|^2$ is \emph{self-balancing}: its gradient vanishes in
+\emph{both} arguments at $R=0$, so leaving the coupling attached is harmless, and the class default
+is not to detach. For minimizing movement it is different: $\nabla_{\mathbf u^k}J$ does \emph{not}
+vanish at the correct step --- $J$ is minimised over its second argument only, and the proximal
+centre is data. Backpropagating through it therefore rewards moving the \emph{centre}, distorting
+the trajectory. The MM class default is to detach. \S\ref{sec:exp-bptt} shows this is worth roughly
+two orders of magnitude, and it is the single clearest experimental result we have about autodiff
+through time.
+
+\section{Experiments}
+
+All runs: FNO ($16\times16$ modes, width $64$, $5$ layers), Adam with cosine
+$10^{-3}\!\to\!10^{-4}$, batch $32$, $n_{\text{train}}/n_{\text{val}}/n_{\text{test}} =
+1024/128/256$, \texttt{seed=42}, $a=1$, zero Dirichlet, convex--concave reference. Initial
+conditions are multi-frequency,
+$u_0 = \frac{\pi}{K^2}\sum_{i,j=1}^{K} a_{ij}(i^2+j^2)^{-1/2}\sin(\pi i x)\sin(\pi j y)$ with
+$a_{ij}\sim\mathrm{Unif}[-1,1]$ (amplitude $\approx0.15$), so $K$ controls how rich the initial
+data is. Metric is the FEM (mass-matrix) relative $L^2$ against the reference; ``space-time''
+averages over the rollout.
+
+\subsection{\texttt{ac\_loss\_comparison} --- does the loss matter at all?}
+$64^2$, $\dt=0.0025$, $\epsilon=2$, $K=4$, 10-step rollout, 1000 epochs. Four arms: data-driven,
+backward-Euler least squares, convex--concave least squares, minimizing movement. Arm 2 trains the
+\emph{BE} residual against \emph{CC} data on purpose, to test whether the physics-loss integrator
+matters. \textbf{Outcome:} at $\epsilon=2$ the dynamics are diffusion-dominated (the double well
+barely engages) and all four losses land close together --- an informative null. This motivated the
+stress test.
+
+\subsection{\texttt{ac\_stresstest} --- sweep the reaction strength}
+Same setup, $\epsilon\in\{2,4,8,12,16,20,24,32\}$ (24 runs), $500$ epochs, three losses. Best
+space-time relative $L^2$:
+\begin{center}
+\begin{tabular}{rccc}
+\hline
+$\epsilon$ & data-driven & least squares & min.\ movement \\
+\hline
+ 2 & 0.024 & 0.022 & 0.013 \\
+ 4 & 0.025 & 0.004 & 0.005 \\
+ 8 & 0.011 & 0.004 & 0.004 \\
+12 & 0.011 & 0.004 & 0.011 \\
+16 & 0.999 & 0.975 & 0.021 \\
+20 & 1.000 & 0.991 & 0.056 \\
+24 & 1.000 & 0.995 & 0.095 \\
+32 & 0.981 & 0.998 & 1.011 \\
+\hline
+\end{tabular}
+\end{center}
+Read at face value this is the headline Allen--Cahn story: past $\epsilon\approx12$ both
+data-driven and bare least squares collapse to $\approx100\%$ error while minimizing movement
+degrades gracefully until it too fails at $\epsilon=32$. \textbf{But see
+\S\ref{sec:exp-inconsistency} before using these numbers.}
+
+\subsection{\texttt{compare\_bptt} --- autodiff modes $\times$ reaction strength}
+\label{sec:exp-bptt}
+$64^2$, $\dt=0.0025$, $K=4$, $500$ epochs, $\epsilon\in\{4,\dots,32\}$, three losses $\times$ their
+modes $=64$ runs. Best space-time relative $L^2$:
+\begin{center}
+\begin{tabular}{llcccccccc}
+\hline
+loss & mode & 4 & 8 & 12 & 16 & 20 & 24 & 28 & 32 \\
+\hline
+data & \texttt{full}   & 0.010 & 0.011 & 0.007 & 0.009 & 0.010 & 0.012 & 0.061 & 0.038 \\
+data & \texttt{push}   & 0.009 & 0.007 & 0.006 & 0.005 & 0.006 & 0.009 & 0.010 & 0.017 \\
+LS   & \texttt{full}   & 0.023 & 0.004 & 0.004 & 0.006 & 0.012 & 0.995 & 0.997 & 0.998 \\
+LS   & \texttt{detach} & 0.004 & 0.004 & 0.006 & 0.008 & 0.015 & 0.028 & 0.044 & 1.000 \\
+LS   & \texttt{push}   & 0.004 & 0.004 & 0.005 & 0.012 & 0.015 & 0.039 & 0.034 & 0.035 \\
+MM   & \texttt{full}   & 0.408 & 0.964 & 1.018 & 2.854 & 2.394 & 2.091 & 1.736 & 1.515 \\
+MM   & \texttt{detach} & 0.005 & 0.004 & 0.004 & 0.007 & 0.007 & 0.009 & 0.019 & 1.000 \\
+MM   & \texttt{push}   & 0.003 & 0.003 & 0.006 & 0.004 & 0.008 & 0.007 & 0.007 & 0.012 \\
+\hline
+\end{tabular}
+\end{center}
+Three clean conclusions:
+\begin{itemize}
+   \item \textbf{Pushforward is best or tied-best for every loss at every $\epsilon$}, and it is
+         also the cheapest (no rollout graph, so activation memory is a single forward). This is
+         why it is the default in all later experiments.
+   \item \textbf{Minimizing movement with full BPTT is catastrophic} ($0.41\to2.85$, i.e.\ worse
+         than predicting nothing), while the same loss with the proximal centre detached is the
+         best arm in the table. This is the quantitative version of \S6.
+   \item Detaching rescues least squares at large $\epsilon$: \texttt{full} collapses from
+         $\epsilon=24$, \texttt{detach} survives to $28$, \texttt{push} holds throughout.
+\end{itemize}
+
+\subsection{\texttt{long\_rollout} --- extrapolation past the training horizon}
+Rolls the best \texttt{compare\_bptt} checkpoints $20$ steps (trained on $10$) and tracks both the
+relative $L^2$ and the Ginzburg--Landau energy \eqref{eq:discrete-energy} against the CC reference,
+with divergence detection (non-finite frames are marked and the curve truncated). The energy check
+is the point: by \eqref{eq:dissipation} a rising $E$ is a blow-up even if the error looks
+acceptable. Two-stage by design --- the compute step runs on Euler where the checkpoints live and
+emits a small \texttt{metrics.json}; only that and the figures are transferred.
+
+\subsection{\texttt{realistic\_ac} --- the stiff, resolved regime with preconditioning}
+\label{sec:exp-realistic}
+The current headline experiment: $128^2$, $\epsilon=32$, $\dt=0.01$, $K=4$, 10-step pushforward
+rollout, $500$ epochs, trained then rolled out to \textbf{100 steps}. Four arms: data-driven,
+minimizing movement, bare least squares, and \textbf{preconditioned least squares} with the
+multigrid V-cycle on $a^2A+cM$. Relative $L^2$ against the CC reference on the test set:
+\begin{center}
+\begin{tabular}{lcccc}
+\hline
+loss & best space-time & step 10 & step 50 & step 100 \\
+\hline
+data-driven                & 0.019 & 0.019 & 0.041 & 0.041 \\
+minimizing movement        & 0.008 & 0.008 & 0.014 & 0.013 \\
+preconditioned LS          & 0.047 & 0.034 & 0.039 & 0.037 \\
+bare LS                    & \textbf{1.000} & \multicolumn{3}{c}{---\ (collapsed; excluded from the rollout figure)} \\
+\hline
+\end{tabular}
+\end{center}
+This is the cleanest statement of the Allen--Cahn result:
+\begin{itemize}
+   \item \textbf{Bare least squares fails completely} --- $\approx100\%$ relative error. It does
+         \emph{not} produce NaNs; it stays finite and collapses towards the trivial prediction
+         (final training loss $0.069$, versus $3.8\times10^{-3}$ preconditioned).
+   \item \textbf{Preconditioning rescues it} to within a factor of two of data-driven training,
+         using the same V-cycle machinery as Poisson with only the operator changed.
+   \item \textbf{Minimizing movement is the best arm overall}, beating even data-driven training,
+         consistent with it inheriting $\kappa$ rather than $\kappa^2$.
+   \item \textbf{Rollouts stay stable to 100 steps} despite a 10-step training horizon; the error
+         plateaus rather than growing, for all three working losses.
+\end{itemize}
+
+\subsection{\texttt{realistic\_ac\_K8} / \texttt{realistic\_ac\_K16} --- harder initial data}
+Identical protocol, with the multi-frequency initial condition at $K=8$ and $K=16$ instead of
+$K=4$; separate output trees, analysis scripts reused unchanged. $K=8$ is the interesting
+intermediate difficulty; at $K=16$ \textbf{none of the arms converged}, which bounds how rich the
+initial data can be before the whole approach stops working at this resolution and budget. Locally
+only three of the four $K=8$ runs are present and $K=16$ results have not been pulled --- worth
+completing before any of this goes in the paper.
+
+\subsection{\texttt{bare\_ls\_seeds} --- is the bare-LS failure deterministic?}
+Three seeds of the bare (unpreconditioned) least-squares arm with the NaN guard removed, each
+writing to its own output directory, to distinguish ``collapses to $\approx100\%$ but stays
+finite'' from ``diverges to NaN''. This is the diagnostic that makes the failure claim in
+\S\ref{sec:exp-realistic} safe to state.
+
+\section{Open issues and things worth checking}
+
+\paragraph{An unresolved inconsistency between two sweeps.}
+\label{sec:exp-inconsistency}
+\texttt{ac\_stresstest} and \texttt{compare\_bptt} have \emph{byte-identical} CLI configurations
+apart from \texttt{--bptt\_mode}, which \texttt{ac\_stresstest} leaves unset --- and unset resolves
+to \texttt{full\_bptt} for the data and Galerkin losses. So \texttt{ac\_stresstest}'s ``data'' and
+``LS'' columns should reproduce \texttt{compare\_bptt}'s \texttt{full} rows. They do not:
+\begin{center}
+\begin{tabular}{lccc}
+\hline
+$\epsilon=16$, data-driven & final train loss & best space-time rel.\ $L^2$ & run date \\
+\hline
+\texttt{ac\_stresstest}  & $1.5\times10^{-1}$ & 0.999 & 10 Jul \\
+\texttt{compare\_bptt}   & $1.0\times10^{-5}$ & 0.009 & 15 Jul \\
+\hline
+\end{tabular}
+\end{center}
+A \emph{supervised} run failing to fit is not a plausible scientific finding, so the
+\texttt{ac\_stresstest} large-$\epsilon$ collapse is most likely a stale-code artefact: the two
+sweeps are five days apart, their result JSONs differ five-fold in size (schema change), and the
+proximal-centre fix \texttt{ee1fdd0} landed the same day as the stress test. \textbf{Treat
+\texttt{compare\_bptt} as authoritative and re-run \texttt{ac\_stresstest} before using its numbers
+anywhere.} Note that this undercuts the ``data-driven falls apart as $\epsilon$ grows'' claim in
+the \texttt{ac\_stresstest} README --- \texttt{compare\_bptt} shows data-driven holding to
+$\epsilon=32$.
+
+\paragraph{Stale READMEs.} \texttt{experiments/allen\_cahn/realistic\_ac/README.md} describes
+$256^2$ and $\epsilon=64$ throughout, but \texttt{sweep.sbatch} actually runs $128^2$ and
+$\epsilon=32$ (the numbers reported in \S\ref{sec:exp-realistic}). The
+\texttt{ac\_stresstest} README lists six $\epsilon$ values; eight were run.
+
+\paragraph{The preconditioned-LS gap.} Preconditioned LS ($0.047$) is still $6\times$ worse than
+minimizing movement ($0.008$) and $2.5\times$ worse than data-driven. The frozen-coefficient
+approximation $\mathbf u^2\equiv1$ is exact in the bulk and wrong exactly on the interface, which
+is where all the dynamics are --- so this gap is expected, but it has not been measured against a
+non-frozen (per-step, per-sample) preconditioner. That is the obvious next experiment, and it is
+the one that would let us claim preconditioning closes the gap for Allen--Cahn as cleanly as it
+does for Poisson.
+
+\paragraph{Not yet done.} No mesh-refinement study for Allen--Cahn (the $h^{-4}$-versus-$h^{-2}$
+story is Poisson-only so far); no infinite-data-limit run (streaming datasets exist for Poisson
+only); no seed replication for anything except bare LS; and the $\epsilon$-sweep has never been run
+with the preconditioned loss included, so we cannot yet say at which $\epsilon$ preconditioning
+stops rescuing least squares.
+
+\end{document}

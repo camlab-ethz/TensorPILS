@@ -80,7 +80,8 @@ def main():
     ax.legend(fontsize=8, framealpha=0.9, ncol=2); ax.grid(alpha=0.3, which="both")
     fig.tight_layout()
     p = os.path.join(out_dir, "rollout_error.png")
-    fig.savefig(p, dpi=150); plt.close(fig); print(f"  {p}")
+    fig.savefig(p, dpi=150); fig.savefig(p[:-4] + ".pdf")
+    plt.close(fig); print(f"  {p}\n  {p[:-4]}.pdf")
 
     # --- energy ---
     fig, ax = plt.subplots(figsize=(8, 5.2))
@@ -99,7 +100,8 @@ def main():
     ax.legend(fontsize=8, framealpha=0.9, ncol=2); ax.grid(alpha=0.3)
     fig.tight_layout()
     p = os.path.join(out_dir, "rollout_energy.png")
-    fig.savefig(p, dpi=150); plt.close(fig); print(f"  {p}")
+    fig.savefig(p, dpi=150); fig.savefig(p[:-4] + ".pdf")
+    plt.close(fig); print(f"  {p}\n  {p[:-4]}.pdf")
 
 
 if __name__ == "__main__":
