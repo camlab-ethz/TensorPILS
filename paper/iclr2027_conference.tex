@@ -55,21 +55,22 @@ ETH Zürich \\
 \section{Introduction}
 
 % Importance of fast solutions of PDEs. A tool for this in the age of AI: neural operators
-\paragraph{Neural Operators} 
-% ---------------------------------------------------------------------------
-% PLACEHOLDER FIGURE. Numbers are made up; regenerate with the real sweep via
-%   python experiments/poisson/graphical_abstract/plot_graphical_abstract.py \
-%       --out paper/figures/graphical_abstract.pdf
-% ---------------------------------------------------------------------------
-\begin{wrapfigure}{r}{0.47\textwidth}
-   \vspace{-\intextsep}
-   \includegraphics[width=\linewidth]{figures/graphical_abstract.pdf}
-   \caption{Adam on the plain versus the preconditioned Poisson least-squares loss,
-   $N\times N$ grid. \emph{Placeholder numbers.}}
-   \label{fig:graphical_abstract}
-\end{wrapfigure}
-
+\paragraph{Neural Operators}
 Despite a century of development of numerical methods, partial differential equations (PDEs) remain expensive to solve, even more so in many-query situations, such as uncertainty quantification, optimal control, and inverse problems. The development of fast PDE solution techniques, e.g., through reduced-order/surrogate models therefore is of utmost importance. In the wake of the deep learning revolution, neural operators emerged as a powerful computational tool for surrogate modeling, drastically reducing PDE solution time in many applications. Neural operators approximate maps between infinite-dimensional spaces (operators) by a neural network, and are typically trained in a supervised fashion. They hence require a dataset that is built in an offline fashion, before they can be trained, and eventually used downstream. Data generation can constitute a substantial part of the computation and engineering effort, even more so in the context of physics foundation models that are pre-trained over an array of different PDE instances.
+
+% Declared here, after the text that fills page 1, so [t] places it at the top of page 2.
+% Regenerate with
+%   python experiments/graphical_abstract/plot_abstract.py \
+%       --bare output/graphical_abstract/abstract_v1/bare.npz \
+%       --mg   output/graphical_abstract/abstract_v1/mg.npz \
+%       --out  paper/figures/graphical_abstract.png
+% Authored at exactly \textwidth, so do not rescale it.
+\begin{figure}[t]
+   \centering
+   \includegraphics[width=\linewidth]{figures/graphical_abstract.pdf}
+   \caption{Ill-conditioning in physics-informed learning: The figure compares Adam minimization of a linear model with and without preconditioning for a physics-informed loss originating from a Poisson problem on a $64^2$ grid. The \textbf{left} and \textbf{centre} report error in each eigenmode of $A$ along the iteration, with the smoothest mode at the bottom. The \textbf{right} figure compares the relative $L^2$ error during training.}
+   \label{fig:graphical_abstract}
+\end{figure}
 
 % Physics-Informed Training: desirable but presently infeasible (prior to this work)
 \paragraph{Physics-Informed Training}

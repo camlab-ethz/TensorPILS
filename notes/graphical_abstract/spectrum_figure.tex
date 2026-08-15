@@ -1,0 +1,115 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage[hidelinks]{hyperref}
+
+\title{What \texttt{landscape\_spectrum} plots}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section*{Setup}
+
+Let $A\in\mathbb R^{n\times n}$ be the interior block of the $Q_1$ stiffness matrix on the
+$N\times N$ grid ($N=64$, so $n=(N-2)^2=3844$), $b=Mf$ the consistent load, and
+$u^\star=A^{-1}b$ computed by a direct solve in \texttt{float64}. Adam is run in \texttt{float32}
+on
+\begin{equation*}
+   L(u)=\tfrac12\|Au-b\|_2^2, \qquad u_0=0,
+\end{equation*}
+producing iterates $u_k$. The quantity the figure decomposes is the \emph{error}
+\begin{equation*}
+   e_k \;=\; u_k-u^\star \in\mathbb R^n ,
+   \qquad\text{so}\qquad e_0=-u^\star .
+\end{equation*}
+
+\section*{The basis}
+
+On a uniform grid $A=K\otimes\tilde M+\tilde M\otimes K$ with $K,\tilde M$ the 1D stiffness and
+mass matrices, and the 1D sine vectors diagonalise both. Hence the 2D sine modes
+\begin{equation*}
+   (v_{pq})_{ij}\;\propto\;\sin\!\Big(\frac{\pi p i}{N-1}\Big)\sin\!\Big(\frac{\pi q j}{N-1}\Big),
+   \qquad p,q=1,\dots,N-2,
+\end{equation*}
+normalised to $\|v_{pq}\|_2=1$, are \emph{exact} eigenvectors of $A$,
+\begin{equation*}
+   A\,v_{pq}=\lambda_{pq}\,v_{pq},
+   \qquad
+   \lambda_{pq}=k_pm_q+m_pk_q,
+\end{equation*}
+with $\theta_p=\pi p h$, $h=1/(N-1)$, $k_p=h^{-1}(2-2\cos\theta_p)$ and
+$m_p=\tfrac{h}{6}(4+2\cos\theta_p)$. They are orthonormal, so
+\begin{equation*}
+   e_k=\sum_{p,q}c_{pq}(k)\,v_{pq},
+   \qquad
+   c_{pq}(k)=\langle e_k,v_{pq}\rangle,
+   \qquad
+   \|e_k\|_2^2=\sum_{p,q}|c_{pq}(k)|^2 .
+\end{equation*}
+The $c_{pq}(k)$ are obtained from one orthonormal 2D DST-I of $e_k$; no eigensolver is used. The
+eigenvector property is verified numerically at run time (relative residual $\sim10^{-13}$).
+
+\section*{The plotted quantity}
+
+The same construction is applied to the gradient-descent iterates, giving the companion figure
+\texttt{landscape\_spectrum\_gd}.
+
+Write $\hat c_{pq}(k)$ for the root-mean-square of $|c_{pq}(k)|$ over the $25$ modes nearest in
+$\lambda$ (a denoising window along the mode axis only, normalised by the number of samples
+actually inside it; the $\lambda$ axis is not binned). The colour is
+\begin{equation*}
+   \boxed{\;
+   \log_{10}\frac{\hat c_{pq}(k)}{\|e_0\|_2}\;}
+   \qquad\text{clipped to }[-5,\,0],
+\end{equation*}
+plotted against iteration $k$ (horizontal, log) and eigenvalue $\lambda_{pq}$ (vertical, log).
+Each cell is one recorded iteration $\times$ one mode.
+
+\paragraph{Why the normalisation is global, not per mode.}
+The natural choice $|c_{pq}(k)|/|c_{pq}(0)|$ is undefined here: with $u_0=0$ the initial error is
+$e_0=-u^\star$, and $u^\star$ inherits the $K^2$ frequencies of the source, so \textbf{only $16$ of
+the $3844$ coefficients $c_{pq}(0)$ are nonzero}. Dividing by $\|e_0\|_2$ instead makes every cell
+comparable and keeps Parseval available: the squared cell values in a column sum to
+$\|e_k\|_2^2/\|e_0\|_2^2$, the squared relative error.
+
+\paragraph{Reading it, and one trap.} Bright $=$ this mode carries error comparable to the
+\emph{total} initial error; black $=$ at or below $10^{-5}$ of it. The colour is a \emph{per-mode}
+amplitude, and the bands hold very different numbers of modes: $3511$ modes have $\lambda\ge1$ and
+only $26$ have $\lambda<0.1$. \textbf{A broad dim band can therefore carry far more error than a
+narrow bright one}, and the heatmap alone does not support quantitative statements about where the
+error lives. The companion figure \texttt{landscape\_bands} plots the un-diluted quantity, the
+fraction of $\|e_k\|_2^2$ in each band, and that is the one to quote.
+
+\paragraph{What the two optimizers actually do.} They behave oppositely, and only the
+gradient-descent panel matches the classical intuition.
+\begin{itemize}
+   \item \textbf{Gradient descent} is the textbook smoother: everything above $\lambda\approx0.1$
+   is annihilated within the first iteration, and $100\%$ of the squared error sits in
+   $\lambda<0.1$ from iteration $1$ through $10^5$, essentially undiminished. It ends at $46.7\%$
+   relative error.
+   \item \textbf{Adam} does the reverse. The smooth band dominates until $k\approx10^3$, then
+   crosses over sharply around $k\approx3$--$7\times10^3$, and by $k\approx10^4$ the modes with
+   $\lambda\ge1$ carry $100\%$ of the error, with the smooth coefficients down at $\sim5\times10^{-5}$.
+   Adam \emph{solves} the smooth content and is left rattling in the stiff modes. This is
+   consistent with its per-coordinate normalisation: it advances every coordinate by
+   $\sim\mathrm{lr}$ regardless of curvature, so it has no difficulty with flat directions, and no
+   way to settle in steep ones.
+\end{itemize}
+So the ill-conditioning of $\tfrac12\|Au-b\|^2$ defeats both, but for different reasons: GD cannot
+move along the flat directions, while Adam cannot stop moving along the steep ones.
+
+\section*{Two rendering notes}
+
+\begin{itemize}
+   \item \textbf{Cell widths are unequal by construction.} Iterations are recorded log-spaced but
+   must be integers, so the first ones are $1,2,3,\dots$; on a log axis the step $1\!\to\!2$ spans
+   $0.30$ decades while $10^4\!\to\!10^5$ spans $1$. The wide left-hand cells are single
+   iterations, and the strong colour changes between them are real: the amplitudes genuinely
+   swing by an order of magnitude per step during the first few iterations.
+   \item Cell edges are the geometric midpoints between samples, with the first edge pinned at
+   $k=1$. (With \texttt{shading="nearest"} the first cell is centred on $k=1$ and extends half a
+   log-spacing to its left, which made the axis display iterations $<10^0$.)
+\end{itemize}
+
+\end{document}
