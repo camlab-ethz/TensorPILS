@@ -146,7 +146,7 @@ For analysis purposes, we will frequently ignore the nonlinear parametrization $
 %    L_{\textup{LS}}(u) = \frac 12 \| A\mathbf u - \mathbf f \|^2
 % \end{equation}
 If $a$ is coercive and symmetric, an energy formulation is an attractive alternative to \eqref{eq:weak_formulation}. In this case, we can find the solution $u$ via a variational principle as the minimizer of the energy $\tfrac12 a(v,v)-f(v)$. The loss function to train the neural operator is, again on a single sample
-\begin{equation}
+\begin{equation}\label{eq:variational_loss_in_theta}
    L_{\textup{Var}}(\theta)= \frac12 \mathbf u(\theta, f)^\top A \mathbf u(\theta, f) - \mathbf f^\top \mathbf u(\theta, f).
 \end{equation}
 
@@ -162,7 +162,7 @@ where $P\in\mathbb R^{n\times n}$ is an invertible matrix, and $B\in\mathbb R^{n
 \end{equation}
 We discuss a few choices of $P$ and $A$.
 
-\subsubsection{Approximate Inverse Preconditioners} We refer to the choice $P\approx A^{-1}$ and $B=I$ or a similarly well-conditioned matrix, like the mass matrix $M_{ij}=(\phi_i,\phi_j)_{L^2}$ as the approximate inverse setting. As proven in Lemma [] in the Appendix, this yields
+\subsubsection{Approximate Inverse Preconditioners}\label{sec:approximate_inverse_preconditioner} We refer to the choice $P\approx A^{-1}$ and $B=I$ or a similarly well-conditioned matrix, like the mass matrix $M_{ij}=(\phi_i,\phi_j)_{L^2}$ as the approximate inverse setting. As proven in Lemma [] in the Appendix, this yields
 \begin{equation*}
    \kappa(PA)^2 
    \approx
@@ -237,7 +237,7 @@ and similarly $\nabla_u^2 \tilde L_{\textup{Var}}(\mathbf u) = P^\top A P$. Howe
 \section{Numerical Results}
 
 \subsection{Poisson Equation}
-We are interested in approximating the solution operator $\mathcal G$ of the Poisson equation
+We approximate the solution operator $\mathcal G$ of the homogeneous Poisson equation
 \begin{align}\label{eq:poisson_equation}
    \begin{split}
       -\Delta u &= f \quad \text{in }\Omega,
@@ -245,7 +245,7 @@ We are interested in approximating the solution operator $\mathcal G$ of the Poi
       u &= 0 \quad \text{on }\partial\Omega,
    \end{split}
 \end{align}
-on the domain $\Omega = [0,1]$ by a Fourier Neural Operator (FNO) $\mathcal G_\theta$. More precisely, $\mathcal G$ maps $f$ to the solution $u$ of \eqref{eq:poisson_equation}. We work on a structured tensor-product grid, and the output of the FNO is interpolated into the space $\mathcal U_h = Q_1^h$ of bilinear quadrilateral finite elements, with (global) basis functions denoted by $\phi_1, \dots,\phi_n$. The corresponding stiffness matrix $A_{ij} = \int_\Omega \nabla \phi_j \nabla \phi_i\,\mathrm dx$ is symmetric and positive definite, which makes both the least-squares formulation and variational formulation available. As an $\mathcal O(n)$ complexity preconditioner $P_{\textup{GMG}}$, we employ a single di-adic V-cycle geometric multigrid method, which falls in the approximate inverse setting []. For details we refer to Appendix [].
+on the domain $\Omega = [0,1]$ by a FNO $\mathcal G_\theta$. More precisely, $\mathcal G$ maps $f$ to the solution $u$ of \eqref{eq:poisson_equation}. We work on a structured tensor-product grid, and the output of the FNO is interpolated into the space $\mathcal U_h = Q_1^h$ of bilinear quadrilateral finite elements, with basis functions denoted by $\phi_1, \dots,\phi_n$. The corresponding stiffness matrix $A_{ij} = \int_\Omega \nabla \phi_j \nabla \phi_i\,\mathrm dx$ is symmetric and positive definite, which makes both the least-squares loss \ref{eq:LS_loss_in_theta} and variational loss \ref{eq:variational_loss_in_theta} available. As preconditioner $P=P_{\textup{GMG}}$, we employ single V-cycle di-adic geometric multigrid, which falls in the approximate inverse setting \ref{sec:approximate_inverse_preconditioner}. The full details are given in Appendix \ref{appendix:details_poisson}.
 
 \subsubsection{Ill-Conditioning Prevents Physics-Informed Training}
 In this experiment, we show that the ill-conditioning of the stiffness matrix $A$ is the reason physics-informed training fails without a preconditioner. To demonstrate this, we use the physics-informed least-squares loss with $B=I$ and a parametrized preconditioner
@@ -417,8 +417,67 @@ acknowledgments, including those to funding agencies, go at the end of the paper
 \bibliographystyle{iclr2027_conference}
 
 \appendix
-\section{Appendix}
-You may include other additional sections here.
+\section{Details of the Poisson Equation Experiment}\label{appendix:details_poisson}
 
+\paragraph{Operator} We consider the Poisson equation with homogeneous Dirichlet boundary conditions on the unit square $\Omega = [0,1]^2$,
+\begin{equation}\label{eq:appendix_poisson}
+   -\Delta u = f \quad \text{in } \Omega, \qquad u = 0 \quad \text{on } \partial\Omega.
+\end{equation}
+For every $f\in H^{1}_0(\Omega)^*$ the Poisson equation admits a unique weak solution $u\in H^1_0(\Omega)$. We learn the associated solution operator 
+\begin{equation*}
+   \mathcal G: \mathcal F \to \mathcal U, \quad f \mapsto u,
+\end{equation*}
+with $\mathcal U = H^1_0(\Omega)$ and $\mathcal F=\mathcal U^*$. Hence $\mathcal G$ is the inverse of the Laplace operator.
+
+\paragraph{Data Set} The dataset pairs $(f, u)$ are constructed through the eigenfunctions of the Laplacian, hence require no PDE solve. We draw coefficients $a_{ij}\sim\mathrm{Unif}[-1,1]$, independently for $i,j=1,\dots,K$, and set
+\begin{align}\label{eq:appendix_poisson_data}
+   \begin{split}
+      f(x,y) &= \frac{\pi}{K^2}\sum_{i,j=1}^{K} a_{ij}\,(i^2+j^2)^{1/2}\,\sin(\pi i x)\sin(\pi j y),
+      \\
+      u(x,y) &= \frac{1}{\pi K^2}\sum_{i,j=1}^{K} a_{ij}\,(i^2+j^2)^{-1/2}\,\sin(\pi i x)\sin(\pi j y).
+   \end{split}
+\end{align}
+The pairs satisfy $-\Delta u = f$ exactly and vanish at the boundary. The parameter $K$ controls the amount of frequencies in the data, and a larger $K$ constitutes a more challenging learning problem. Figure~\ref{fig:poisson_dataset} shows one draw at each value.
+
+\begin{figure}[htb]
+   \centering
+   \includegraphics[width=\linewidth]{figures/poisson_dataset_samples.pdf}
+   \caption{Samples from the Poisson data set, drawn from \eqref{eq:appendix_poisson_data} on a $64^2$ grid: source and solution at $K=4$ (left pair) and at $K=16$ (right pair). Note the differing magnitudes of $u$.}
+   \label{fig:poisson_dataset}
+\end{figure}
+
+\paragraph{Discretization} We partition $\Omega$ into a uniform grid of $(n_x-1)^2$ squares with mesh size $h = 1/(n_x-1)$, and approximate in the space of continuous, piecewise \emph{bilinear} finite elements
+\begin{equation*}
+   \mathcal U_h = Q_1^h = \big\{ v \in C(\overline\Omega) \;:\; v|_T \in \operatorname{span}\{1, x, y, xy\} \text{ for every cell } T, \quad v|_{\partial\Omega} = 0 \big\}.
+\end{equation*}
+We write $\phi_1, \dots, \phi_n$ for the associated global basis functions that are characterized through $\phi_i(x_j) = \delta_{ij}$ on the interior grid nodes $x_1, \dots, x_n$. This means that $n = \dim \mathcal U_h = (n_x-2)^2$. We use $n_x = 64$, hence $n = 3844$. The stiffness and mass matrices are
+\begin{equation}\label{eq:appendix_stiffness_mass}
+   A_{ij} = \int_\Omega \nabla\phi_j \cdot \nabla\phi_i \,\mathrm dx,
+   \qquad
+   M_{ij} = \int_\Omega \phi_j\,\phi_i \,\mathrm dx,
+\end{equation}
+which we assemble with an exact quadrature rule. For the analytical sources $f$ we use its \emph{nodal approximation}, i.e., we replace $f$ by its interpolant $\sum_{j=1}^n f(x_j)\phi_j \in \mathcal U_h$. The discretized forcing thus becomes
+\begin{equation}\label{eq:appendix_consistent_rhs}
+   \mathbf f_i = \sum_{j=1}^n M_{ij}\,f(x_j).
+\end{equation}
+
+\paragraph{Neural Operator} We use a FNO as implemented in the \texttt{neuraloperator} package []. The hyperparameters are collected in Table~\ref{tab:fno}. Because the FNO grid coincides with the finite element nodes, the interpolation into $\mathcal U_h$ of \eqref{eq:neural_operator_interpolated_form} is the identity. Zero boundary conditions are hard-enforced by projecting to zero on $\partial\Omega$, so the model output lies in $\mathcal U_h$ exactly.
+
+\begin{table}[htb]
+   \caption{FNO hyperparameters used for all Poisson experiments.}
+   \label{tab:fno}
+   \begin{center}
+   \begin{tabular}{ll}
+      \multicolumn{1}{c}{\bf Component} & \multicolumn{1}{c}{\bf Value} \\ \hline \\
+      Fourier modes.             & $16\times16$ \\
+      Hidden channels (width)    & $64$ \\
+      Fourier layers             & $5$ \\
+      Lifting / projection channels & $128$ / $128$ \\
+      Positional embedding       & grid coordinates, appended as channels \\
+      Input / output channels    & $1$ / $1$ \\
+      Trainable parameters       & $3.01\times10^{6}$ \\
+   \end{tabular}
+   \end{center}
+\end{table}
 
 \end{document}
