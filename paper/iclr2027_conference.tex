@@ -9,6 +9,8 @@
 \usepackage{url}
 \usepackage{graphicx}
 \usepackage{wrapfig}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
 
 
 \title{Physics-Informed Training at the Operator Level}
@@ -61,14 +63,14 @@ Despite a century of development of numerical methods, partial differential equa
 % Declared here, after the text that fills page 1, so [t] places it at the top of page 2.
 % Regenerate with
 %   python experiments/graphical_abstract/plot_abstract.py \
-%       --bare output/graphical_abstract/abstract_v1/bare.npz \
-%       --mg   output/graphical_abstract/abstract_v1/mg.npz \
+%       --bare output/graphical_abstract/abstract_v1_65grid/bare.npz \
+%       --mg   output/graphical_abstract/abstract_v1_65grid/mg.npz \
 %       --out  paper/figures/graphical_abstract.png
 % Authored at exactly \textwidth, so do not rescale it.
 \begin{figure}[t]
    \centering
    \includegraphics[width=\linewidth]{figures/graphical_abstract.pdf}
-   \caption{Ill-conditioning in physics-informed learning: The figure compares Adam minimization of a linear model with and without preconditioning for a physics-informed loss originating from a Poisson problem on a $64^2$ grid. The \textbf{left} and \textbf{centre} report error in each eigenmode of $A$ along the iteration, with the smoothest mode at the bottom. The \textbf{right} figure compares the relative $L^2$ error during training.}
+   \caption{Ill-conditioning in physics-informed learning: The figure compares Adam minimization of a linear model with and without preconditioning for a physics-informed loss originating from a Poisson problem on a $65^2$ grid. The \textbf{left} and \textbf{centre} report error in each eigenmode of $A$ along the iteration, with the smoothest mode at the bottom. The \textbf{right} figure compares the relative $L^2$ error during training.}
    \label{fig:graphical_abstract}
 \end{figure}
 
@@ -442,7 +444,7 @@ The pairs satisfy $-\Delta u = f$ exactly and vanish at the boundary. The parame
 \begin{figure}[htb]
    \centering
    \includegraphics[width=\linewidth]{figures/poisson_dataset_samples.pdf}
-   \caption{Samples from the Poisson data set, drawn from \eqref{eq:appendix_poisson_data} on a $64^2$ grid: source and solution at $K=4$ (left pair) and at $K=16$ (right pair). Note the differing magnitudes of $u$.}
+   \caption{Samples from the Poisson data set, drawn from \eqref{eq:appendix_poisson_data} on a $65^2$ grid: source and solution at $K=4$ (left pair) and at $K=16$ (right pair). Note the differing magnitudes of $u$.}
    \label{fig:poisson_dataset}
 \end{figure}
 
@@ -450,7 +452,7 @@ The pairs satisfy $-\Delta u = f$ exactly and vanish at the boundary. The parame
 \begin{equation*}
    \mathcal U_h = Q_1^h = \big\{ v \in C(\overline\Omega) \;:\; v|_T \in \operatorname{span}\{1, x, y, xy\} \text{ for every cell } T, \quad v|_{\partial\Omega} = 0 \big\}.
 \end{equation*}
-We write $\phi_1, \dots, \phi_n$ for the associated global basis functions that are characterized through $\phi_i(x_j) = \delta_{ij}$ on the interior grid nodes $x_1, \dots, x_n$. This means that $n = \dim \mathcal U_h = (n_x-2)^2$. We use $n_x = 64$, hence $n = 3844$. The stiffness and mass matrices are
+We write $\phi_1, \dots, \phi_n$ for the associated global basis functions that are characterized through $\phi_i(x_j) = \delta_{ij}$ on the interior grid nodes $x_1, \dots, x_n$. This means that $n = \dim \mathcal U_h = (n_x-2)^2$. We use $n_x = 65$, hence $n = 3969$. The stiffness and mass matrices are
 \begin{equation}\label{eq:appendix_stiffness_mass}
    A_{ij} = \int_\Omega \nabla\phi_j \cdot \nabla\phi_i \,\mathrm dx,
    \qquad
@@ -476,6 +478,48 @@ which we assemble with an exact quadrature rule. For the analytical sources $f$ 
       Positional embedding       & grid coordinates, appended as channels \\
       Input / output channels    & $1$ / $1$ \\
       Trainable parameters       & $3.01\times10^{6}$ \\
+   \end{tabular}
+   \end{center}
+\end{table}
+
+\paragraph{Multigrid Preconditioner} We take $P$ to be a single geometric multigrid V-cycle for $A$ starting from a zero initial guess. We use dyadic coarsening on grids of fineness $2^k+1$ to guarantee nested grids, and denote by $A_\ell$ the stiffness matrix on level $\ell=0,\dots,L-1$, where $\ell=0$ is the finest grid and $L$ the number of levels. As smoother, we use weighted Jacobi with $\omega=2/3$ and $\nu_1=\nu_2=2$ iterations, bilinear prolongation $\Pi_\ell$ with restriction $\Pi_\ell^\top$, and a direct solve on the coarsest grid; Algorithm~\ref{alg:vcycle} summarizes the V-cycle.
+
+\begin{algorithm}[htb]
+   \caption{V-cycle $\mathrm{V}(\ell,\mathbf r)$ on level $\ell$; the preconditioner is $P\mathbf r := \mathrm{V}(0,\mathbf r)$. Here $D_\ell = \operatorname{diag}(A_\ell)$.}
+   \label{alg:vcycle}
+   \begin{algorithmic}[1]
+      \If{$\ell = L-1$}
+         \State \Return $A_{L-1}^{-1}\mathbf r$ \Comment{coarsest grid: direct solve}
+      \EndIf
+      \State $\mathbf e \gets \mathbf 0$
+      \For{$\nu_1$ sweeps}
+         \State $\mathbf e \gets \mathbf e + \omega\, D_\ell^{-1}\big(\mathbf r - A_\ell \mathbf e\big)$ \Comment{pre-smoothing}
+      \EndFor
+      \State $\mathbf r_c \gets \Pi_\ell^\top\big(\mathbf r - A_\ell \mathbf e\big)$ \Comment{restrict the residual}
+      \State $\mathbf e \gets \mathbf e + \Pi_\ell\, \mathrm{V}(\ell+1, \mathbf r_c)$ \Comment{coarse-grid correction}
+      \For{$\nu_2$ sweeps}
+         \State $\mathbf e \gets \mathbf e + \omega\, D_\ell^{-1}\big(\mathbf r - A_\ell \mathbf e\big)$ \Comment{post-smoothing}
+      \EndFor
+      \State \Return $\mathbf e$
+   \end{algorithmic}
+\end{algorithm}
+
+\paragraph{Optimization} The FNO is trained with Adam and cosine annealed learning rate; see Table~\ref{tab:optim}. The configuration is identical across loss functions and preconditioners. The checkpoint attaining the lowest validation error is restored after training.
+
+\begin{table}[htb]
+   \caption{Optimization hyperparameters for the Poisson experiments. Identical across loss functions.}
+   \label{tab:optim}
+   \begin{center}
+   \begin{tabular}{ll}
+      \multicolumn{1}{c}{\bf Setting} & \multicolumn{1}{c}{\bf Value} \\ \hline \\
+      Optimizer                 & Adam, $\beta_1 = 0.9$, $\beta_2 = 0.999$, $\varepsilon = 10^{-8}$ \\
+      Weight decay              & $0$ \\
+      Learning rate             & $10^{-3}$, cosine annealed to $10^{-4}$ over all epochs \\
+      Epochs                    & $500$ \\
+      Batch size                & $32$ \\
+      Train / validation / test samples & $1024$ / $128$ / $256$ \\
+      Model selection           & lowest validation error, restored after training \\
+      Random seed               & $42$ \\
    \end{tabular}
    \end{center}
 \end{table}
