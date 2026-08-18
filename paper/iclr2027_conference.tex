@@ -63,8 +63,8 @@ Despite a century of development of numerical methods, partial differential equa
 % Declared here, after the text that fills page 1, so [t] places it at the top of page 2.
 % Regenerate with
 %   python experiments/graphical_abstract/plot_abstract.py \
-%       --bare output/graphical_abstract/abstract_v1_65grid/bare.npz \
-%       --mg   output/graphical_abstract/abstract_v1_65grid/mg.npz \
+%       --bare output/graphical_abstract/abstract_v1_65grid_omega_opt/bare.npz \
+%       --mg   output/graphical_abstract/abstract_v1_65grid_omega_opt/mg.npz \
 %       --out  paper/figures/graphical_abstract.png
 % Authored at exactly \textwidth, so do not rescale it.
 \begin{figure}[t]
@@ -482,7 +482,7 @@ which we assemble with an exact quadrature rule. For the analytical sources $f$ 
    \end{center}
 \end{table}
 
-\paragraph{Multigrid Preconditioner} We take $P$ to be a single geometric multigrid V-cycle for $A$ starting from a zero initial guess. We use dyadic coarsening on grids of fineness $2^k+1$ to guarantee nested grids, and denote by $A_\ell$ the stiffness matrix on level $\ell=0,\dots,L-1$, where $\ell=0$ is the finest grid and $L$ the number of levels. As smoother, we use weighted Jacobi with $\omega=2/3$ and $\nu_1=\nu_2=2$ iterations, bilinear prolongation $\Pi_\ell$ with restriction $\Pi_\ell^\top$, and a direct solve on the coarsest grid; Algorithm~\ref{alg:vcycle} summarizes the V-cycle.
+\paragraph{Multigrid Preconditioner} We take $P$ to be a single geometric multigrid V-cycle for $A$ starting from a zero initial guess. We use dyadic coarsening on grids of fineness $2^k+1$ to guarantee nested grids, and denote by $A_\ell$ the stiffness matrix on level $\ell=0,\dots,L-1$, where $\ell=0$ is the finest grid and $L$ the number of levels. As smoother, we use weighted Jacobi with $\nu_1=\nu_2=2$ iterations and damping $\omega=8/9$, which is the optimal value for $Q_1$ elements in two dimensions, bilinear prolongation $\Pi_\ell$ with restriction $\Pi_\ell^\top$, and a direct solve on the coarsest grid; Algorithm~\ref{alg:vcycle} summarizes the V-cycle.
 
 \begin{algorithm}[htb]
    \caption{V-cycle $\mathrm{V}(\ell,\mathbf r)$ on level $\ell$; the preconditioner is $P\mathbf r := \mathrm{V}(0,\mathbf r)$. Here $D_\ell = \operatorname{diag}(A_\ell)$.}

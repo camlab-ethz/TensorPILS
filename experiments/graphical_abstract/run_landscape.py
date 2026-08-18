@@ -119,12 +119,13 @@ class MultigridOperator:
     sparse matvecs per step.
     """
 
-    def __init__(self, grid: int, idx: np.ndarray, n_levels=4, pre=2, post=2):
+    def __init__(self, grid: int, idx: np.ndarray, n_levels=4, pre=2, post=2,
+                 omega: float = 2.0 / 3.0):
         import torch
         from tensorpils.preconditioners.multigrid import GeometricMultigrid
         self.torch = torch
         self.mg = GeometricMultigrid(nx_fine=grid, ny_fine=grid, n_levels=n_levels,
-                                     pre_smooth=pre, post_smooth=post)
+                                     pre_smooth=pre, post_smooth=post, omega=omega)
         self.idx = torch.from_numpy(idx.astype(np.int64))
         self.n_full = grid * grid
 
@@ -224,6 +225,11 @@ def main():
     ap.add_argument("--skip_gd", action="store_true",
                     help="skip the gradient-descent arm (it has no lr to match, and costs the same "
                          "as Adam under preconditioning)")
+    ap.add_argument("--mg_omega", type=float, default=2.0 / 3.0,
+                    help="damping of the weighted-Jacobi smoother. The default 2/3 is the *1D "
+                         "finite-difference* optimum; for Q1 in 2D the high-frequency spectrum of "
+                         "D^-1 A is [3/4, 3/2], so the optimal value is 8/9 (smoothing factor 1/3 "
+                         "instead of 1/2).")
     ap.add_argument("--precond", choices=["none", "multigrid"], default="none",
                     help="none (default) minimises 1/2||Au-b||^2; multigrid minimises "
                          "1/2||P(Au-b)||^2 with P one geometric-multigrid V-cycle, used purely "
@@ -252,9 +258,10 @@ def main():
         mask = np.ones(args.grid * args.grid, bool)
         mesh_idx = np.flatnonzero(~structured_quad_mesh(nx=args.grid, ny=args.grid)
                                   .boundary_mask.numpy().astype(bool))
-        P = MultigridOperator(args.grid, mesh_idx)
+        P = MultigridOperator(args.grid, mesh_idx, omega=args.mg_omega)
         sym = P.check_symmetry(n)
-        print(f"preconditioner: multigrid V-cycle   symmetry residual {sym:.2e}")
+        print(f"preconditioner: multigrid V-cycle  omega={args.mg_omega:.4f}  "
+              f"symmetry residual {sym:.2e}")
         if sym > 1e-5:
             raise RuntimeError("V-cycle is not symmetric; grad = A P^2 r is then wrong")
 
@@ -365,6 +372,7 @@ def main():
         best_lr=best_lr, eta_gd=eta, grid=args.grid, n_int=n,
         sweep_lr=grid_lr, sweep_rel=np.array(scores), sweep_steps=args.sweep_steps,
         precond=args.precond, record_mode=args.record, skip_gd=args.skip_gd,
+        mg_omega=args.mg_omega,
         lr_min=(np.nan if args.lr_min is None else args.lr_min),
     )
     print(f"\nwrote {args.out}")
