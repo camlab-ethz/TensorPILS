@@ -1,0 +1,185 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+\usepackage[hidelinks]{hyperref}
+\usepackage[htt]{hyphenat}
+\sloppy
+
+\title{PINO and PI-DeepONet baselines: what the implementation actually does}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\noindent
+Summary of the two published label-free operator-learning baselines on branch
+\texttt{baselines-pino-deeponet}, read off the source rather than the papers. They exist so the
+comparison is against \emph{published} physics-informed operator training and not only against our
+own $t=0$ negative control. Code lives in \texttt{tensorpils/baselines/}; nothing in
+\texttt{losses.py}, \texttt{trainer.py} or \texttt{physics.py} is modified, and only
+\texttt{cli.py} gains dispatch.
+
+\section*{The short answers}
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+ & \textbf{PINO} & \textbf{PI-DeepONet} \\
+\midrule
+Architecture      & FNO (ours, unchanged)          & DeepONet (new, unstacked) \\
+Derivatives       & 2nd-order central differences  & autodiff through the trunk \\
+Dirichlet BC      & hard, $\sin(\pi x)\sin(\pi y)$ & hard, same mollifier \\
+Residual form     & strong                         & strong \\
+Evaluated at      & grid nodes, interior only      & collocation points \\
+Reduction         & relative $L^2$ ratio           & relative $L^2$ ratio \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Does PINO just sit on top of the FNO?} Yes. \texttt{MollifiedModel} wraps our
+\texttt{FNOModel} unchanged and multiplies its output by the mollifier; the loss is swapped and
+nothing else. The only architectural addition in the whole branch is the DeepONet.
+
+\section*{Boundary conditions}
+
+Both baselines impose $u=0$ on $\partial\Omega$ \textbf{hard}, by multiplying the prediction with
+$\sin(\pi x)\sin(\pi y)$. This follows the reference implementations (PINO's \texttt{train\_2d.py}
+applies \texttt{pred = model(x) * mollifier}), and it is applied in the \emph{model}, not the loss,
+so training and evaluation see the same function.
+
+Two details matter:
+\begin{itemize}
+   \item For PINO the mollifier is a grid buffer; for PI-DeepONet it must be evaluated at the
+   \emph{query} coordinates, so it lives inside \texttt{forward\_at} --- which also means the
+   autodiff Laplacian differentiates the \emph{mollified} field, as it must.
+   \item $\sin(\pi\cdot 1.0)$ evaluates to $8.7\times10^{-8}$ in \texttt{float32}, not $0$, so the
+   ``hard'' BC would leak at the far edges. Both implementations snap the domain boundary to
+   exactly zero. The eval-time boundary projection then genuinely has nothing left to do.
+\end{itemize}
+
+\textbf{This is an advantage the baselines have over our bare \texttt{galerkin} arm}, which does not
+get a hard BC. It is deliberate: skipping it would be strawmanning. The soft BC penalty of the
+original PI-DeepONet ($\lambda_{\mathrm{bc}}$) is therefore $0$ by default, which removes a tuned
+hyperparameter rather than adding one.
+
+\section*{How derivatives are computed}
+
+\paragraph{PINO: finite differences.} The Laplacian comes from
+\texttt{neuralop.losses.differentiation.FiniteDiff} --- the reference library's own utility,
+second-order central in the interior, pure \texttt{torch} so it stays differentiable. Using the
+library's function rather than a reimplementation removes ``you coded the baseline wrong'' as a
+reading of any result.
+
+The choice of scheme is not taste. The reference repo uses FFT differentiation for its
+\emph{periodic} problems (Burgers, Navier--Stokes) and central differences for \emph{Dirichlet}
+Darcy. Every PDE here is homogeneous Dirichlet on the unit square, so Darcy is the analogue and
+finite differences is the faithful choice.
+
+Note \texttt{FiniteDiff} names axis $-2$ ``x'' while this repo names it $y$; the spacings are passed
+in its order, $(h_y, h_x)$.
+
+\paragraph{PI-DeepONet: autodiff.} The trunk consumes the coordinate $y=(x,y)$ directly, so the
+Laplacian is exact: one \texttt{grad} of $u$ with respect to \texttt{coords}, then a second
+\texttt{grad} per dimension, with \texttt{create\_graph=True} throughout so the residual remains
+differentiable in the parameters.
+
+\textbf{Coordinates are passed per sample}, as \texttt{[B, Q, 2]} rather than \texttt{[Q, 2]}. With
+the shared form, \texttt{grad(u.sum(), coords)} returns $\sum_b \partial u_b/\partial y$ --- the
+batch \emph{sum} of gradients --- and the per-sample residual cannot be recovered. The code raises
+if given the shared form.
+
+\section*{The DeepONet architecture}
+
+Standard unstacked DeepONet,
+\begin{equation*}
+   \mathcal G_\theta(f)(y) = \frac{1}{\sqrt{p}}\sum_{k=1}^{p} b_k(f)\,t_k(y) + b_0 ,
+\end{equation*}
+with an MLP branch over the input function sampled on the sensor grid and an MLP trunk over the
+query coordinate. \texttt{neuralop} ships no DeepONet, so this is a direct implementation.
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{Component} & \textbf{Value} \\
+\midrule
+Basis functions $p$      & $128$ \\
+Branch                   & MLP $4225 \to 256 \to 256 \to 256 \to 128$, $\tanh$ \\
+Trunk                    & MLP $128 \to 256 \to 256 \to 256 \to 128$, $\tanh$ \\
+Trunk input              & $64$ random Fourier features (fixed, scale $2.0$) \\
+Sensors                  & the full $65^2$ grid, flattened \\
+Trainable parameters     & $1.44\times10^{6}$ (branch $1.25\times10^{6}$, trunk $0.20\times10^{6}$) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Three implementation choices exist so that a poor result is attributable to the objective and not to
+a handicapped baseline:
+\begin{itemize}
+   \item \textbf{Random Fourier features on the trunk.} A plain MLP has a strong spectral bias and
+   these data are multi-frequency ($K=4$ means modes up to $4\times4$); without them the DeepONet
+   underfits for reasons unrelated to the loss. Standard practice in the PI-DeepONet literature.
+   The matrix $B$ is a fixed buffer, so it travels with the checkpoint.
+   \item \textbf{$1/\sqrt{p}$ output scaling.} A dot product of two $p$-vectors grows like
+   $\sqrt{p}$, so without this the output magnitude at initialisation depends on $p$ (measured
+   $5.5\times$ the target at $p=32$, $12.4\times$ at $p=128$). Starting an operator an order of
+   magnitude too large costs the baseline real epochs.
+   \item \textbf{Branch input scaling} \texttt{f\_scale}: an MLP on a raw $O(10^2)$ input trains
+   badly, while the FNO's lifting layer absorbs the scale by itself.
+\end{itemize}
+
+\paragraph{It is also a drop-in for the FNO.} \texttt{forward(f\_grid)} returns
+\texttt{[B,1,H,W]}, the \texttt{FNOModel} signature, so the DeepONet can be paired with
+\emph{any} loss in \texttt{losses.py} through the unmodified \texttt{PoissonTrainer}. This fills the
+``our loss, other architecture'' cell for free. \texttt{forward\_at(f\_grid, coords)} is the second
+entry point, and is what the autodiff residual uses.
+
+\section*{Things that are easy to miss}
+
+\begin{itemize}
+   \item \textbf{The reduction is a relative ratio, not our sum-over-nodes convention.} PINO reduces
+   with $\mathrm{mean}_b\,\|{-\Delta_h u} - f\|_2 / \|f\|_2$. It is inherited, not a physics-informed design choice: this is \texttt{LpLoss.rel()} from the reference FNO/PINO codebase, the relative-$L^2$ reduction introduced as the \emph{supervised} training loss in the original FNO paper and reused unchanged for the equation residual. It changes the gradient scale by
+   \emph{orders of magnitude} relative to our $\tfrac12\|\cdot\|^2$ losses, which is why each
+   baseline arm gets its own learning-rate sweep. Comparing at a shared learning rate would be
+   meaningless. \texttt{--pino\_reduction mse} puts them back on our footing when that is the
+   question.
+   \item \textbf{It is a ratio of norms, not of squared norms}, and that is not cosmetic:
+   $\partial_r \big(\|r\|_2/\|f\|_2\big) = r/(\|r\|_2\|f\|_2)$ has norm $1/\|f\|_2$ for
+   \emph{every} $r\neq0$, so the gradient magnitude does not vanish as the residual does (measured
+   constant across six orders of magnitude in $\|r\|$, while $\tfrac12\|r\|^2$ decays linearly).
+   PINO's objective is therefore not a smooth least-squares problem near its solution, its floor is
+   set by the learning rate, and the Hessian analysis of Section~2.3---which presumes the squared
+   form---does not transfer to it as written.
+   \item \textbf{The residual is evaluated on interior points only}, boundary rows and columns
+   sliced off, as the reference does.
+   \item \textbf{Allen--Cahn: strong vs.\ weak, same time discretisation.} Where our FEM residual is
+   $M\frac{u^{n+1}-u^n}{\tau} + a^2Au^{n+1} - M\rho$, PINO drops the mass matrix and replaces
+   $A \leftrightarrow -\Delta_h$. The time stepping (convex--concave or backward Euler) is identical,
+   so the only thing under test is weak versus strong form.
+   \item \textbf{Allen--Cahn reduces with \texttt{mse}, not the relative ratio}: the step residual
+   has no right-hand side to normalise against.
+   \item \textbf{Collocation defaults to the grid nodes} --- for fairness (every arm then sees the
+   same points), and for Allen--Cahn out of necessity: the residual needs $u^n$ at each collocation
+   point and the FEM Newton reference exists only at nodes. Off-node collocation would require
+   interpolating the reference and would inject an error unrelated to the method.
+   For Poisson the source is closed-form, so random collocation is also available.
+   \item \textbf{\texttt{detach\_coupling} mirrors our \texttt{ACGalerkinLoss}} and is set from
+   \texttt{--bptt\_mode} exactly as the FEM arm is, so the two differ in the residual and not in
+   what the gradient flows through.
+   \item \textbf{Scoring is unchanged}: both are evaluated with the repo's FEM relative-$L^2$ metric
+   and the eval-time boundary projection, so their numbers drop straight into the existing tables.
+\end{itemize}
+
+\section*{Invocation}
+
+\begin{verbatim}
+--loss pino                        # FNO + FD strong form (implies the mollifier)
+--loss pideeponet --model deeponet # DeepONet + autodiff strong form
+--model deeponet --loss pls        # our loss, other architecture
+\end{verbatim}
+Relevant flags: \texttt{--mollify \{auto,on,off\}} (auto = on for the baseline losses, off
+otherwise, so existing arms are unchanged), \texttt{--pi\_n\_colloc}, \texttt{--pino\_reduction},
+\texttt{--deeponet\_p/\_width/\_depth}, \texttt{--trunk\_fourier[\_scale]}.
+
+\end{document}
