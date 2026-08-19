@@ -46,6 +46,12 @@ ARMS_FLAGS=(
 # ratio, Deep Ritz an energy), so their gradient scales differ by orders of magnitude.
 LRS=(1e-4 3e-4 1e-3 3e-3 1e-2 3e-2)
 
+# Epoch budget. 100 by default (the cheap first pass). Override per submission with
+#     sbatch --export=ALL,EPOCHS=500 --array=... lr_sweep.sbatch
+# to re-tune a subset of arms at the full budget -- the optimal lr depends on it, and short
+# sweeps systematically prefer rates that are too large (see the CAVEAT at the top).
+EPOCHS=${EPOCHS:-100}
+
 N_ARMS=${#ARMS_TAG[@]}
 ARM_IDX=$(( SLURM_ARRAY_TASK_ID % N_ARMS ))
 LR_IDX=$((  SLURM_ARRAY_TASK_ID / N_ARMS ))
@@ -62,7 +68,7 @@ LR_MIN=$(python3 -c "print(${LR}/10)")
 OUT=~/TensorPILS/output/poisson/poisson_paper/lr_sweep/lr${LR}
 # -----------------------------------------------------------------------------
 
-echo "=== poisson_paper lr sweep: arm=${TAG} lr=${LR} (task ${SLURM_ARRAY_TASK_ID}) on $(hostname) ==="
+echo "=== poisson_paper lr sweep: arm=${TAG} lr=${LR} epochs=${EPOCHS} (task ${SLURM_ARRAY_TASK_ID}) on $(hostname) ==="
 
 cd ~/TensorPILS
 python -m tensorpils.cli \
@@ -72,7 +78,7 @@ python -m tensorpils.cli \
     -k 10 \
     --grid_resolution 65 \
     --n_train 1024 --n_val 128 --n_test 256 \
-    --epochs 100 \
+    --epochs "${EPOCHS}" \
     --batch_size 32 \
     --optimizer adam \
     --lr "${LR}" --lr_min "${LR_MIN}" \
