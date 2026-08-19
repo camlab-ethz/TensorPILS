@@ -17,7 +17,8 @@ import math
 import pytest
 import torch
 
-from tensorpils.baselines import (DeepONetModel, MollifiedModel, PINOACLoss,
+from tensorpils.baselines import (DeepONetModel, MollifiedModel, ZeroBoundaryModel,
+                                  boundary_mask_grid, PINOACLoss,
                                   PINOPoissonLoss, PIDeepONetACLoss,
                                   autodiff_laplacian, mollifier_grid, rel_lp)
 from tensorpils.baselines.trainers import _arch_tag
@@ -229,6 +230,43 @@ def test_mollifier_imposes_the_boundary_condition_exactly():
     assert out[..., 0, :].abs().max() == 0 and out[..., :, -1].abs().max() == 0
 
 
+def test_zero_boundary_matches_apply_zero_boundary_on_our_arms():
+    """The PINO default BC must be the *same operation* losses.py applies to our arms.
+
+    Not merely "also zero on the boundary": the interior has to be passed through untouched, or
+    PINO would differ from the galerkin arm in the BC as well as in the residual, and the
+    comparison would no longer be attributable to the residual alone.
+    """
+    from tensorpils.physics import apply_zero_boundary
+    from tensorpils.meshing import grid_to_node, node_to_grid
+
+    n = 17
+    m = boundary_mask_grid(n, n)
+    assert m[0].abs().max() == 0 and m[-1].abs().max() == 0
+    assert m[:, 0].abs().max() == 0 and m[:, -1].abs().max() == 0
+    assert m[1:-1, 1:-1].min().item() == 1.0                    # interior untouched
+
+    torch.manual_seed(0)
+    u = torch.randn(2, 1, n, n)
+    wrapped = ZeroBoundaryModel(torch.nn.Identity(), n, n)
+    got = wrapped(u)
+
+    # The FEM path: grid -> nodes -> apply_zero_boundary -> grid.
+    grid_mask = torch.zeros(n, n, dtype=torch.bool)
+    grid_mask[0, :] = grid_mask[-1, :] = grid_mask[:, 0] = grid_mask[:, -1] = True
+    mask = grid_mask.reshape(-1)
+    want = node_to_grid(apply_zero_boundary(grid_to_node(u.squeeze(1), n, n), mask), n, n)
+    assert torch.equal(got.squeeze(1), want)
+
+
+def test_zero_boundary_is_exact_unlike_the_mollifier():
+    """sin(pi * 1.0) is 8.7e-8 in float32; masking is bit-exact zero, with no snap needed."""
+    n = 33
+    out = ZeroBoundaryModel(torch.nn.Identity(), n, n)(torch.ones(1, 1, n, n))
+    for sl in (out[..., 0, :], out[..., -1, :], out[..., :, 0], out[..., :, -1]):
+        assert sl.abs().max().item() == 0.0
+
+
 def test_rel_lp_is_the_reference_reduction():
     """PINO's ``LpLoss.rel(size_average=True)``: per-sample relative norm, mean over batch."""
     pred = torch.tensor([[3.0, 4.0], [0.0, 0.0]])
@@ -309,6 +347,9 @@ def test_arch_tag_sees_through_the_mollifier_wrapper():
     n = 17
     fno_like = torch.nn.Identity()
     assert _arch_tag(MollifiedModel(fno_like, n, n)) == "fno"
+    assert _arch_tag(ZeroBoundaryModel(fno_like, n, n)) == "fno"
+    assert _arch_tag(ZeroBoundaryModel(DeepONetModel((n, n), p=8, width=16, depth=2),
+                                       n, n)) == "deeponet"
     assert _arch_tag(DeepONetModel((n, n), p=8, width=16, depth=2)) == "deeponet"
     assert _arch_tag(MollifiedModel(DeepONetModel((n, n), p=8, width=16, depth=2),
                                     n, n)) == "deeponet"

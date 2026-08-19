@@ -30,7 +30,7 @@ own $t=0$ negative control. Code lives in \texttt{tensorpils/baselines/}; nothin
 \midrule
 Architecture      & FNO (ours, unchanged)          & DeepONet (new, unstacked) \\
 Derivatives       & 2nd-order central differences  & autodiff through the trunk \\
-Dirichlet BC      & hard, $\sin(\pi x)\sin(\pi y)$ & hard, same mollifier \\
+Dirichlet BC      & hard, boundary nodes zeroed & hard, $\sin(\pi x)\sin(\pi y)$ \\
 Residual form     & strong                         & strong \\
 Evaluated at      & grid nodes, interior only      & collocation points \\
 Reduction         & relative $L^2$ ratio           & relative $L^2$ ratio \\
@@ -38,26 +38,39 @@ Reduction         & relative $L^2$ ratio           & relative $L^2$ ratio \\
 \end{tabular}
 \end{center}
 
-\paragraph{Does PINO just sit on top of the FNO?} Yes. \texttt{MollifiedModel} wraps our
-\texttt{FNOModel} unchanged and multiplies its output by the mollifier; the loss is swapped and
-nothing else. The only architectural addition in the whole branch is the DeepONet.
+\paragraph{Does PINO just sit on top of the FNO?} Yes. \texttt{ZeroBoundaryModel} wraps our
+\texttt{FNOModel} unchanged and zeroes its boundary nodes; the loss is swapped and nothing else.
+The only architectural addition in the whole branch is the DeepONet.
 
 \section*{Boundary conditions}
 
-Both baselines impose $u=0$ on $\partial\Omega$ \textbf{hard}, by multiplying the prediction with
-$\sin(\pi x)\sin(\pi y)$. This follows the reference implementations (PINO's \texttt{train\_2d.py}
-applies \texttt{pred = model(x) * mollifier}), and it is applied in the \emph{model}, not the loss,
-so training and evaluation see the same function.
+Both baselines impose $u=0$ on $\partial\Omega$ \textbf{hard}, as a property of the \emph{model}
+rather than of the loss, so training and evaluation see the same function. \textbf{They do so by
+different mechanisms, and deliberately so.}
 
-Two details matter:
-\begin{itemize}
-   \item For PINO the mollifier is a grid buffer; for PI-DeepONet it must be evaluated at the
-   \emph{query} coordinates, so it lives inside \texttt{forward\_at} --- which also means the
-   autodiff Laplacian differentiates the \emph{mollified} field, as it must.
-   \item $\sin(\pi\cdot 1.0)$ evaluates to $8.7\times10^{-8}$ in \texttt{float32}, not $0$, so the
-   ``hard'' BC would leak at the far edges. Both implementations snap the domain boundary to
-   exactly zero. The eval-time boundary projection then genuinely has nothing left to do.
-\end{itemize}
+\paragraph{PINO --- zeroing the boundary nodes (default).} The prediction is multiplied by a
+0/1 mask that is zero on the outer ring of nodes. This is exactly the operation
+\texttt{losses.py} applies to our own arms via \texttt{apply\_zero\_boundary}, so PINO and the
+\texttt{galerkin}/\texttt{pls} arms now impose the Dirichlet condition identically and differ only
+in the residual --- strong versus weak form, finite differences versus exact $Q_1$ assembly.
+A unit test asserts the two operations agree bit-for-bit.
+
+This departs from the reference implementation, which multiplies by
+$\sin(\pi x)\sin(\pi y)$ (still available under \texttt{--pino\_bc mollifier}). The reason is that
+the mollifier injects a smooth global decay profile into the model, and for the multi-frequency
+sine dataset used here that profile is close to the solution's own structure --- information our
+arms never receive. It also does not generalise: zeroing boundary nodes works on any mesh, whereas
+a mollifier must be hand-built per geometry. \emph{Expect this to cost PINO accuracy relative to
+the mollified version}; that is the price of making the comparison attributable.
+
+Masking is bit-exact, so unlike the mollifier it needs no boundary snap: $\sin(\pi\cdot 1.0)$
+evaluates to $8.7\times10^{-8}$ in \texttt{float32}, not $0$.
+
+\paragraph{PI-DeepONet --- the mollifier, for now.} Unchanged from the reference:
+$\sin(\pi x)\sin(\pi y)$, evaluated at the \emph{query} coordinates inside \texttt{forward\_at},
+so the autodiff Laplacian differentiates the mollified field as it must. The same objection
+applies here, and if the mollifier is reinstated it should be reinstated uniformly across all
+methods rather than for one arm.
 
 \textbf{This is an advantage the baselines have over our bare \texttt{galerkin} arm}, which does not
 get a hard BC. It is deliberate: skipping it would be strawmanning. The soft BC penalty of the
@@ -174,12 +187,13 @@ entry point, and is what the autodiff residual uses.
 \section*{Invocation}
 
 \begin{verbatim}
---loss pino                        # FNO + FD strong form (implies the mollifier)
+--loss pino                        # FNO + FD strong form (boundary nodes zeroed)
 --loss pideeponet --model deeponet # DeepONet + autodiff strong form
 --model deeponet --loss pls        # our loss, other architecture
 \end{verbatim}
 Relevant flags: \texttt{--mollify \{auto,on,off\}} (auto = on for the baseline losses, off
-otherwise, so existing arms are unchanged), \texttt{--pi\_n\_colloc}, \texttt{--pino\_reduction},
+otherwise, so existing arms are unchanged), \texttt{--pino\_bc \{zero,mollifier\}} (default
+\texttt{zero}), \texttt{--pi\_n\_colloc}, \texttt{--pino\_reduction},
 \texttt{--deeponet\_p/\_width/\_depth}, \texttt{--trunk\_fourier[\_scale]}.
 
 \end{document}

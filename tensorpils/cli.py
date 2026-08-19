@@ -20,7 +20,8 @@ from .data import (create_datasets, create_scaling_datasets, PoissonDataset,
                    create_wave_datasets, create_ac_datasets, create_stokes_datasets)
 from .models import FNOModel
 from .trainer import PoissonTrainer, WaveTrainer, ACTrainer, StokesTrainer
-from .baselines import (DeepONetModel, MollifiedModel, PINOPoissonTrainer, PINOACTrainer,
+from .baselines import (DeepONetModel, MollifiedModel, ZeroBoundaryModel,
+                        PINOPoissonTrainer, PINOACTrainer,
                         PIDeepONetPoissonTrainer, PIDeepONetACTrainer,
                         DeepONetPoissonTrainer, DeepONetACTrainer)
 
@@ -38,8 +39,8 @@ def build_parser() -> ArgumentParser:
                    help="poisson: data/data_l2/data_h1/galerkin/deepritz/pls. wave/ac: data or "
                         "galerkin (preset for the lambda_galerkin/lambda_data mix). "
                         "BASELINES (poisson/ac only): 'pino' = strong-form residual by finite "
-                        "differences (implies the sin(pi x)sin(pi y) mollifier, as in the "
-                        "reference implementation); 'pideeponet' = the same strong form by "
+                        "differences (hard zero Dirichlet BC by zeroing the boundary nodes, as "
+                        "our own arms do; see --pino_bc); 'pideeponet' = the same strong form by "
                         "autodiff through the trunk, and requires --model deeponet.")
     p.add_argument("--n_train", type=int, default=1024)
     p.add_argument("--n_val", type=int, default=128)
@@ -246,10 +247,18 @@ def build_parser() -> ArgumentParser:
     p.add_argument("--trunk_fourier_scale", type=float, default=2.0,
                    help="DeepONet: std of the random Fourier frequency matrix.")
     p.add_argument("--mollify", choices=["auto", "on", "off"], default="auto",
-                   help="Multiply the prediction by sin(pi x)sin(pi y), imposing the zero "
-                        "Dirichlet BC hard. 'auto' turns it on for the baseline losses "
-                        "(pino/pideeponet), matching the reference implementation, and off "
-                        "otherwise so existing arms are unchanged.")
+                   help="Impose the zero Dirichlet BC hard as part of the model. 'auto' turns it "
+                        "on for the baseline losses (pino/pideeponet) and off otherwise so "
+                        "existing arms are unchanged. HOW it is imposed depends on the arm: "
+                        "PI-DeepONet multiplies by sin(pi x)sin(pi y) (the reference's "
+                        "mollifier); PINO zeroes the boundary nodes -- see --pino_bc.")
+    p.add_argument("--pino_bc", choices=["zero", "mollifier"], default="zero",
+                   help="PINO only: how the hard zero Dirichlet BC is imposed. 'zero' (default) "
+                        "zeroes the boundary nodes, exactly as losses.py does to our own arms via "
+                        "apply_zero_boundary, so PINO differs from the galerkin arm only in the "
+                        "residual. 'mollifier' multiplies by sin(pi x)sin(pi y), reproducing the "
+                        "reference -- but that injects a decay profile close to this dataset's own "
+                        "structure, which our arms never get.")
     p.add_argument("--pi_n_colloc", type=int, default=0,
                    help="pideeponet: collocation points per step, drawn afresh from the grid "
                         "nodes each step. 0 (default) uses all nodes, which matches every "
@@ -538,9 +547,9 @@ def _is_baseline_loss(loss: str) -> bool:
 
 def _build_model(args, in_channels: int, out_channels: int = 1, train_ds=None):
     print("Building model...")
-    # Hard zero-Dirichlet BC via sin(pi x)sin(pi y). On by default for the baselines only:
-    # it is what the PINO reference does, and it removes a boundary-penalty weight from the
-    # baseline's hyperparameters rather than adding one.
+    # Hard zero-Dirichlet BC as part of the model. On by default for the baselines only: it
+    # removes a boundary-penalty weight from their hyperparameters rather than adding one.
+    # The *mechanism* differs by arm -- see --pino_bc and the FNO branch below.
     mollify = (args.mollify == "on") or (args.mollify == "auto" and _is_baseline_loss(args.loss))
 
     if args.model == "deeponet":
@@ -566,8 +575,14 @@ def _build_model(args, in_channels: int, out_channels: int = 1, train_ds=None):
         model = FNOModel(**cfg)
         if mollify:
             nx = ny = args.grid_resolution
-            model = MollifiedModel(model, nx, ny)
-            print("  mollified: output x sin(pi x)sin(pi y)  (hard zero Dirichlet BC)")
+            if args.pino_bc == "mollifier":
+                model = MollifiedModel(model, nx, ny)
+                print("  mollified: output x sin(pi x)sin(pi y)  (hard zero Dirichlet BC)")
+            else:
+                # Default. The same operation losses.py applies to our own arms, so the PINO
+                # comparison isolates the residual instead of also varying the BC treatment.
+                model = ZeroBoundaryModel(model, nx, ny)
+                print("  zero-BC: boundary nodes set to 0  (hard zero Dirichlet BC, as our arms)")
     # Stash the constructor config so a checkpoint can be reloaded without re-guessing it later
     # (e.g. the long_rollout analysis rebuilds the model from this).
     model.build_config = cfg

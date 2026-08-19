@@ -78,10 +78,12 @@ class DeepONetACTrainer(_ArchPrefixMixin, ACTrainer):
 class PINOPoissonTrainer(PoissonTrainer):
     """Poisson with the PINO finite-difference strong-form residual.
 
-    The model is expected to be wrapped in
-    :class:`~tensorpils.baselines.pino.MollifiedModel` (the CLI does this), which is what
-    imposes the zero Dirichlet BC — so ``eval_project_bc`` has nothing left to do and the
-    prediction fed to the loss is the same one that is evaluated.
+    The model is expected to be wrapped so that the zero Dirichlet BC is imposed by the *model*
+    (the CLI does this): :class:`~tensorpils.baselines.pino.ZeroBoundaryModel` by default, which
+    zeroes the boundary nodes exactly as ``losses.py`` does to our own arms, or
+    :class:`~tensorpils.baselines.pino.MollifiedModel` under ``--pino_bc mollifier`` to reproduce
+    the reference. Either way ``eval_project_bc`` has nothing left to do and the prediction fed to
+    the loss is the same one that is evaluated.
     """
 
     def __init__(self, *args, pino_reduction: str = "rel", **kwargs):

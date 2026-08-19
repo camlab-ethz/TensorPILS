@@ -18,10 +18,13 @@ from ``FDM_Darcy`` / ``train_2d.py``, each of which *helps* the baseline — ski
 would be strawmanning:
 
 1. the residual is evaluated on **interior points only** (boundary rows/columns sliced off);
-2. the network output is multiplied by a **mollifier** :math:`\sin(\pi x)\sin(\pi y)`, i.e.
-   the zero Dirichlet BC is imposed *hard* — an advantage our bare ``galerkin`` arm does
-   not have. This is a property of the *model* (``pred = model(x) * mollifier``), not of the
-   loss, so it lives in :class:`MollifiedModel` and is therefore active at eval too;
+2. the zero Dirichlet BC is imposed **hard**, as a property of the *model* rather than of the
+   loss, so it is active at eval too. The reference multiplies by a mollifier
+   :math:`\sin(\pi x)\sin(\pi y)` (:class:`MollifiedModel`); **we default instead to zeroing
+   the boundary nodes** (:class:`ZeroBoundaryModel`), which is exactly what ``losses.py`` does
+   to our own arms via ``apply_zero_boundary``. The mollifier would hand the baseline a smooth
+   decay profile matched to this dataset that our arms never see, so zeroing is the comparable
+   choice; the mollifier remains available via ``--pino_bc mollifier``;
 3. the reduction is the **relative** :math:`L^p` ratio :math:`\|\mathcal{L}u-f\|/\|f\|`
    averaged over the batch, not our sum-over-nodes convention. This changes the gradient
    scale by orders of magnitude, which is why each baseline arm gets its own learning-rate
@@ -46,8 +49,8 @@ except ImportError as e:  # pragma: no cover
         "(neuralop.losses.differentiation.FiniteDiff)."
     ) from e
 
-__all__ = ["mollifier_grid", "MollifiedModel", "rel_lp",
-           "PINOPoissonLoss", "PINOACLoss"]
+__all__ = ["mollifier_grid", "MollifiedModel", "boundary_mask_grid", "ZeroBoundaryModel",
+           "rel_lp", "PINOPoissonLoss", "PINOACLoss"]
 
 
 # --------------------------------------------------------------------------- helpers
@@ -96,6 +99,47 @@ class MollifiedModel(nn.Module):
 
     def forward(self, f: torch.Tensor) -> torch.Tensor:
         return self.model(f) * self.mollifier
+
+
+def boundary_mask_grid(nx: int, ny: int, device=None, dtype=torch.float32) -> torch.Tensor:
+    """``[ny, nx]`` of ones with a zeroed outer ring — the grid form of the FEM Dirichlet mask."""
+    m = torch.ones(ny, nx, device=device, dtype=dtype)
+    m[0, :] = 0.0
+    m[-1, :] = 0.0
+    m[:, 0] = 0.0
+    m[:, -1] = 0.0
+    return m
+
+
+class ZeroBoundaryModel(nn.Module):
+    r"""Wrap a grid model so its boundary nodes are set to **exactly zero**.
+
+    The BC treatment our own arms use, applied to the baseline. ``losses.py`` builds every FEM
+    residual from ``apply_zero_boundary(u_pred_node, boundary_mask)`` — the network's boundary
+    values are discarded and replaced by zero — and this is the grid-space form of the same
+    operation, so PINO and the ``galerkin``/``pls`` arms now impose the Dirichlet condition
+    identically and differ only in the residual itself.
+
+    **Why this replaces the mollifier as the default.** Multiplying by
+    :math:`\sin(\pi x)\sin(\pi y)` also imposes the BC exactly, and it is what PINO's reference
+    does, but it injects a smooth global decay profile into the model — and for the multi-frequency
+    sine dataset used here that profile is close to the solution's own structure, which is
+    information our arms do not get. Zeroing the boundary ring assumes nothing about the interior
+    and generalises to any mesh, whereas a mollifier has to be hand-built per geometry.
+
+    Expect this to *cost* PINO accuracy relative to the mollified version. That is the point: the
+    two are then comparable. :class:`MollifiedModel` is kept for reproducing the reference.
+    """
+
+    def __init__(self, model: nn.Module, nx: int, ny: int):
+        super().__init__()
+        self.model = model
+        self.register_buffer("mask", boundary_mask_grid(nx, ny))
+        # Keep the checkpoint-reload contract of models.FNOModel.
+        self.build_config = getattr(model, "build_config", None)
+
+    def forward(self, f: torch.Tensor) -> torch.Tensor:
+        return self.model(f) * self.mask
 
 
 def rel_lp(pred: torch.Tensor, target: torch.Tensor, p: int = 2,
