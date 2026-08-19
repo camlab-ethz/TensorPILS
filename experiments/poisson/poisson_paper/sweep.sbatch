@@ -34,8 +34,8 @@ ARMS_FLAGS=(
   "--loss pino"
   "--loss pideeponet"
 )
-# <<< EDIT ME after stage 1 >>>   data  ls    pls   dr    pdr   pino  pideeponet
-ARMS_LR=(                        1e-3  1e-3  1e-3  1e-3  1e-3  1e-3  1e-3)
+# from stage 1 (lr sweep, 100 epochs)  data  ls    pls   dr    pdr   pino  pideeponet
+ARMS_LR=(                              1e-3  3e-3  1e-3  3e-3  1e-3  3e-3  3e-4)
 SEEDS=(42 43 44)
 
 N_ARMS=${#ARMS_TAG[@]}
