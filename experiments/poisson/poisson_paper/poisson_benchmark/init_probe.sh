@@ -23,7 +23,7 @@ set -eo pipefail
 OMEGA=0.8888888888888888          # 8/9, the optimal Jacobi damping for Q1 in 2D
 LR=1e-12                          # effectively zero: no parameter moves in float32
 DEVICE=${DEVICE:-cpu}
-OUT=${OUT:-output/poisson/poisson_paper/init_probe}
+OUT=${OUT:-output/poisson/poisson_paper/poisson_benchmark/init_probe}
 # Prefer the repo venv: the other local env on this machine carries a stale tensormesh
 # (0.1.1, no `Field`) and fails at import, the same way Euler did.
 REPO_VENV="$(cd "$(dirname "$0")/../../.." && pwd)/.venv/bin/python"

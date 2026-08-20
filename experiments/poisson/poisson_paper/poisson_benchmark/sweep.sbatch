@@ -9,7 +9,7 @@
 #     sbatch experiments/poisson/poisson_paper/poisson_benchmark/sweep.sbatch
 # Watch:   squeue --me      Logs: logs/pp_final_<jobid>_<task>.out
 # Then:    python experiments/poisson/poisson_paper/poisson_benchmark/plot_final.py \
-#              --root output/poisson/poisson_paper/final
+#              --root output/poisson/poisson_paper/poisson_benchmark/final
 #
 #SBATCH --job-name=pils-pp-final
 #SBATCH --time=06:00:00
@@ -48,7 +48,7 @@ SEED=${SEEDS[$SEED_IDX]}
 LR_MIN=$(python3 -c "print(${LR}/10)")
 
 # Run prefixes do not encode the seed, so each seed needs its own directory.
-OUT=~/TensorPILS/output/poisson/poisson_paper/final/seed${SEED}
+OUT=~/TensorPILS/output/poisson/poisson_paper/poisson_benchmark/final/seed${SEED}
 # -----------------------------------------------------------------------------
 
 echo "=== poisson_paper final: arm=${TAG} lr=${LR} seed=${SEED} (task ${SLURM_ARRAY_TASK_ID}) on $(hostname) ==="

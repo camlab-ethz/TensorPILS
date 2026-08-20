@@ -20,7 +20,7 @@ its own dash pattern, so identity never rests on hue alone.
 
 Usage:
     python experiments/poisson/poisson_paper/poisson_benchmark/plot_final.py \
-        --root output/poisson/poisson_paper/final
+        --root output/poisson/poisson_paper/poisson_benchmark/final
 """
 
 import argparse
@@ -98,7 +98,7 @@ def despine(ax):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--root", default="output/poisson/poisson_paper/final")
+    ap.add_argument("--root", default="output/poisson/poisson_paper/poisson_benchmark/final")
     ap.add_argument("--out_dir", default=None, help="default: alongside --root")
     args = ap.parse_args()
     out_dir = args.out_dir or args.root

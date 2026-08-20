@@ -20,7 +20,7 @@ initialization.
 
 Usage:
     python experiments/poisson/poisson_paper/poisson_benchmark/plot_lr_sweep.py \
-        --root output/poisson/poisson_paper/lr_sweep
+        --root output/poisson/poisson_paper/poisson_benchmark/lr_sweep
 """
 
 import argparse
@@ -89,9 +89,9 @@ def load(root):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--root", default="output/poisson/poisson_paper/lr_sweep")
+    ap.add_argument("--root", default="output/poisson/poisson_paper/poisson_benchmark/lr_sweep")
     ap.add_argument("--out_dir", default=None, help="default: alongside --root")
-    ap.add_argument("--init_probe", default="output/poisson/poisson_paper/init_probe",
+    ap.add_argument("--init_probe", default="output/poisson/poisson_paper/poisson_benchmark/init_probe",
                     help="1-epoch no-op runs supplying the shared epoch-0 point; optional")
     args = ap.parse_args()
     out_dir = args.out_dir or args.root

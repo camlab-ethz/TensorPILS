@@ -16,7 +16,7 @@
 #     sbatch experiments/poisson/poisson_paper/poisson_benchmark/lr_sweep.sbatch
 # Watch:   squeue --me      Logs: logs/pp_lr_<jobid>_<task>.out
 # Then:    python experiments/poisson/poisson_paper/poisson_benchmark/plot_lr_sweep.py \
-#              --root output/poisson/poisson_paper/lr_sweep
+#              --root output/poisson/poisson_paper/poisson_benchmark/lr_sweep
 #
 #SBATCH --job-name=pils-pp-lr
 #SBATCH --time=02:00:00
@@ -63,7 +63,7 @@ LR=${LRS[$LR_IDX]}
 LR_MIN=$(python3 -c "print(${LR}/10)")
 
 # Run prefixes do not encode the learning rate, so each lr needs its own directory.
-OUT=~/TensorPILS/output/poisson/poisson_paper/lr_sweep/lr${LR}
+OUT=~/TensorPILS/output/poisson/poisson_paper/poisson_benchmark/lr_sweep/lr${LR}
 # -----------------------------------------------------------------------------
 
 echo "=== poisson_paper lr sweep: arm=${TAG} lr=${LR} epochs=${EPOCHS} (task ${SLURM_ARRAY_TASK_ID}) on $(hostname) ==="

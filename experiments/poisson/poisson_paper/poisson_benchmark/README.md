@@ -55,7 +55,7 @@ squeue --me
 rsync -avz --exclude 'checkpoints' \
     euler:~/TensorPILS/output/poisson/poisson_paper ~/Documents/TensorPILS/output/poisson/
 python experiments/poisson/poisson_paper/poisson_benchmark/plot_lr_sweep.py \
-    --root output/poisson/poisson_paper/lr_sweep
+    --root output/poisson/poisson_paper/poisson_benchmark/lr_sweep
 
 # edit ARMS_LR in sweep.sbatch with the printed line, commit, push, pull on Euler, then:
 sbatch experiments/poisson/poisson_paper/poisson_benchmark/sweep.sbatch        # 15 tasks
