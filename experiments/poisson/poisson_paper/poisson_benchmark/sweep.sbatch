@@ -32,8 +32,11 @@ ARMS_FLAGS=(
   "--loss pino"
   "--loss pideeponet"
 )
-# from stage 1 (lr sweep)          data  ls    pls   pino  pideeponet
-ARMS_LR=(                          1e-3  3e-3  1e-3  1e-2  3e-4)
+# from stage 1 (lr sweep, 500 epochs -- the full budget, so these supersede the 100-epoch picks).
+# pideeponet is PROVISIONAL: its 500-epoch optimum sat on the 1e-4 edge of the grid, so 1e-4 is an
+# upper bound. Run lr_sweep tasks 34,39 (3e-5, 1e-5) before trusting that column.
+#                                  data  ls    pls   pino  pideeponet
+ARMS_LR=(                          3e-4  3e-3  3e-4  3e-3  1e-4)
 SEEDS=(42 43 44)
 
 N_ARMS=${#ARMS_TAG[@]}

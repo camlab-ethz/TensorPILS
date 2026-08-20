@@ -42,7 +42,10 @@ ARMS_FLAGS=(
 )
 # Wide grid: the arms do not share a reduction (ours is a summed square, PINO a relative norm
 # ratio), so their gradient scales differ by orders of magnitude.
-LRS=(1e-4 3e-4 1e-3 3e-3 1e-2 3e-2)
+# Appended, never reordered: LR_IDX = task/N_ARMS, so adding to the END leaves tasks 0-29
+# mapping to exactly the same (arm, lr) pairs as before. 3e-5 / 1e-5 exist because PI-DeepONet's
+# 500-epoch optimum sat on the 1e-4 edge -- its error rises monotonically across the original grid.
+LRS=(1e-4 3e-4 1e-3 3e-3 1e-2 3e-2 3e-5 1e-5)
 
 # Epoch budget. 100 by default (the cheap first pass). Override per submission with
 #     sbatch --export=ALL,EPOCHS=500 --array=... lr_sweep.sbatch
