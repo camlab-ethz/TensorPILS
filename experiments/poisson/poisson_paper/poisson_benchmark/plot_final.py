@@ -19,7 +19,7 @@ Colours in the overlay are the Okabe-Ito colourblind-safe set, and each arm addi
 its own dash pattern, so identity never rests on hue alone.
 
 Usage:
-    python experiments/poisson/poisson_paper/plot_final.py \
+    python experiments/poisson/poisson_paper/poisson_benchmark/plot_final.py \
         --root output/poisson/poisson_paper/final
 """
 
@@ -41,8 +41,6 @@ ARMS = [
     ("data",       "data-driven",         lambda n: n.startswith("fno_data_")),
     ("ls",         "least squares",       lambda n: n.startswith("fno_galerkin_")),
     ("pls",        "LS + multigrid",      lambda n: n.startswith("fno_pls_")),
-    ("deepritz",   "Deep Ritz",           lambda n: n.startswith("fno_deepritz_bc-hard_")),
-    ("pdeepritz",  "Deep Ritz + precond", lambda n: "deepritz_precond" in n),
     ("pino",       "PINO",                lambda n: n.startswith("fno_pino")),
     ("pideeponet", "PI-DeepONet",         lambda n: n.startswith("deeponet_pi-")),
 ]
@@ -113,7 +111,7 @@ def main():
     style()
 
     # ---------------------------------------------------------------- per-arm panels
-    fig, axes = plt.subplots(2, 4, figsize=(15, 7), sharey=True)
+    fig, axes = plt.subplots(2, 3, figsize=(12, 7), sharey=True)
     summary = {}
     for i, (ax, (key, title, _)) in enumerate(zip(axes.ravel(), ARMS)):
         runs = data[key]
@@ -132,7 +130,7 @@ def main():
         despine(ax)
     axes[0, 0].set_ylabel(r"validation relative $L^2$")
     axes[1, 0].set_ylabel(r"validation relative $L^2$")
-    axes[-1, -1].set_axis_off()                       # 7 arms in an 8-panel grid
+    axes[-1, -1].set_axis_off()                       # 5 arms in a 6-panel grid
     fig.tight_layout(pad=0.6)
     os.makedirs(out_dir, exist_ok=True)
     p = os.path.join(out_dir, "final_panels")

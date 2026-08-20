@@ -19,7 +19,7 @@ is being scored, and including a common constant could otherwise let a diverging
 initialization.
 
 Usage:
-    python experiments/poisson/poisson_paper/plot_lr_sweep.py \
+    python experiments/poisson/poisson_paper/poisson_benchmark/plot_lr_sweep.py \
         --root output/poisson/poisson_paper/lr_sweep
 """
 
@@ -40,8 +40,6 @@ ARMS = [
     ("data",       "data-driven",            lambda n: n.startswith("fno_data_")),
     ("ls",         "least squares",          lambda n: n.startswith("fno_galerkin_")),
     ("pls",        "LS + multigrid",         lambda n: n.startswith("fno_pls_")),
-    ("deepritz",   "Deep Ritz",              lambda n: n.startswith("fno_deepritz_bc-hard_")),
-    ("pdeepritz",  "Deep Ritz + precond",    lambda n: "deepritz_precond" in n),
     ("pino",       "PINO",                   lambda n: n.startswith("fno_pino")),
     ("pideeponet", "PI-DeepONet",            lambda n: n.startswith("deeponet_pi-")),
 ]
@@ -121,7 +119,7 @@ def main():
         "mathtext.fontset": "stix", "axes.edgecolor": MUTED, "text.color": TEXT,
         "axes.labelcolor": TEXT, "xtick.color": MUTED, "ytick.color": MUTED,
     })
-    fig, axes = plt.subplots(2, 4, figsize=(15, 7), sharey=True)
+    fig, axes = plt.subplots(2, 3, figsize=(12, 7), sharey=True)
     picks = {}
     for ax, (key, title, _) in zip(axes.ravel(), ARMS):
         runs = data[key]
@@ -152,7 +150,7 @@ def main():
             ax.spines[sp].set_visible(False)
     axes[0, 0].set_ylabel(r"validation relative $L^2$")
     axes[1, 0].set_ylabel(r"validation relative $L^2$")
-    axes[-1, -1].set_axis_off()                       # 7 arms in an 8-panel grid
+    axes[-1, -1].set_axis_off()                       # 5 arms in a 6-panel grid
     fig.tight_layout(pad=0.6)
     os.makedirs(out_dir, exist_ok=True)
     p = os.path.join(out_dir, "lr_sweep")
@@ -166,7 +164,7 @@ def main():
             lr, err = picks[key]
             edge = "  <-- EDGE OF GRID, widen the sweep" if lr in (1e-4, 3e-2) else ""
             print(f"  {title:<22s} lr = {lr:.0e}   val rel L2 = {err:.4f}{edge}")
-    print("\npaste into sweep.sbatch ARMS_LR (data ls pls deepritz pdeepritz pino pideeponet):")
+    print("\npaste into sweep.sbatch ARMS_LR (data ls pls pino pideeponet):")
     print("ARMS_LR=(" + " ".join(f"{picks[k][0]:.0e}" if k in picks else "1e-3"
                                  for k, _, _ in ARMS) + ")")
 

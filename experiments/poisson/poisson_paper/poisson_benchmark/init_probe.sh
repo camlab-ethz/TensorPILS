@@ -11,11 +11,11 @@
 # It is a measurement, not a cosmetic: "all six lr runs share an init" is currently an inference
 # from the seed being 42 everywhere. This checks it.
 #
-# Cheap enough to run on a laptop -- 7 arms x 1 epoch. CPU rather than MPS because the
+# Cheap enough to run on a laptop -- 5 arms x 1 epoch. CPU rather than MPS because the
 # preconditioned arms use sparse operators, which MPS does not fully support.
 #
 # Usage (from the repo root):
-#     bash experiments/poisson/poisson_paper/init_probe.sh
+#     bash experiments/poisson/poisson_paper/poisson_benchmark/init_probe.sh
 # Then plot_lr_sweep.py picks it up automatically and prepends it as epoch 0.
 
 set -eo pipefail
@@ -30,14 +30,12 @@ REPO_VENV="$(cd "$(dirname "$0")/../../.." && pwd)/.venv/bin/python"
 PYTHON=${PYTHON:-$([ -x "$REPO_VENV" ] && echo "$REPO_VENV" || echo python)}
 
 # Must match lr_sweep.sbatch exactly, or the probe measures a different model.
-ARMS_MODEL=(fno fno fno fno fno fno deeponet)
-ARMS_TAG=(  data ls pls deepritz pdeepritz pino pideeponet)
+ARMS_MODEL=(fno fno fno fno deeponet)
+ARMS_TAG=(  data ls pls pino pideeponet)
 ARMS_FLAGS=(
   "--loss data"
   "--loss galerkin"
   "--loss pls --precond_kind multigrid --mg_omega ${OMEGA}"
-  "--loss deepritz --bc_mode hard"
-  "--loss deepritz --bc_mode hard --precondition --precond_kind multigrid --mg_omega ${OMEGA}"
   "--loss pino"
   "--loss pideeponet"
 )

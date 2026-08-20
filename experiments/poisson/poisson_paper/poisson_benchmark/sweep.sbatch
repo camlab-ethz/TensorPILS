@@ -1,14 +1,14 @@
 #!/bin/bash
 # Poisson paper table, STAGE 2: the final runs.
 #
-# Seven arms x three seeds = 21 tasks. EDIT ARMS_LR BELOW before submitting -- fill in whatever
+# Five arms x three seeds = 15 tasks. EDIT ARMS_LR BELOW before submitting -- fill in whatever
 # lr_sweep.sbatch selected per arm (lowest best validation relative L2). Everything else is the
 # repo default, identical across arms, so the comparison differs only in the objective.
 #
 # Submit from ~/TensorPILS after `mkdir -p logs`, and AFTER the lr sweep:
-#     sbatch experiments/poisson/poisson_paper/sweep.sbatch
+#     sbatch experiments/poisson/poisson_paper/poisson_benchmark/sweep.sbatch
 # Watch:   squeue --me      Logs: logs/pp_final_<jobid>_<task>.out
-# Then:    python experiments/poisson/poisson_paper/make_table.py \
+# Then:    python experiments/poisson/poisson_paper/poisson_benchmark/plot_final.py \
 #              --root output/poisson/poisson_paper/final
 #
 #SBATCH --job-name=pils-pp-final
@@ -16,26 +16,24 @@
 #SBATCH --gpus=1
 #SBATCH --mem-per-cpu=16G
 #SBATCH --output=logs/pp_final_%A_%a.out
-#SBATCH --array=0-20
+#SBATCH --array=0-14
 
 source ~/env_tensorpils.sh
 set -eo pipefail
 
 OMEGA=0.8888888888888888          # 8/9, the optimal Jacobi damping for Q1 in 2D
 
-ARMS_MODEL=(fno fno fno fno fno fno deeponet)
-ARMS_TAG=(  data ls pls deepritz pdeepritz pino pideeponet)
+ARMS_MODEL=(fno fno fno fno deeponet)
+ARMS_TAG=(  data ls pls pino pideeponet)
 ARMS_FLAGS=(
   "--loss data"
   "--loss galerkin"
   "--loss pls --precond_kind multigrid --mg_omega ${OMEGA}"
-  "--loss deepritz --bc_mode hard"
-  "--loss deepritz --bc_mode hard --precondition --precond_kind multigrid --mg_omega ${OMEGA}"
   "--loss pino"
   "--loss pideeponet"
 )
-# from stage 1 (lr sweep, 100 epochs)  data  ls    pls   dr    pdr   pino  pideeponet
-ARMS_LR=(                              1e-3  3e-3  1e-3  3e-3  1e-3  1e-2  3e-4)
+# from stage 1 (lr sweep)          data  ls    pls   pino  pideeponet
+ARMS_LR=(                          1e-3  3e-3  1e-3  1e-2  3e-4)
 SEEDS=(42 43 44)
 
 N_ARMS=${#ARMS_TAG[@]}
