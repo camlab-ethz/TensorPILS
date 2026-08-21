@@ -162,7 +162,12 @@ def main():
     for key, title, _ in ARMS:
         if key in picks:
             lr, err = picks[key]
-            edge = "  <-- EDGE OF GRID, widen the sweep" if lr in (1e-4, 3e-2) else ""
+            # Compare against the grid actually swept for THIS arm, not a hardcoded pair:
+            # the grid was extended to 3e-5/1e-5 for PI-DeepONet, which made a fixed
+            # (1e-4, 3e-2) test report a false edge on a now-interior optimum.
+            swept = sorted(data[key])
+            edge = ("  <-- EDGE OF GRID, widen the sweep"
+                    if lr in (swept[0], swept[-1]) else "")
             print(f"  {title:<22s} lr = {lr:.0e}   val rel L2 = {err:.4f}{edge}")
     print("\npaste into sweep.sbatch ARMS_LR (data ls pls pino pideeponet):")
     print("ARMS_LR=(" + " ".join(f"{picks[k][0]:.0e}" if k in picks else "1e-3"

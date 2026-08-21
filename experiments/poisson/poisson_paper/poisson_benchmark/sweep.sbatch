@@ -33,8 +33,8 @@ ARMS_FLAGS=(
   "--loss pideeponet"
 )
 # from stage 1 (lr sweep, 500 epochs -- the full budget, so these supersede the 100-epoch picks).
-# pideeponet is PROVISIONAL: its 500-epoch optimum sat on the 1e-4 edge of the grid, so 1e-4 is an
-# upper bound. Run lr_sweep tasks 34,39 (3e-5, 1e-5) before trusting that column.
+# pideeponet's optimum first appeared on the 1e-4 edge; extending the grid down (3e-5: 0.2579,
+# 1e-5: 0.6208) confirmed 1e-4 (0.2035) is a genuine interior minimum, not an edge artifact.
 #                                  data  ls    pls   pino  pideeponet
 ARMS_LR=(                          3e-4  3e-3  3e-4  3e-3  1e-4)
 SEEDS=(42 43 44)
