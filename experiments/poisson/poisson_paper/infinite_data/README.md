@@ -19,6 +19,7 @@ original swept PLS alone.
 | | |
 |---|---|
 | grid / dataset | `65²`, `K=10`, `n_val/n_test = 128/256`, `--fixed_eval` (all runs share eval sets) |
+| labels | **`--dataset_solution fem`** — the $Q_1$ FEM solution of $Au = Mf$, for train, val *and* test |
 | budget | 1000 virtual epochs × 32 steps = **32,000 steps**, batch 32 |
 | early stopping | **off** — every run spends the full budget |
 | seeds | one (42) |
@@ -67,8 +68,12 @@ both arms per size with their ratio, plus the size at which supervised training 
   `n_train=4096` sees a fraction of its set. Optimizer steps are equal; passes over the data are not.
 - **The budget is 2× `poisson_benchmark`** (32,000 steps against 500 × 32 = 16,000), so numbers
   here are not directly comparable to the table there.
-- **PLS is measured against the analytic solution but converges to the FEM solution.** The gap at
-  `65²`/`K=10` is 0.68%, a floor PLS cannot pass on this metric. We expect to stay well above it;
-  if the curve approaches 0.007, re-assess before reading the plateau as a property of the loss.
+- **Labels are FEM solutions, so there is no discretisation floor.** With the closed-form labels
+  the arms were scored against different targets: PLS converges to the discrete solution and could
+  never cross the discretisation error (0.68% relative here), while supervised training had no such
+  floor — a plateau would have been unreadable. Under `--dataset_solution fem` the label *is* what
+  the residual losses target, so any plateau is a property of the method. The solve runs once at
+  dataset construction, in scipy, outside autograd; nothing backpropagates through it.
+- **Numbers here are not comparable to `poisson_benchmark`**, which uses analytic labels.
 - **One seed.** On the `K=10` benchmark the supervised arm's spread across seeds was 0.037–0.121 at
   `n=1024`. Treat small differences between neighbouring points as noise.

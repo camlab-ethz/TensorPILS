@@ -59,6 +59,13 @@ def build_parser() -> ArgumentParser:
     p.add_argument("--patience", type=int, default=None,
                    help="Poisson: early-stop when the validation error has not improved for "
                         "this many epochs (default: off).")
+    p.add_argument("--dataset_solution", choices=["analytic", "fem"], default="analytic",
+                   help="Poisson labels: 'analytic' (default) samples the closed-form solution "
+                        "at the nodes; 'fem' solves A u = M f with Q1 on the regular grid, i.e. "
+                        "labels become the discrete solution the FEM losses target. Applies to "
+                        "train, val AND test, so under 'fem' the reported error is measured "
+                        "against the discrete solution and the residual losses lose their "
+                        "discretisation floor (~0.7%% relative at 65^2, K=10).")
     p.add_argument("--fixed_eval", action="store_true",
                    help="Poisson: draw val/test from dedicated seeds (seed+1/seed+2), identical "
                         "for every --n_train — all runs of a dataset-size sweep share the same "
@@ -311,11 +318,13 @@ def run_poisson(args, device):
             K=args.k, grid_resolution=args.grid_resolution, seed=args.seed,
             stream_samples_per_epoch=(args.steps_per_epoch * args.batch_size
                                       if args.stream else None),
+            solution=args.dataset_solution,
         )
     else:
         train_ds, val_ds, test_ds = create_datasets(
             n_train=args.n_train, n_val=args.n_val, n_test=args.n_test,
             K=args.k, grid_resolution=args.grid_resolution, seed=args.seed,
+            solution=args.dataset_solution,
         )
     ntr = f"stream({len(train_ds)}/epoch)" if args.stream else len(train_ds)
     print(f"  train={ntr}, val={len(val_ds)}, test={len(test_ds)}, "
@@ -324,7 +333,8 @@ def run_poisson(args, device):
     # Out-of-distribution eval datasets (higher source complexity K, same grid).
     eval_datasets = {
         f"K{k}": PoissonDataset(num_samples=args.ood_n_val, K=k, seed=args.ood_seed,
-                                grid_resolution=args.grid_resolution)
+                                grid_resolution=args.grid_resolution,
+                                solution=args.dataset_solution)
         for k in args.ood_k
     }
     if eval_datasets:
@@ -593,6 +603,9 @@ def _build_model(args, in_channels: int, out_channels: int = 1, train_ds=None):
 
 def _print_common(args, device):
     print(f"K           : {args.k}")
+    print(f"labels      : {args.dataset_solution}"
+          + ("  (Q1 FEM solve of A u = M f; train+val+test)"
+             if args.dataset_solution == "fem" else "  (closed form at nodes)"))
     print(f"samples     : train={args.n_train}, val={args.n_val}, test={args.n_test}")
     print(f"epochs/bs   : {args.epochs} / {args.batch_size}")
     print(f"lr          : {args.lr}  ->  {args.lr_min}")

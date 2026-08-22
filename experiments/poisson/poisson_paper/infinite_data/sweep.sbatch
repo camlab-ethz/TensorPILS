@@ -6,6 +6,13 @@
 # preconditioned training? Every run gets the same 32,000 optimizer steps (1000 virtual epochs x
 # 32 steps, batch 32), so the x-axis is dataset size and nothing else.
 #
+# Labels are the Q1 FEM solution of A u = M f (--dataset_solution fem), for train, val AND test.
+# With the closed-form labels the two arms are scored against different targets: PLS converges to
+# the discrete solution, so it could never cross the discretisation error (0.68% relative at 65^2,
+# K=10) while supervised training had no such floor. Under fem labels the label IS the target and
+# the floor is gone, so the comparison is attributable to the loss. The solve happens once at
+# dataset construction, in scipy, outside autograd -- labels are constants either way.
+#
 # 15 tasks:
 #   0-13  seven dataset sizes x two arms (data-driven, PLS)
 #   14    PLS on an infinite stream -- fresh samples every step, none ever seen twice
@@ -86,6 +93,7 @@ python -m tensorpils.cli \
     ${CFG} \
     -k ${K} \
     --grid_resolution ${GRID} \
+    --dataset_solution fem \
     --n_val 128 --n_test 256 \
     --steps_per_epoch ${STEPS} \
     --epochs ${EPOCHS} \
