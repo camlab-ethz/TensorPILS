@@ -487,6 +487,10 @@ class PoissonTrainer(BaseTrainer):
             "precond_strength": self.precond_strength,
             "precond_method": self.precond_method,
             "K": self.K,
+            # Which labels this run was trained and scored against. Without it, an analytic-label
+            # and a fem-label run are indistinguishable on disk -- same prefix, same filename --
+            # and the only signal is the file mtime.
+            "dataset_solution": getattr(self.train_dataset, "solution", None),
             "n_train": (None if self.stream else len(self.train_dataset)),
             "stream": self.stream,
             "steps_per_epoch": self.steps_per_epoch,

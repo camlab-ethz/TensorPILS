@@ -13,6 +13,8 @@ vector (for the FEM losses, which operate on node values via the physics operato
 
 from typing import List, Optional
 
+import numpy as np
+import scipy.sparse.linalg as spla
 import torch
 from torch.utils.data import Dataset, IterableDataset
 
@@ -21,14 +23,64 @@ from tensormesh.dataset import PoissonMultiFrequency, WaveMultiFrequency
 from .meshing import structured_quad_mesh, structured_quad9_mesh, node_to_grid
 from .physics import PoissonProblem, WaveProblem, ACProblem, StokesProblem
 
-__all__ = ["PoissonDataset", "StreamingPoissonDataset", "create_datasets",
+__all__ = ["FEMPoissonSolver", "PoissonDataset", "StreamingPoissonDataset", "create_datasets",
            "create_scaling_datasets", "WaveDataset", "create_wave_datasets",
            "ACDataset", "create_ac_datasets",
            "StokesDataset", "create_stokes_datasets", "stokes_body_force"]
 
 
+SOLUTION_MODES = ("analytic", "fem")
+
+
+class FEMPoissonSolver:
+    r"""Exact $Q_1$ FEM solve of :math:`A u = M f`, zero on the Dirichlet boundary.
+
+    Backs ``solution="fem"``: labels become the *discrete* solution the FEM losses actually
+    target, rather than the closed form ``PoissonMultiFrequency.solution`` sampled at nodes.
+    The two differ by the discretisation error -- ~0.7 % relative at ``65^2`` with ``K=10`` --
+    which is a floor the residual-based losses can never cross while the analytic labels are
+    the reference. With ``fem`` labels that floor is gone, because the label *is* the target.
+
+    **Why a sparse LU rather than the DST.** On a uniform grid the discrete sines are exact
+    eigenvectors of the $Q_1$ stiffness, so a DST diagonalises it and is ~2.7x faster
+    (measured, agreeing to 2.4e-14). It is not used, for two reasons: this factorises the
+    *assembled* ``problem.A``, so a label can never silently disagree with the operator the
+    losses use; and the DST would need the mesh to stay uniform, rectangular and $Q_1$, failing
+    silently rather than loudly if that changed. The cost is ~2.3 min per million samples
+    against ~0.8 -- negligible next to training.
+
+    The factorisation is built once and reused for every sample, which is what keeps the
+    streaming dataset affordable.
+    """
+
+    def __init__(self, problem: PoissonProblem):
+        A = problem.A.to_scipy_coo().tocsr()
+        self.M = problem.M.to_scipy_coo().tocsr()
+        mask = problem.boundary_mask.numpy().astype(bool)
+        self.interior = np.flatnonzero(~mask)
+        self.n_nodes = mask.size
+        self.lu = spla.splu(A[self.interior][:, self.interior].tocsc())
+
+    def __call__(self, fs: torch.Tensor) -> torch.Tensor:
+        """``[n, N]`` nodal source values -> ``[n, N]`` FEM solution, exactly 0 on the boundary."""
+        f = fs.detach().cpu().numpy().astype(np.float64)
+        b = (self.M @ f.T).T[:, self.interior]          # consistent load M f, interior rows
+        u = np.zeros((f.shape[0], self.n_nodes), dtype=np.float64)
+        u[:, self.interior] = self.lu.solve(b.T).T
+        return torch.from_numpy(u).float()
+
+
+def _check_solution_mode(solution: str) -> str:
+    if solution not in SOLUTION_MODES:
+        raise ValueError(f"solution must be one of {SOLUTION_MODES}, got {solution!r}")
+    return solution
+
+
 class PoissonDataset(Dataset):
-    """Dataset of (source, analytical-solution) pairs on a structured quad grid.
+    """Dataset of (source, solution) pairs on a structured quad grid.
+
+    ``solution="analytic"`` (default) labels with the closed form; ``"fem"`` labels with the
+    $Q_1$ FEM solution of the same source -- see :class:`FEMPoissonSolver` for why that matters.
 
     Each item is ``((f_grid [1,H,W], grid_size, f_node [N], u_node [N]), u_grid [H,W])``,
     where ``H = ny``, ``W = nx`` and ``N = nx*ny``. The grid form feeds the FNO; the node
@@ -45,9 +97,11 @@ class PoissonDataset(Dataset):
         problem: Optional[PoissonProblem] = None,
         all_data: Optional[dict] = None,
         indices: Optional[List[int]] = None,
+        solution: str = "analytic",
     ):
         super().__init__()
         self.K = K
+        self.solution = _check_solution_mode(solution)
         self.grid_resolution = grid_resolution
         self.grid_size = (grid_resolution, grid_resolution)   # (nx, ny)
 
@@ -75,7 +129,10 @@ class PoissonDataset(Dataset):
             equation = PoissonMultiFrequency(a=self.l_a, r=-0.5)
             points = self.mesh.points                              # [N, 2], float64
             all_fs = equation.source_term(points, domain="rectangle").float()   # [num, N]
-            all_us = equation.solution(points).float()                          # [num, N]
+            if self.solution == "fem":
+                all_us = FEMPoissonSolver(self.problem)(all_fs)                 # [num, N]
+            else:
+                all_us = equation.solution(points).float()                      # [num, N]
 
             self.fs = [all_fs[i] for i in range(num_samples)]
             self.us = [all_us[i] for i in range(num_samples)]
@@ -97,12 +154,13 @@ class PoissonDataset(Dataset):
 
 
 def create_datasets(n_train: int, n_val: int, n_test: int,
-                    K: int, grid_resolution: int = 64, seed: int = 42):
+                    K: int, grid_resolution: int = 64, seed: int = 42,
+                    solution: str = "analytic"):
     """Build train/val/test splits that share one mesh, one :class:`PoissonProblem`,
     and a single pool of generated samples."""
     total = n_train + (n_val if n_val > 0 else 0) + (n_test if n_test > 0 else 0)
     base = PoissonDataset(num_samples=total, K=K, seed=seed,
-                          grid_resolution=grid_resolution)
+                          grid_resolution=grid_resolution, solution=solution)
     mesh, problem, all_data = base.get_shared_resources()
 
     train_idx = list(range(n_train))
@@ -117,6 +175,7 @@ def create_datasets(n_train: int, n_val: int, n_test: int,
         return PoissonDataset(
             num_samples=total, K=K, seed=seed, grid_resolution=grid_resolution,
             mesh=mesh, problem=problem, all_data=all_data, indices=indices,
+            solution=solution,
         )
     return _make(train_idx), _make(val_idx), _make(test_idx)
 
@@ -144,8 +203,10 @@ class StreamingPoissonDataset(IterableDataset):
         problem: Optional[PoissonProblem] = None,
         chunk_size: int = 256,
         n_preview: int = 8,
+        solution: str = "analytic",
     ):
         super().__init__()
+        self.solution = _check_solution_mode(solution)
         self.samples_per_epoch = samples_per_epoch
         self.K = K
         self.grid_resolution = grid_resolution
@@ -156,6 +217,9 @@ class StreamingPoissonDataset(IterableDataset):
             structured_quad_mesh(nx=grid_resolution, ny=grid_resolution)
         self.problem = problem if problem is not None else PoissonProblem(self.mesh)
 
+        # Factorised once here, not per chunk: the stream draws ~10^6 samples over a run.
+        self._fem = FEMPoissonSolver(self.problem) if self.solution == "fem" else None
+
         self._generator = torch.Generator().manual_seed(seed)
         self._preview = self._generate(n_preview, torch.Generator().manual_seed(seed + 1))
 
@@ -165,7 +229,7 @@ class StreamingPoissonDataset(IterableDataset):
         equation = PoissonMultiFrequency(a=l_a, r=-0.5)
         points = self.mesh.points                                        # [N, 2], float64
         fs = equation.source_term(points, domain="rectangle").float()     # [n, N]
-        us = equation.solution(points).float()                            # [n, N]
+        us = self._fem(fs) if self._fem is not None else equation.solution(points).float()
         return fs, us
 
     def _item(self, f: torch.Tensor, u: torch.Tensor):
@@ -194,7 +258,8 @@ class StreamingPoissonDataset(IterableDataset):
 
 def create_scaling_datasets(n_train: int, n_val: int, n_test: int,
                             K: int, grid_resolution: int = 64, seed: int = 42,
-                            stream_samples_per_epoch: Optional[int] = None):
+                            stream_samples_per_epoch: Optional[int] = None,
+                            solution: str = "analytic"):
     """Splits for a dataset-size sweep: val/test are drawn from dedicated seeds
     (``seed+1`` / ``seed+2``), so they are **identical for every** ``n_train`` — all runs
     of the sweep (including the streaming one) are scored on the same eval sets, making
@@ -204,18 +269,22 @@ def create_scaling_datasets(n_train: int, n_val: int, n_test: int,
     ``n_train`` values, which couples the draws and smooths the scaling curve), or the
     infinite stream when ``stream_samples_per_epoch`` is given (then ``n_train`` is ignored).
     """
+    # The mode applies to val/test as well as train: with "fem" the eval metric measures against
+    # the discrete solution, which is what removes the residual losses' discretisation floor.
     test_ds = PoissonDataset(num_samples=n_test, K=K, seed=seed + 2,
-                             grid_resolution=grid_resolution)
+                             grid_resolution=grid_resolution, solution=solution)
     mesh, problem, _ = test_ds.get_shared_resources()
     val_ds = PoissonDataset(num_samples=n_val, K=K, seed=seed + 1,
-                            grid_resolution=grid_resolution, mesh=mesh, problem=problem)
+                            grid_resolution=grid_resolution, mesh=mesh, problem=problem,
+                            solution=solution)
     if stream_samples_per_epoch is not None:
         train_ds = StreamingPoissonDataset(
             samples_per_epoch=stream_samples_per_epoch, K=K, seed=seed,
-            grid_resolution=grid_resolution, mesh=mesh, problem=problem)
+            grid_resolution=grid_resolution, mesh=mesh, problem=problem, solution=solution)
     else:
         train_ds = PoissonDataset(num_samples=n_train, K=K, seed=seed,
-                                  grid_resolution=grid_resolution, mesh=mesh, problem=problem)
+                                  grid_resolution=grid_resolution, mesh=mesh, problem=problem,
+                                  solution=solution)
     return train_ds, val_ds, test_ds
 
 

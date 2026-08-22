@@ -258,10 +258,12 @@ The preconditioner $P_t$ is a convex mixing between no preconditioning $P_0=I$ a
 
 \begin{figure}[t]
   \centering
+  % Both authored at exactly 0.49\textwidth (2.695 in) by
+  % experiments/poisson/sweep_blend/plot_paper.py, so do not rescale them.
   \includegraphics[width=0.49\linewidth]{figures/sweep_overlay.pdf}
   \hfill
   \includegraphics[width=0.49\linewidth]{figures/sweep_collapse.pdf}
-  \caption{Preconditioned least-squares training for the Poisson equation. \textbf{Left:} validation relative $L^2$ vs.\ epoch as the preconditioner $P_t$ is swept from $I$ to $A^{-1}$, together with the geometric multigrid preconditioner \textbf{Right:} best validation error of the $P_t$ preconditioned sweeps against the condition number $\kappa(H_t)$ of the preconditioned loss Hessian.}
+  \caption{Preconditioned least-squares training for the Poisson equation. \textbf{Left:} validation relative $L^2$ vs.\ epoch as the preconditioner $P_t$ is swept from $I$ to $A^{-1}$, together with the geometric multigrid preconditioner \textbf{Right:} test error, at the best-validation checkpoint, of the $P_t$ preconditioned sweeps against the condition number $\kappa(H_t)$ of the preconditioned loss Hessian; the dashed line is the geometric multigrid preconditioner, which has no finite $\kappa(H_t)$.}
   \label{fig:pls-overlay}
 \end{figure}
 

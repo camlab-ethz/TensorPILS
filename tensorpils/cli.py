@@ -20,6 +20,10 @@ from .data import (create_datasets, create_scaling_datasets, PoissonDataset,
                    create_wave_datasets, create_ac_datasets, create_stokes_datasets)
 from .models import FNOModel
 from .trainer import PoissonTrainer, WaveTrainer, ACTrainer, StokesTrainer
+from .baselines import (DeepONetModel, MollifiedModel, ZeroBoundaryModel,
+                        PINOPoissonTrainer, PINOACTrainer,
+                        PIDeepONetPoissonTrainer, PIDeepONetACTrainer,
+                        DeepONetPoissonTrainer, DeepONetACTrainer)
 
 
 def build_parser() -> ArgumentParser:
@@ -29,10 +33,15 @@ def build_parser() -> ArgumentParser:
                    help="Which PDE to train on. 'poisson'/'stokes' (static), "
                         "'wave'/'ac' (time-dependent).")
     p.add_argument("--loss",
-                   choices=["data", "data_l2", "data_h1", "galerkin", "deepritz", "pls"],
+                   choices=["data", "data_l2", "data_h1", "galerkin", "deepritz", "pls",
+                            "pino", "pideeponet"],
                    default="galerkin",
                    help="poisson: data/data_l2/data_h1/galerkin/deepritz/pls. wave/ac: data or "
-                        "galerkin (preset for the lambda_galerkin/lambda_data mix).")
+                        "galerkin (preset for the lambda_galerkin/lambda_data mix). "
+                        "BASELINES (poisson/ac only): 'pino' = strong-form residual by finite "
+                        "differences (hard zero Dirichlet BC by zeroing the boundary nodes, as "
+                        "our own arms do; see --pino_bc); 'pideeponet' = the same strong form by "
+                        "autodiff through the trunk, and requires --model deeponet.")
     p.add_argument("--n_train", type=int, default=1024)
     p.add_argument("--n_val", type=int, default=128)
     p.add_argument("--n_test", type=int, default=256)
@@ -50,6 +59,13 @@ def build_parser() -> ArgumentParser:
     p.add_argument("--patience", type=int, default=None,
                    help="Poisson: early-stop when the validation error has not improved for "
                         "this many epochs (default: off).")
+    p.add_argument("--dataset_solution", choices=["analytic", "fem"], default="analytic",
+                   help="Poisson labels: 'analytic' (default) samples the closed-form solution "
+                        "at the nodes; 'fem' solves A u = M f with Q1 on the regular grid, i.e. "
+                        "labels become the discrete solution the FEM losses target. Applies to "
+                        "train, val AND test, so under 'fem' the reported error is measured "
+                        "against the discrete solution and the residual losses lose their "
+                        "discretisation floor (~0.7%% relative at 65^2, K=10).")
     p.add_argument("--fixed_eval", action="store_true",
                    help="Poisson: draw val/test from dedicated seeds (seed+1/seed+2), identical "
                         "for every --n_train — all runs of a dataset-size sweep share the same "
@@ -219,6 +235,45 @@ def build_parser() -> ArgumentParser:
     p.add_argument("--n_modes", type=int, nargs=2, default=[16, 16])
     p.add_argument("--grid_resolution", type=int, default=64)
 
+    # -------- architecture / baselines (experiments/baselines/) --------
+    p.add_argument("--model", choices=["fno", "deeponet"], default="fno",
+                   help="Neural-operator architecture. 'deeponet' is a drop-in for the FNO "
+                        "(same [B,C,H,W] -> [B,1,H,W] signature), so it can be paired with ANY "
+                        "loss; it additionally exposes a coordinate query, which is what "
+                        "--loss pideeponet differentiates through.")
+    p.add_argument("--deeponet_p", type=int, default=128,
+                   help="DeepONet: number of basis functions (branch/trunk latent width).")
+    p.add_argument("--deeponet_width", type=int, default=256,
+                   help="DeepONet: hidden width of the branch and trunk MLPs.")
+    p.add_argument("--deeponet_depth", type=int, default=4,
+                   help="DeepONet: number of Linear layers in each of branch and trunk.")
+    p.add_argument("--trunk_fourier", type=int, default=64,
+                   help="DeepONet: random Fourier features on the trunk input (0 disables). "
+                        "A plain MLP trunk has a strong spectral bias and underfits "
+                        "multi-frequency data for reasons unrelated to the loss.")
+    p.add_argument("--trunk_fourier_scale", type=float, default=2.0,
+                   help="DeepONet: std of the random Fourier frequency matrix.")
+    p.add_argument("--mollify", choices=["auto", "on", "off"], default="auto",
+                   help="Impose the zero Dirichlet BC hard as part of the model. 'auto' turns it "
+                        "on for the baseline losses (pino/pideeponet) and off otherwise so "
+                        "existing arms are unchanged. HOW it is imposed depends on the arm: "
+                        "PI-DeepONet multiplies by sin(pi x)sin(pi y) (the reference's "
+                        "mollifier); PINO zeroes the boundary nodes -- see --pino_bc.")
+    p.add_argument("--pino_bc", choices=["zero", "mollifier"], default="zero",
+                   help="PINO only: how the hard zero Dirichlet BC is imposed. 'zero' (default) "
+                        "zeroes the boundary nodes, exactly as losses.py does to our own arms via "
+                        "apply_zero_boundary, so PINO differs from the galerkin arm only in the "
+                        "residual. 'mollifier' multiplies by sin(pi x)sin(pi y), reproducing the "
+                        "reference -- but that injects a decay profile close to this dataset's own "
+                        "structure, which our arms never get.")
+    p.add_argument("--pi_n_colloc", type=int, default=0,
+                   help="pideeponet: collocation points per step, drawn afresh from the grid "
+                        "nodes each step. 0 (default) uses all nodes, which matches every "
+                        "other arm's discretisation budget.")
+    p.add_argument("--pino_reduction", choices=["rel", "mse"], default="rel",
+                   help="pino/pideeponet (poisson): 'rel' is the reference implementation's "
+                        "relative-Lp ratio ||Lu-f||/||f||; 'mse' is the plain mean square.")
+
     # -------- Misc --------
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="auto")
@@ -263,11 +318,13 @@ def run_poisson(args, device):
             K=args.k, grid_resolution=args.grid_resolution, seed=args.seed,
             stream_samples_per_epoch=(args.steps_per_epoch * args.batch_size
                                       if args.stream else None),
+            solution=args.dataset_solution,
         )
     else:
         train_ds, val_ds, test_ds = create_datasets(
             n_train=args.n_train, n_val=args.n_val, n_test=args.n_test,
             K=args.k, grid_resolution=args.grid_resolution, seed=args.seed,
+            solution=args.dataset_solution,
         )
     ntr = f"stream({len(train_ds)}/epoch)" if args.stream else len(train_ds)
     print(f"  train={ntr}, val={len(val_ds)}, test={len(test_ds)}, "
@@ -276,15 +333,16 @@ def run_poisson(args, device):
     # Out-of-distribution eval datasets (higher source complexity K, same grid).
     eval_datasets = {
         f"K{k}": PoissonDataset(num_samples=args.ood_n_val, K=k, seed=args.ood_seed,
-                                grid_resolution=args.grid_resolution)
+                                grid_resolution=args.grid_resolution,
+                                solution=args.dataset_solution)
         for k in args.ood_k
     }
     if eval_datasets:
         print(f"  OOD eval sets: {', '.join(eval_datasets)} "
               f"(n={args.ood_n_val} each, seed={args.ood_seed})\n")
 
-    model = _build_model(args, in_channels=1)
-    trainer = PoissonTrainer(
+    model = _build_model(args, in_channels=1, train_ds=train_ds)
+    common = dict(
         model=model,
         train_dataset=train_ds, val_dataset=val_ds, test_dataset=test_ds,
         loss_type=args.loss,
@@ -300,6 +358,19 @@ def run_poisson(args, device):
         steps_per_epoch=args.steps_per_epoch, patience=args.patience,
         eval_datasets=eval_datasets,
     )
+    # The baseline trainers subclass PoissonTrainer, so validation, model selection and the
+    # reported test metric are the inherited ones -- every arm is scored identically.
+    if args.loss == "pino":
+        trainer = PINOPoissonTrainer(pino_reduction=args.pino_reduction, **common)
+    elif args.loss == "pideeponet":
+        trainer = PIDeepONetPoissonTrainer(n_colloc=args.pi_n_colloc,
+                                           pi_reduction=args.pino_reduction, **common)
+    elif args.model == "deeponet":
+        # Same losses, other architecture. The arch-tagged prefix keeps these runs from
+        # landing on (and overwriting) the identically-configured FNO run's files.
+        trainer = DeepONetPoissonTrainer(**common)
+    else:
+        trainer = PoissonTrainer(**common)
     _run(trainer, train_ds, test_ds, args)
 
 
@@ -348,13 +419,15 @@ def run_wave(args, device):
 
 
 def run_ac(args, device):
-    if args.loss not in ("data", "galerkin"):
-        raise SystemExit(f"--pde ac supports --loss data|galerkin, got {args.loss!r}")
+    if args.loss not in ("data", "galerkin", "pino", "pideeponet"):
+        raise SystemExit("--pde ac supports --loss data|galerkin|pino|pideeponet, "
+                         f"got {args.loss!r}")
     # --loss is a preset for the (lambda_galerkin, lambda_data) mix; explicit flags override.
+    # The baselines are physics-only, so they sit on the galerkin side of the preset.
     lg = args.lambda_galerkin
     ld = args.lambda_data
     if lg is None:
-        lg = 1.0 if args.loss == "galerkin" else 0.0
+        lg = 0.0 if args.loss == "data" else 1.0
     if ld is None:
         ld = 1.0 if args.loss == "data" else 0.0
 
@@ -386,8 +459,8 @@ def run_ac(args, device):
     print(f"  train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}, "
           f"grid={train_ds.grid_size}, frames/sample={args.n_steps + 1}\n")
 
-    model = _build_model(args, in_channels=1)
-    trainer = ACTrainer(
+    model = _build_model(args, in_channels=1, train_ds=train_ds)
+    common = dict(
         model=model,
         train_dataset=train_ds, val_dataset=val_ds, test_dataset=test_ds,
         loss_type=args.loss,
@@ -403,6 +476,11 @@ def run_ac(args, device):
         mg_levels=args.mg_levels, mg_pre_smooth=args.mg_pre_smooth,
         mg_post_smooth=args.mg_post_smooth, mg_omega=args.mg_omega,
     )
+    # Both baselines inherit ACTrainer's rollout evaluation, so their reported per-step /
+    # space-time relative L2 is produced by exactly the same code as the FEM arms.
+    cls = {"pino": PINOACTrainer, "pideeponet": PIDeepONetACTrainer}.get(
+        args.loss, DeepONetACTrainer if args.model == "deeponet" else ACTrainer)
+    trainer = cls(**common)
     _run(trainer, train_ds, test_ds, args)
 
 
@@ -473,11 +551,48 @@ def run_stokes(args, device):
     _run(trainer, train_ds, test_ds, args)
 
 
-def _build_model(args, in_channels: int, out_channels: int = 1):
+def _is_baseline_loss(loss: str) -> bool:
+    return loss in ("pino", "pideeponet")
+
+
+def _build_model(args, in_channels: int, out_channels: int = 1, train_ds=None):
     print("Building model...")
-    cfg = dict(n_modes=tuple(args.n_modes), hidden_channels=args.hidden_dim,
-               in_channels=in_channels, out_channels=out_channels, n_layers=args.num_layers)
-    model = FNOModel(**cfg)
+    # Hard zero-Dirichlet BC as part of the model. On by default for the baselines only: it
+    # removes a boundary-penalty weight from their hyperparameters rather than adding one.
+    # The *mechanism* differs by arm -- see --pino_bc and the FNO branch below.
+    mollify = (args.mollify == "on") or (args.mollify == "auto" and _is_baseline_loss(args.loss))
+
+    if args.model == "deeponet":
+        nx = ny = args.grid_resolution
+        # Branch inputs are standardized like StokesDataset.f_scale already does: an MLP on a
+        # raw O(1e2) field trains badly, while the FNO's lifting layer absorbs the scale itself.
+        f_scale = 1.0
+        if train_ds is not None and getattr(train_ds, "fs", None):
+            f_scale = float(torch.stack(list(train_ds.fs)).abs().mean().clamp_min(1e-8))
+        cfg = dict(grid_size=(nx, ny), in_channels=in_channels, p=args.deeponet_p,
+                   width=args.deeponet_width, depth=args.deeponet_depth,
+                   trunk_fourier=args.trunk_fourier, fourier_scale=args.trunk_fourier_scale,
+                   f_scale=f_scale, mollify=mollify, out_channels=out_channels,
+                   seed=args.seed)
+        model = DeepONetModel(**cfg)
+        print(f"  DeepONet  p={args.deeponet_p} width={args.deeponet_width} "
+              f"depth={args.deeponet_depth} fourier={args.trunk_fourier}"
+              f"(scale {args.trunk_fourier_scale})  f_scale={f_scale:.3g}"
+              f"{'  mollified' if mollify else ''}")
+    else:
+        cfg = dict(n_modes=tuple(args.n_modes), hidden_channels=args.hidden_dim,
+                   in_channels=in_channels, out_channels=out_channels, n_layers=args.num_layers)
+        model = FNOModel(**cfg)
+        if mollify:
+            nx = ny = args.grid_resolution
+            if args.pino_bc == "mollifier":
+                model = MollifiedModel(model, nx, ny)
+                print("  mollified: output x sin(pi x)sin(pi y)  (hard zero Dirichlet BC)")
+            else:
+                # Default. The same operation losses.py applies to our own arms, so the PINO
+                # comparison isolates the residual instead of also varying the BC treatment.
+                model = ZeroBoundaryModel(model, nx, ny)
+                print("  zero-BC: boundary nodes set to 0  (hard zero Dirichlet BC, as our arms)")
     # Stash the constructor config so a checkpoint can be reloaded without re-guessing it later
     # (e.g. the long_rollout analysis rebuilds the model from this).
     model.build_config = cfg
@@ -488,6 +603,9 @@ def _build_model(args, in_channels: int, out_channels: int = 1):
 
 def _print_common(args, device):
     print(f"K           : {args.k}")
+    print(f"labels      : {args.dataset_solution}"
+          + ("  (Q1 FEM solve of A u = M f; train+val+test)"
+             if args.dataset_solution == "fem" else "  (closed form at nodes)"))
     print(f"samples     : train={args.n_train}, val={args.n_val}, test={args.n_test}")
     print(f"epochs/bs   : {args.epochs} / {args.batch_size}")
     print(f"lr          : {args.lr}  ->  {args.lr_min}")
@@ -532,8 +650,25 @@ def _report_test(result, pde: str = "poisson"):
         print(f"  final test     : rollout MSE {result:.2e}")
 
 
+def _validate_baseline_args(args):
+    """Fail fast and legibly on baseline flag combinations that cannot work."""
+    if _is_baseline_loss(args.loss) and args.pde not in ("poisson", "ac"):
+        raise SystemExit(f"--loss {args.loss} is implemented for --pde poisson|ac only "
+                         f"(got {args.pde!r}); see experiments/baselines/README.md.")
+    if args.loss == "pideeponet" and args.model != "deeponet":
+        raise SystemExit("--loss pideeponet differentiates through the trunk's coordinate "
+                         "input, so it needs --model deeponet.")
+    if args.model == "deeponet" and args.pde in ("wave", "stokes"):
+        raise SystemExit(f"--model deeponet is wired for --pde poisson|ac only "
+                         f"(got {args.pde!r}).")
+    if args.model == "deeponet" and args.mollify == "off" and args.loss == "pideeponet":
+        raise SystemExit("--loss pideeponet with --mollify off would need a boundary penalty "
+                         "weight; the baseline uses the hard BC, as PINO's reference does.")
+
+
 def main():
     args = build_parser().parse_args()
+    _validate_baseline_args(args)
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)

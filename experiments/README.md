@@ -1,6 +1,7 @@
 # Experiments
 
-Experiments are grouped by PDE: **`poisson/`**, **`allen_cahn/`** and **`stokes/`**. Each leaf subfolder is one
+Experiments are grouped by PDE: **`poisson/`**, **`allen_cahn/`** and **`stokes/`**, plus
+**`baselines/`** (published methods to compare against, grouped by PDE inside). Each leaf subfolder is one
 self-contained experiment: a `README.md` (description, facts, run & plot commands), the SLURM
 `*.sbatch` sweep script, and the aggregation plot script. Run artifacts land in
 `output/<domain>/<name>/` (git-ignored); pull them back from the cluster with
@@ -42,6 +43,20 @@ scored separately, each in its own FE-`L²` norm.
 | [`h_refinement/`](stokes/h_refinement/README.md) | The learning side of the same claim: 3 losses × 3 velocity grids (`33/65/129`) at a fixed budget — does the bare-residual gap widen under refinement? The `65²` column reproduces the paper's headline table. |
 | [`blend_sweep/`](stokes/blend_sweep/README.md) | Sweep `P_t=(1−t)αI+tP` from the bare loss (`t=0`) to the block preconditioner (`t=1`) and collapse the final error onto the *measured* `κ(KP_tK)` — the Stokes analogue of `poisson/sweep_blend/`. |
 | [`monolithic/`](stokes/monolithic/README.md) | The note's monolithic multigrid with a symmetric Uzawa smoother: a genuine `P ≈ K⁻¹`, `O(1)` conditioning instead of `O(h⁻²)`. Also the sharpest result here — `O(1)` conditioning alone makes training *worse*, and fixing the loss **metric** is what turns it into the best label-free arm (19.34 % → 4.33 % velocity). |
+
+### `baselines/`
+
+Published physics-informed operator methods, so the paper's "vastly outperforms previous
+approaches" claim rests on something other than our own negative control. Both are label-free and
+both are scored by the same FEM relative-`L2` metric as every other table. See
+[`baselines/README.md`](baselines/README.md) for why PINO is ported with **finite differences**
+(its Dirichlet example, Darcy, uses them, while its FFT examples are periodic) and for the
+measurement showing the FD and FEM residuals are the same PDE at the same `O(h²)` accuracy.
+
+| Experiment | Question |
+|---|---|
+| [`baselines/poisson/`](baselines/poisson/README.md) | PINO (FNO + FD strong form) and PI-DeepONet (DeepONet + autodiff strong form) against supervised, bare-FEM and preconditioned-FEM training at `64²`. Includes the supervised-DeepONet control and the "our loss, other architecture" cell. |
+| [`baselines/allen_cahn/`](baselines/allen_cahn/README.md) | The same comparison for a nonlinear time-dependent problem, with the task held fixed as the autoregressive one-step stepper so wins/losses stay attributable to the objective. |
 
 ## Evaluation convention
 
