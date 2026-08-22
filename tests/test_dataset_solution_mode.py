@@ -115,3 +115,36 @@ def test_solver_matches_a_dense_solve():
 def test_invalid_mode_is_rejected():
     with pytest.raises(ValueError, match="solution must be one of"):
         PoissonDataset(num_samples=1, K=K, seed=SEED, grid_resolution=GRID, solution="exact")
+
+
+class _TinyNet(torch.nn.Module):
+    """Minimal grid-in/grid-out stand-in for the FNO -- this test is about provenance, not skill."""
+
+    def __init__(self):
+        super().__init__()
+        self.conv = torch.nn.Conv2d(1, 1, 3, padding=1)
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+def test_results_json_records_the_label_mode(tmp_path):
+    """Provenance: a run must say which labels it used.
+
+    Analytic and FEM runs share a run prefix, so they overwrite each other and are otherwise
+    indistinguishable on disk -- mtime was the only signal, which is not provenance.
+    """
+    import json as _json
+
+    from tensorpils.trainer import PoissonTrainer
+
+    for mode in ("analytic", "fem"):
+        out = tmp_path / mode
+        tr, va, te = create_datasets(n_train=4, n_val=2, n_test=2, K=K,
+                                     grid_resolution=GRID, seed=SEED, solution=mode)
+        PoissonTrainer(model=_TinyNet(), train_dataset=tr, val_dataset=va, test_dataset=te,
+                       loss_type="data", batch_size=2, epochs=1,
+                       device="cpu", output_dir=str(out)).train()
+        hits = sorted((out / "results").glob("*.json"))
+        assert len(hits) == 1, hits
+        assert _json.load(open(hits[0]))["dataset_solution"] == mode

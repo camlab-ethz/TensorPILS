@@ -24,6 +24,7 @@ Usage:
 """
 
 import argparse
+import collections
 import glob
 import json
 import os
@@ -95,6 +96,28 @@ def despine(ax):
     ax.set_axisbelow(True)
 
 
+def _report_label_modes(results_root):
+    """Print which label mode(s) the loaded runs used, and shout if they are mixed.
+
+    ``dataset_solution`` distinguishes analytic labels from FEM ones. Runs of the two kinds share
+    a filename, so without this a stale file sits silently beside a fresh one. ``None`` means the
+    run predates the field -- i.e. analytic, since that was the only behaviour then.
+    """
+    modes = collections.Counter()
+    for path in glob.glob(os.path.join(results_root, "**", "*.json"), recursive=True):
+        with open(path) as fh:
+            try:
+                modes[json.load(fh).get("dataset_solution") or "analytic (pre-flag)"] += 1
+            except json.JSONDecodeError:
+                continue
+    if not modes:
+        return
+    label = ", ".join(f"{k}: {v}" for k, v in sorted(modes.items()))
+    print(f"label mode -> {label}")
+    if len(modes) > 1:
+        print("  WARNING: MIXED label modes in one directory -- these numbers are not comparable")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -108,6 +131,7 @@ def main():
     if not n_found:
         raise SystemExit(f"no runs with a validation history under {args.root}")
     print(f"loaded {n_found} runs")
+    _report_label_modes(args.root)
     style()
 
     # ---------------------------------------------------------------- per-arm panels
