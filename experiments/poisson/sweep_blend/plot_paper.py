@@ -42,6 +42,7 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")            # headless: render to file, no display needed
 import matplotlib.pyplot as plt
+from matplotlib.colors import to_rgb
 
 # The subset shown in the paper. Dropping t = 0.50, 0.90, 0.99 removes three curves that lie on
 # top of t = 0.75 and t = 1.00 and crowd the collapse panel's left end without adding information.
@@ -123,16 +124,53 @@ def save(fig, out_dir, stem, dpi):
     print(f"  {pdf}\n  {png}")
 
 
-# Magma, as in the graphical abstract -- but truncated. The abstract uses the full range on a
-# pcolormesh, where the pale top sits on the image; for lines on white paper magma's high end
-# (#FCFDBF) is invisible and its low end (#000004) collides with the dashed black GMG curve.
-# [0.15, 0.85] keeps the family look and stays legible at both ends.
-CMAP_LO, CMAP_HI = 0.15, 0.85
+# The ramp interpolates what the mathematics interpolates: P_t runs from I (t=0, which IS the
+# unpreconditioned loss L_LS -- orange in the graphical abstract) through the preconditioned regime
+# (blue, #1b6ec2, the L_PLS family colour) to A^-1 (t=1, which IS data-driven training -- the
+# raspberry of the infinite-data figure). So the anchors are not decorative; each names an entity
+# the reader has already met elsewhere in the paper.
+#
+# Interpolated in OKLab, not sRGB. Straight sRGB interpolation between these anchors is NOT
+# monotone in lightness (measured), so the ramp would stop reading as ordered; OKLab keeps it
+# monotone and raises the minimum adjacent dE from 6.7 to 7.8.
+#
+# The anchors sit on a magma sub-path: hue sweeps one side of the wheel, so chroma never collapses
+# (minimum 14.5 across the ramp). The earlier orange->blue->raspberry triple dropped to 5.4, i.e.
+# two grey-brown steps, because orange and blue are near-opposite hues and the path between them
+# has to cross the achromatic axis. Every step sits >40 dE from the dashed black GMG curve.
+_ANCHORS = ["#e07a1f", "#bf3a77", "#5c167f"]      # L_LS -> L_PLS -> data-driven
+
+_M1 = np.array([[.4122214708, .5363325363, .0514459929],
+                [.2119034982, .6806995451, .1073969566],
+                [.0883024619, .2817188376, .6299787005]])
+_M2 = np.array([[.2104542553, .7936177850, -.0040720468],
+                [1.9779984951, -2.4285922050, .4505937099],
+                [.0259040371, .7827717662, -.8086757660]])
+
+
+def _to_oklab(c):
+    rgb = np.asarray(to_rgb(c), dtype=float)
+    lin = np.where(rgb <= .04045, rgb / 12.92, ((rgb + .055) / 1.055) ** 2.4)
+    return _M2 @ np.cbrt(_M1 @ lin)
+
+
+def _from_oklab(lab):
+    lin = np.linalg.solve(_M1, np.linalg.solve(_M2, lab) ** 3)
+    lin = np.clip(lin, 0, 1)
+    return tuple(np.clip(np.where(lin <= .0031308, 12.92 * lin,
+                                  1.055 * lin ** (1 / 2.4) - .055), 0, 1))
 
 
 def colours(n):
-    cmap = plt.get_cmap("magma")
-    return [cmap(CMAP_LO + (CMAP_HI - CMAP_LO) * i / max(n - 1, 1)) for i in range(n)]
+    """``n`` steps along the L_LS -> L_PLS -> data-driven ramp, interpolated in OKLab."""
+    labs = [_to_oklab(c) for c in _ANCHORS]
+    out = []
+    for i in range(n):
+        t = i / max(n - 1, 1) * (len(labs) - 1)
+        k = min(int(t), len(labs) - 2)
+        f = t - k
+        out.append(_from_oklab(labs[k] * (1 - f) + labs[k + 1] * f))
+    return out
 
 
 def plot_overlay(blends, mg, out_dir, dpi, window):

@@ -11,6 +11,8 @@
 \usepackage{wrapfig}
 \usepackage{algorithm}
 \usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{multirow}
 
 
 \title{Physics-Informed Training at the Operator Level}
@@ -238,6 +240,39 @@ and similarly $\nabla_u^2 \tilde L_{\textup{Var}}(\mathbf u) = P^\top A P$. Howe
 
 \section{Numerical Results}
 
+We summarize our main experimental findings in Table~\ref{tab:summary}.
+
+\begin{table}[t]
+  \caption{Summary across the three PDE instances. Errors are relative $L^2$ on the test
+  set at the best-validation checkpoint, mean $\pm$ half-range over three seeds.}
+  \label{tab:summary}
+  \centering
+  \footnotesize
+  \begin{tabular}{llccr r}
+    \toprule
+    PDE & loss & physics-informed & derivatives & rel.\ test $L^2$ & time / epoch \\
+    \midrule
+    \midrule
+    \multirow{4}{*}{Poisson}
+      & $L_\textup{PLS}$ & yes & FEM & $0.051 \pm 0.008$ & --- \\
+      & $L_\textup{data}$ & no & --- & $0.047 \pm 0.008$ & --- \\
+      & PINO & yes & FD & $0.331 \pm 0.011$ & --- \\
+      & PI-DeepONet & yes & AD & $0.191 \pm 0.005$ & --- \\
+    \midrule
+    \multirow{4}{*}{Allen--Cahn}
+      & $L_\textup{PLS}$ & yes & FEM & \textit{pending} & --- \\
+      & $L_\textup{data}$ & no & --- & \textit{pending} & --- \\
+      & PINO & yes & FD & \textit{pending} & --- \\
+      & PI-DeepONet & yes & AD & \textit{pending} & --- \\
+    \midrule
+    \multirow{2}{*}{Stokes}
+      & $L_\textup{PLS}$ & yes & FEM & \textit{pending} & --- \\
+      & $L_\textup{data}$ & no & --- & \textit{pending} & --- \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+
 \subsection{Poisson Equation}
 We approximate the solution operator $\mathcal G$ of the homogeneous Poisson equation
 \begin{align}\label{eq:poisson_equation}
@@ -254,7 +289,18 @@ In this experiment, we show that the ill-conditioning of the stiffness matrix $A
 \begin{equation}
    L^t_\textup{PLS}(\mathbf u) = \frac12 \|P_t[A\mathbf u - \mathbf f] \|^2_2, \quad P_t = (1-t)I + t A^{-1}.
 \end{equation}
-The preconditioner $P_t$ is a convex mixing between no preconditioning $P_0=I$ and data-driven training $P_1 = A^{-1}$. This pedagogical choice is possible on a small $64\times 64$ grid, and serves to illustrate the effect of preconditioning on the training dynamics. We monitor the relative $L^2(\Omega)$ error averaged over the validation set during training for a number of $t$-values, and compare to the single di-adic V-cycle geometric multigrid preconditioner. The results are reported in Figure [], where we additionally report the condition number of the Hessian $H_t=\nabla_u^2 L_\textup{PLS}^t = AP_t^2A$.
+
+\begin{wrapfigure}{r}{0.40\textwidth}
+   \vspace{-\intextsep}
+   % Authored at exactly 0.40\textwidth by
+   % experiments/poisson/poisson_paper/infinite_data/plot_scaling.py, so do not rescale it.
+   \includegraphics[width=\linewidth]{figures/infinite_data.pdf}
+   \vspace{-1em}
+   \caption{Test error vs.\ training set size at a fixed optimization budget for finite and infinite datasets.}
+   \label{fig:data-scaling}
+\end{wrapfigure}
+
+The preconditioner $P_t$ is a convex mixing between no preconditioning $P_0=I$ and data-driven training $P_1 = A^{-1}$. This pedagogical choice is possible on a small $65\times 65$ grid, and serves to illustrate the effect of preconditioning on the training dynamics. We monitor the relative $L^2(\Omega)$ error averaged over the validation set during training for a number of $t$-values, and compare to the single di-adic V-cycle geometric multigrid preconditioner. The results are reported in Figure [], where we additionally report the condition number of the Hessian $H_t=\nabla_u^2 L_\textup{PLS}^t = AP_t^2A$. The dataset uses $K=4$.
 
 \begin{figure}[t]
   \centering
@@ -267,18 +313,13 @@ The preconditioner $P_t$ is a convex mixing between no preconditioning $P_0=I$ a
   \label{fig:pls-overlay}
 \end{figure}
 
-\begin{wrapfigure}{r}{0.40\textwidth}
-   \vspace{-\intextsep}
-   \includegraphics[width=\linewidth]{figures/scaling_test_rl2.pdf}
-   \caption{Test error vs.\ dataset size at a fixed budget; dashed is the infinite-data limit.}
-   \label{fig:data-scaling}
-\end{wrapfigure}
+
 Figure \ref{fig:pls-overlay} shows that that preconditioning is essential to obtain efficient physics-informed training. The un-preconditioned run ($t=0$) converges to $\approx 30\%$ relative $L^2$ error after 500 epochs of training with Adam., while data-driven training ($t=1$) lands at below $1\%$ error for the same amount of training epochs. Intermediate values of $t$ interpolate the training dynamics, which leads us to conclude that ill-conditioning prevents efficient physics-informed neural operator training, and preconditioning is an effective strategy to mitigate this. This is further supported by tracking the condition numbers of $H_t$ in dependence on $t$. For $t=0$, we have $\kappa(H_t)=6.5e+05$ and of course for data-driven training it holds $\kappa(H_1)=1$. Interestingly, as visualized on the right of Figure \ref{fig:pls-overlay} below a conditioning of $approx 10^3-10^4$ (corresponding to $t\in[0.05, 0.1]$) we observe diminishing returns for making the preconditioners more accurate. We attribute this to ill-conditioning induced by the neural network parametrization, which is not resolved in our analysis. This suggests, that a highly-accurate preconditioner may not be needed for accurate physics-informed training, and in fact, the geometric multigrid preconditioner performs virtually identical to the gold standard of data-driven training.
 
 \emph{The deep Ritz results come here, or if space is scarce, we put them in the Appendix. They are nice, but not fundamental.}
 
 \subsubsection{Training at The Infinite Data Limit}
-Physics-informed training is not bound to a dataset. Instead, we may draw a fresh batch of samples for every update of the model's parameters. We refer to this as \emph{training at the infinite data limit}. To illustrate the benefit of training in this regime, we fix an optimization budget: 500 epochs' worth of forward passes at a dataset size of 1024 and compare the final relative test $L^2$ error achieved for datasets of growing size, see Figure []. We clearly see the benefit of training in the infinite data regime, even for a fixed finite training budget. 
+Physics-informed training is not bound to a dataset. Instead, we may draw a fresh batch of samples for every update of the model's parameters. We refer to this as \emph{training at the infinite data limit}. To illustrate the benefit of training in this regime, we fix an optimization budget: 1000 epochs' worth of forward passes at a dataset size of 1024 (double check) and compare the final relative test $L^2$ error achieved for datasets of growing size, see Figure []. We clearly see the benefit of training in the infinite data regime, even for a fixed finite training budget. Dataset uses $K=10$.
 
 \subsection{Allen-Cahn Equation}
 We now learn a time-increment operator for the Allen-Cahn equation with homogeneous Dirichlet boundary conditions
@@ -446,7 +487,7 @@ The pairs satisfy $-\Delta u = f$ exactly and vanish at the boundary. The parame
 \begin{figure}[htb]
    \centering
    \includegraphics[width=\linewidth]{figures/poisson_dataset_samples.pdf}
-   \caption{Samples from the Poisson data set, drawn from \eqref{eq:appendix_poisson_data} on a $65^2$ grid: source and solution at $K=4$ (left pair) and at $K=16$ (right pair). Note the differing magnitudes of $u$.}
+   \caption{Samples from the Poisson data set, drawn from \eqref{eq:appendix_poisson_data} on a $65^2$ grid: source and solution at $K=4$ (left pair) and at $K=10$ (right pair). Note the differing magnitudes of $u$.}
    \label{fig:poisson_dataset}
 \end{figure}
 
@@ -506,22 +547,26 @@ which we assemble with an exact quadrature rule. For the analytical sources $f$ 
    \end{algorithmic}
 \end{algorithm}
 
-\paragraph{Optimization} The FNO is trained with Adam and cosine annealed learning rate; see Table~\ref{tab:optim}. The configuration is identical across loss functions and preconditioners. The checkpoint attaining the lowest validation error is restored after training.
+\paragraph{Optimization} The FNO is trained with Adam and a cosine annealed learning rate; see Table~\ref{tab:optim}. Every setting is shared across losses and preconditioners \emph{except the learning rate}, which is tuned per loss. The rate is selected by a grid search over $\{10^{-4}, 3\cdot 10^{-4}, 10^{-3}, 3\cdot 10^{-3}, 10^{-2}, 3\cdot 10^{-2}\}$, run at the full $500$-epoch budget with a single seed, choosing the rate that attains the lowest validation relative $L^2$ over training. An optimal learning rate at the boundary of the interval prompted us to extend the range for PI-DeepONet, for which $3\cdot 10^{-5}$ and $10^{-5}$ were added, confirming $10^{-4}$ as an interior optimum. The final runs then repeat the selected configuration over three seeds. Throughout, the checkpoint attaining the lowest validation error is restored after training, and the reported test error is evaluated at that checkpoint.
 
 \begin{table}[htb]
-   \caption{Optimization hyperparameters for the Poisson experiments. Identical across loss functions.}
+   \caption{Optimization hyperparameters for the Poisson experiments. Shared across losses except
+   the learning rate, which is swept per loss as described above.}
    \label{tab:optim}
    \begin{center}
    \begin{tabular}{ll}
       \multicolumn{1}{c}{\bf Setting} & \multicolumn{1}{c}{\bf Value} \\ \hline \\
       Optimizer                 & Adam, $\beta_1 = 0.9$, $\beta_2 = 0.999$, $\varepsilon = 10^{-8}$ \\
       Weight decay              & $0$ \\
-      Learning rate             & $10^{-3}$, cosine annealed to $10^{-4}$ over all epochs \\
+      Schedule                  & cosine, annealed from $\eta$ to $\eta/10$ over all epochs \\
+      Learning rate $\eta$      & $3\cdot 10^{-4}$ for $L_\textup{data}$ and $L_\textup{PLS}$ \\
+                                & $3\cdot 10^{-3}$ for $L_\textup{LS}$ and PINO \\
+                                & $10^{-4}$ for PI-DeepONet \\
       Epochs                    & $500$ \\
       Batch size                & $32$ \\
       Train / validation / test samples & $1024$ / $128$ / $256$ \\
-      Model selection           & lowest validation error, restored after training \\
-      Random seed               & $42$ \\
+      Model selection           & lowest validation relative $L^2$, restored after training \\
+      Random seeds              & $42, 43, 44$ (final runs); $42$ for the learning-rate sweep \\
    \end{tabular}
    \end{center}
 \end{table}

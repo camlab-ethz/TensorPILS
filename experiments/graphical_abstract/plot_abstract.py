@@ -30,8 +30,16 @@ matplotlib.use("Agg")            # headless: render to file, no display needed
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 
-C_BARE = "#e07a1f"
-C_MG = "#1b6ec2"
+# The paper's three entities, anchored on a magma sub-path so any ramp between them stays
+# saturated. Orange and blue (the previous L_PLS) are near-opposite hues, so a ramp holding both
+# had to cross the achromatic axis -- measured minimum chroma 5.4, i.e. two muddy grey-brown steps.
+# On this path the minimum is 14.5. Pairwise dE: LS-PLS 20.5, LS-data 41.0, PLS-data 22.8.
+C_LS   = "#e07a1f"   # L_LS   -- unpreconditioned least squares
+C_PLS  = "#bf3a77"   # L_PLS  -- preconditioned least squares
+C_DATA = "#5c167f"   # L_data -- supervised
+
+C_BARE = C_LS
+C_MG = C_PLS
 MUTED = "#6b6b6b"
 TEXT = "#1a1a1a"
 

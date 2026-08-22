@@ -34,11 +34,39 @@ matplotlib.use("Agg")            # headless: render to file, no display needed
 import matplotlib.pyplot as plt
 
 # Prefix -> arm. Same matching convention as poisson_benchmark's plotting scripts.
+# Colours are fixed across the paper by the graphical abstract: orange is L_LS, blue is L_PLS.
+# Colours come from the paper-wide triple on a magma sub-path: L_LS orange #e07a1f, L_PLS magenta
+# #bf3a77, L_data deep purple #5c167f. Pairwise OKLab dE 20.5 / 41.0 / 22.8, all well clear of the
+# 8 floor. Chosen so the blend-sweep ramp between L_LS and L_data can pass through L_PLS without
+# crossing the achromatic axis; see experiments/poisson/sweep_blend/plot_paper.py.
+# The two arms coincide to within 1-4% at every size, so a solid line simply hides the other and
+# markers only re-hide it at the sample points. One solid, one dashed: the dashes let the curve
+# underneath show through, which reads as "these lie on top of each other" rather than "one is
+# missing". The infinite-data reference is dotted so it stays distinct from L_data's dashes.
 ARMS = [
-    ("pls",  "PLS (multigrid)", "#0072B2", "o", lambda n: n.startswith("fno_pls_")),
-    ("data", "data-driven",     "#D55E00", "s", lambda n: n.startswith("fno_data_")),
+    # Lightened from the canonical #bf3a77. In this figure L_PLS and L_data are the two curves
+    # that lie on top of each other, and they are the closest pair in the paper triple (dE 22.8).
+    # #d24d87 opens that to 27.5 while staying only dE 5.5 from the canonical magenta, so it still
+    # reads as the same colour next to the other figures. Local deviation, deliberate.
+    ("pls",  r"$L_{\mathrm{PLS}}$",  "#d24d87", "-",        lambda n: n.startswith("fno_pls_")),
+    ("data", r"$L_{\mathrm{data}}$", "#5c167f", (0, (4, 2)), lambda n: n.startswith("fno_data_")),
 ]
+STREAM_LS = (0, (1, 1.6))     # dotted; must not be confusable with L_data's dashes
+PLAIN = {"pls": "L_PLS", "data": "L_data"}       # for the terminal table; math is for the figure
 MUTED, TEXT = "#6b6b6b", "#1a1a1a"
+
+# Authored at the size the paper actually gives it: a wrapfigure of 0.40\textwidth, and the ICLR
+# text width is 5.5 in, so \includegraphics[width=\linewidth] does not rescale and the point sizes
+# below are the ones that reach the page. Body text is 10 pt; 9 pt labels and 7.5 pt ticks match
+# the graphical abstract and the blend-sweep figures, so all of them look like one paper.
+W_IN, H_IN = 0.40 * 5.5, 1.95
+FS_LAB, FS_TICK, FS_LEG = 9.0, 7.5, 7.0
+
+# Largest dataset size shown. The curve is still bending at the top end, which points at the
+# fixed 32,000-step budget being the binding constraint there rather than the data -- so the
+# last point would invite a convergence reading the experiment cannot support. Deliberate cut,
+# not a data problem: the run exists and is on disk.
+MAX_N = 2048
 
 
 def load(results_dir):
@@ -61,8 +89,28 @@ def load(results_dir):
         if m.group(1) == "inf" or run.get("stream"):
             stream[arm].append(float(y))
         else:
-            finite[arm][int(m.group(1))].append(float(y))
+            n = int(m.group(1))
+            if n <= MAX_N:
+                finite[arm][n].append(float(y))
     return finite, stream
+
+
+def _decade_ladder(lo, hi):
+    """1-2-5 ticks covering [lo, hi] — the readable ladder on a log axis of ~1.5 decades."""
+    out = []
+    d = int(np.floor(np.log10(lo)))
+    while 10.0 ** d <= hi * 10:
+        for m in (1, 2, 5):
+            v = m * 10.0 ** d
+            if lo <= v <= hi:
+                out.append(v)
+        d += 1
+    return out
+
+
+def _fmt(v):
+    """0.02 not 2e-2, and no trailing zeros."""
+    return f"{v:.10f}".rstrip("0").rstrip(".")
 
 
 def band(per_n):
@@ -111,40 +159,54 @@ def main():
     _report_label_modes(os.path.join(args.root, "results"))
 
     plt.rcParams.update({
-        "font.family": "serif", "font.serif": ["Times New Roman", "DejaVu Serif"],
+        "font.family": "serif",
+        "font.serif": ["Times New Roman", "Nimbus Roman", "DejaVu Serif"],
         "mathtext.fontset": "stix", "axes.edgecolor": MUTED, "text.color": TEXT,
         "axes.labelcolor": TEXT, "xtick.color": MUTED, "ytick.color": MUTED,
+        "xtick.labelsize": FS_TICK, "ytick.labelsize": FS_TICK,
+        "axes.linewidth": 0.6,
+        "xtick.major.width": 0.6, "ytick.major.width": 0.6,
+        "xtick.major.size": 2.5, "ytick.major.size": 2.5,
     })
-    fig, ax = plt.subplots(figsize=(6.6, 4.4))
+    fig, ax = plt.subplots(figsize=(W_IN, H_IN))
 
-    for key, label, colour, marker, _ in ARMS:
+    for key, label, colour, ls, _ in ARMS:
         if not finite[key]:
             continue
         ns, mean, lo, hi = band(finite[key])
         if np.any(hi > lo):
             ax.fill_between(ns, lo, hi, color=colour, alpha=0.15, lw=0)
-        ax.plot(ns, mean, marker=marker, ms=5, lw=1.8, color=colour, label=label)
+        ax.plot(ns, mean, ls=ls, lw=1.7, color=colour, label=label)
 
     # Streaming runs: no finite abscissa, so a horizontal reference line across the axis.
     for key, label, colour, _, _ in ARMS:
         if not stream[key]:
             continue
         y = float(np.mean(stream[key]))
-        ax.axhline(y, ls="--", lw=1.5, color=colour, alpha=0.85)
-        ax.annotate(f"{label}, infinite stream: {y:.3%}",
-                    xy=(0.99, y), xycoords=("axes fraction", "data"),
-                    xytext=(0, 4), textcoords="offset points",
-                    ha="right", va="bottom", fontsize=8, color=colour)
+        # "infinite data" alone: the colour already ties it to L_PLS, and the legend is narrow.
+        ax.axhline(y, ls=STREAM_LS, lw=1.7, color=colour, alpha=0.9, label="infinite data")
 
     ax.set_xscale("log", base=2); ax.set_yscale("log")
-    ax.set_xlabel(r"training set size $n_{\mathrm{train}}$")
-    ax.set_ylabel(r"test relative $L^2$")
-    ax.grid(True, which="major", color=MUTED, alpha=0.2, lw=0.5)
+    # Plain integers, not 2^k: the sizes are the quantity of interest, not the exponent.
+    all_ns = sorted({n for k in finite for n in finite[k]})
+    ax.set_xticks(all_ns)
+    ax.set_xticklabels([str(n) for n in all_ns])
+    ax.xaxis.set_minor_locator(matplotlib.ticker.NullLocator())
+    # A 1-2-5 ladder with plain decimals, instead of matplotlib's "6 x 10^-1" offset labels.
+    lo, hi = ax.get_ylim()
+    ticks = [t for t in _decade_ladder(lo, hi)]
+    ax.set_yticks(ticks)
+    ax.set_yticklabels([_fmt(t) for t in ticks])
+    ax.yaxis.set_minor_locator(matplotlib.ticker.NullLocator())
+    ax.set_xlabel("training set size", fontsize=FS_LAB, labelpad=1.5)
+    ax.set_ylabel(r"test relative $L^2$", fontsize=FS_LAB, labelpad=2)
+    ax.grid(True, which="major", color=MUTED, alpha=0.22, lw=0.4)
     ax.set_axisbelow(True)
     for sp in ("top", "right"):
         ax.spines[sp].set_visible(False)
-    ax.legend(frameon=False, fontsize=9)
-    fig.tight_layout(pad=0.6)
+    ax.legend(frameon=False, fontsize=FS_LEG, handlelength=1.9, labelspacing=0.25,
+              handletextpad=0.5, borderaxespad=0.2, loc="upper right")
+    fig.tight_layout(pad=0.3)
 
     os.makedirs(out_dir, exist_ok=True)
     p = os.path.join(out_dir, "infinite_data")
@@ -154,7 +216,7 @@ def main():
 
     # ---------------------------------------------------------------- summary
     all_ns = sorted({n for k in finite for n in finite[k]})
-    print(f"\n{'n_train':>9}" + "".join(f"{lab:>18}" for _, lab, _, _, _ in ARMS) + f"{'ratio':>9}")
+    print(f"\n{'n_train':>9}" + "".join(f"{PLAIN[k]:>18}" for k, _, _, _, _ in ARMS) + f"{'ratio':>9}")
     for n in all_ns:
         cells, vals = "", {}
         for key, _, _, _, _ in ARMS:
@@ -164,9 +226,9 @@ def main():
         r = (f"{vals['data']/vals['pls']:9.2f}"
              if vals.get('data') and vals.get('pls') else f"{'-':>9}")
         print(f"{n:9d}{cells}{r}")
-    for key, label, _, _, _ in ARMS:
+    for key, _, _, _, _ in ARMS:
         if stream[key]:
-            print(f"\n{label} streaming: {np.mean(stream[key]):.5f}")
+            print(f"\n{PLAIN[key]} infinite data: {np.mean(stream[key]):.5f}")
 
     # How much labelled data does supervised training need to match PLS at each size?
     if finite["pls"] and finite["data"]:

@@ -1,7 +1,7 @@
 """Sample (source, solution) pairs from the Poisson dataset, for the appendix.
 
-A 2x2 grid: one ``(f, u)`` pair at ``K=4`` (the frequency content used for the main experiments)
-above one at ``K=16`` (the harder out-of-distribution setting). Field styling follows
+A 2x2 grid: one ``(f, u)`` pair at ``K=4`` above one at ``K=10``, the frequency content the paper's
+Poisson experiments actually use. Field styling follows
 ``tensorpils/viz.py`` (``RdBu_r``, ``origin="lower"``); the panels are drawn straight from
 :class:`PoissonDataset`, so no trained model is involved.
 
@@ -31,9 +31,10 @@ TEXT = "#1a1a1a"
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--Ks", type=int, nargs=2, default=[4, 16],
-                    help="the two frequency cutoffs to show (default 4 16)")
-    ap.add_argument("--grid", type=int, default=64)
+    ap.add_argument("--Ks", type=int, nargs=2, default=[4, 10],
+                    help="the two frequency cutoffs to show (default 4 10)")
+    # 65, not 64: nested-dyadic, and what every Poisson experiment in the paper runs on.
+    ap.add_argument("--grid", type=int, default=65)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--sample", type=int, default=0, help="index of the drawn sample")
     ap.add_argument("--out_dir", default="output/poisson/dataset_samples")
