@@ -24,7 +24,7 @@
 # Watch:   squeue --me      Logs: logs/ac_lr_<jobid>_<task>.out
 #
 #SBATCH --job-name=pils-ac-lr
-#SBATCH --time=08:00:00
+#SBATCH --time=24:00:00
 #SBATCH --gpus=1
 #SBATCH --gres=gpumem:20g
 #SBATCH --mem-per-cpu=16G
