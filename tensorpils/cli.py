@@ -281,6 +281,11 @@ def build_parser() -> ArgumentParser:
 
     p.add_argument("--eval_only", action="store_true")
     p.add_argument("--checkpoint", type=str, default=None)
+    p.add_argument("--no_checkpoint", action="store_true",
+                   help="Do not write the best-model .pth. Model selection is unaffected (the best "
+                        "state is kept in memory and restored at the end); this only skips the file, "
+                        "which is worth doing in learning-rate sweeps -- a checkpoint carries the "
+                        "optimizer state as well, ~3x the parameter count per run.")
     p.add_argument("--sample_idx", type=int, nargs="+", default=[0])
     return p
 
@@ -617,6 +622,7 @@ def _print_common(args, device):
 
 
 def _run(trainer, train_ds, test_ds, args):
+    trainer.save_checkpoints = not args.no_checkpoint
     if args.eval_only:
         if not trainer.load_checkpoint(args.checkpoint):
             return
