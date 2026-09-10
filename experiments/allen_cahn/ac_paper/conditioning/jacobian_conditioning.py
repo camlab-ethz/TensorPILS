@@ -59,7 +59,9 @@ def parse_args():
     p.add_argument("--mg_pre_smooth", type=int, default=2)
     p.add_argument("--mg_post_smooth", type=int, default=2)
     p.add_argument("--mg_omega", type=float, default=2.0 / 3.0)
-    p.add_argument("--tol", type=float, default=1e-10, help="ARPACK tolerance")
+    p.add_argument("--tol", type=float, default=1e-5,
+                   help="ARPACK tolerance (1e-5 leaves kappa unchanged to 6 digits vs 1e-10, and is "
+                        "~10x faster: the top of the preconditioned spectra is clustered at 1)")
     p.add_argument("--out", type=str, default=None, help="optional JSON dump of all numbers")
     return p.parse_args()
 
