@@ -42,6 +42,7 @@ ARMS = [
     ("pls",        "LS + multigrid",  lambda n: n.startswith("fno_ac_galerkin_ls_") and "precmg" in n),
     ("pino",       "PINO",            lambda n: n.startswith("fno_ac_pino_")),
     ("pideeponet", "PI-DeepONet",     lambda n: n.startswith("deeponet_ac_pi_")),
+    ("mm",         "min. movement",   lambda n: n.startswith("fno_ac_galerkin_mm_")),
 ]
 MUTED, TEXT = "#6b6b6b", "#1a1a1a"
 
@@ -146,7 +147,8 @@ def main():
             ax.spines[sp].set_visible(False)
     axes[0, 0].set_ylabel(r"validation space-time relative $L^2$")
     axes[1, 0].set_ylabel(r"validation space-time relative $L^2$")
-    axes[-1, -1].set_axis_off()                       # 5 arms in a 6-panel grid
+    for ax in axes.ravel()[len(ARMS):]:               # blank any unused panel
+        ax.set_axis_off()
     fig.tight_layout(pad=0.6)
     os.makedirs(out_dir, exist_ok=True)
     p = os.path.join(out_dir, "ac_lr_sweep")
@@ -162,7 +164,10 @@ def main():
     for key, title, _ in ARMS:
         if key not in picks:
             n = len(data[key])
-            print(f"  {title:<22s} NO RATE TRAINS -- all {n} diverged or collapsed (>= {COLLAPSE})")
+            # "no runs found" and "every run failed" are different problems and must not print
+            # the same sentence: one means the sweep is incomplete, the other is a result.
+            print(f"  {title:<22s} " + ("NO RUNS FOUND -- not swept yet?" if n == 0 else
+                  f"NO RATE TRAINS -- all {n} diverged or collapsed (>= {COLLAPSE})"))
             continue
         lr, err = picks[key]
         # Compare against the rates actually swept for THIS arm, not a hardcoded pair: the grid
