@@ -23,7 +23,7 @@ set -eo pipefail
 # --- physical regime -----------------------------------------------------------------
 # Fixed at 128/32, matching realistic_ac. Halving both grid and eps holds the interface
 # resolution l/h = a(n-1)/eps ~ 4, so this is the same physical regime at a quarter the cost.
-GRID=128
+GRID=129
 EPS=32.0
 EPOCHS=500
 K=4
@@ -45,10 +45,8 @@ ARMS_FLAGS=(
   "--loss pino"
   "--loss pideeponet"
 )
-# <<< DECIDE >>> placeholders. Run lr_sweep.sbatch first; the Poisson sweep showed the optimum
-# moves with the epoch budget and differs per arm by up to 30x.
 #            data  ls    pls   pino  pideeponet
-ARMS_LR=(    1e-3  1e-3  1e-3  1e-3  1e-3)
+ARMS_LR=(3e-04 1e-03 3e-04 1e-03 1e-03)
 SEEDS=(42 43 44)
 
 N_ARMS=${#ARMS_TAG[@]}
