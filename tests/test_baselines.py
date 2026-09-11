@@ -20,6 +20,7 @@ import torch
 from tensorpils.baselines import (DeepONetModel, MollifiedModel, ZeroBoundaryModel,
                                   boundary_mask_grid, PINOACLoss,
                                   PINOPoissonLoss, PIDeepONetACLoss,
+                                  PINOStokesLoss, PIDeepONetStokesLoss, autodiff_stokes,
                                   autodiff_laplacian, mollifier_grid, rel_lp)
 from tensorpils.baselines.trainers import _arch_tag
 from tensorpils.meshing import node_to_grid, structured_quad_mesh
@@ -267,6 +268,74 @@ def test_zero_boundary_is_exact_unlike_the_mollifier():
         assert sl.abs().max().item() == 0.0
 
 
+def test_deeponet_zero_boundary_masks_the_grid_but_not_the_query():
+    """``--pideeponet_bc zero``: the grid output has an exactly-zero boundary ring (the same
+    operation as ``ZeroBoundaryModel`` / ``apply_zero_boundary``), the interior is passed
+    through untouched, and a coordinate query at a boundary point returns the *raw* network
+    value -- that is what the boundary penalty acts on."""
+    n = 17
+    torch.manual_seed(0)
+    model = DeepONetModel((n, n), p=16, width=32, depth=3, zero_boundary=True)
+    f = torch.randn(2, 1, n, n)
+    out = model(f)
+    for sl in (out[..., 0, :], out[..., -1, :], out[..., :, 0], out[..., :, -1]):
+        assert sl.abs().max().item() == 0.0
+    raw = model.forward_at(f, model.grid_coords).reshape(2, 1, n, n)
+    assert torch.equal(out[..., 1:-1, 1:-1], raw[..., 1:-1, 1:-1])
+    bmask = torch.zeros(n, n, dtype=torch.bool)
+    bmask[0, :] = bmask[-1, :] = bmask[:, 0] = bmask[:, -1] = True
+    u_b = model.forward_at(f, model.grid_coords[bmask.reshape(-1)])
+    assert u_b.abs().max().item() > 0.0
+    with pytest.raises(ValueError):
+        DeepONetModel((n, n), p=8, width=16, depth=2, mollify=True, zero_boundary=True)
+
+
+def test_pideeponet_boundary_penalty_vanishes_under_the_mollifier_and_is_scale_free():
+    """The ``rel`` penalty is exactly 0 for a mollified model (hard BC), positive and
+    differentiable for a zero-BC model, and invariant to the output scale -- the property
+    that makes ``lambda_bc = 1`` meaningful at any solution magnitude."""
+    from tensorpils.baselines.pi_deeponet import PIDeepONetPoissonLoss
+
+    n = 9
+    torch.manual_seed(0)
+    f = torch.randn(2, 1, n, n)
+    bmask = torch.zeros(n, n, dtype=torch.bool)
+    bmask[0, :] = bmask[-1, :] = bmask[:, 0] = bmask[:, -1] = True
+    bmask = bmask.reshape(-1)
+
+    def interior_coords(model):
+        c = model.grid_coords[~bmask]
+        return c.unsqueeze(0).expand(2, -1, -1).clone().requires_grad_(True)
+
+    loss = PIDeepONetPoissonLoss(reduction="rel", lambda_bc=1.0)
+
+    moll = DeepONetModel((n, n), p=8, width=16, depth=2, mollify=True)
+    u_int, _ = autodiff_laplacian(moll, f, interior_coords(moll))
+    # sqrt(mean + 1e-24) floors the boundary RMS at 1e-12, so 'zero' means ~1e-10 here.
+    assert loss.boundary_term(moll, f, moll.grid_coords[bmask], u_int).item() < 1e-9
+
+    zero = DeepONetModel((n, n), p=8, width=16, depth=2, zero_boundary=True)
+    u_int, _ = autodiff_laplacian(zero, f, interior_coords(zero))
+    term = loss.boundary_term(zero, f, zero.grid_coords[bmask], u_int)
+    assert term.item() > 0.0
+    term.backward()
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in zero.parameters())
+
+    with torch.no_grad():                       # u -> 100 u
+        zero.branch[-1].weight.mul_(100.0)
+        zero.branch[-1].bias.mul_(100.0)
+        zero.bias.mul_(100.0)
+    u_int2, _ = autodiff_laplacian(zero, f, interior_coords(zero))
+    term2 = loss.boundary_term(zero, f, zero.grid_coords[bmask], u_int2)
+    assert term2.item() == pytest.approx(term.item(), rel=1e-4)
+
+    # The full loss actually includes the penalty when bc_coords is given, and not otherwise.
+    f_at = f.reshape(2, -1)[:, ~bmask]
+    with_bc = loss(zero, f, interior_coords(zero), f_at, bc_coords=zero.grid_coords[bmask])
+    without = loss(zero, f, interior_coords(zero), f_at)
+    assert with_bc.item() == pytest.approx(without.item() + term2.item(), rel=1e-5)
+
+
 def test_rel_lp_is_the_reference_reduction():
     """PINO's ``LpLoss.rel(size_average=True)``: per-sample relative norm, mean over batch."""
     pred = torch.tensor([[3.0, 4.0], [0.0, 0.0]])
@@ -374,3 +443,168 @@ def test_deeponet_run_prefix_does_not_collide_with_the_fno_one():
     assert fno == "fno_data_K4_samples-1024-128-256"        # existing names unchanged
     assert deeponet == "deeponet_data_K4_samples-1024-128-256"
     assert deeponet != fno
+
+
+# ------------------------------------------------------------------------- Stokes
+
+_PI = math.pi
+
+
+def _stokes_manufactured(pts):
+    """Divergence-free, zero-boundary velocity (curl of sin^2 sin^2), a smooth pressure, and
+    the body force f = -lap u + grad p that they solve (mu = 1). ``pts`` ``[..., 2]``."""
+    x, y = pts[..., 0], pts[..., 1]
+    u = torch.stack([_PI * torch.sin(_PI * x) ** 2 * torch.sin(2 * _PI * y),
+                     -_PI * torch.sin(2 * _PI * x) * torch.sin(_PI * y) ** 2], dim=-1)
+    lap = torch.stack([2 * _PI ** 3 * torch.cos(2 * _PI * x) * torch.sin(2 * _PI * y)
+                       - 4 * _PI ** 3 * torch.sin(_PI * x) ** 2 * torch.sin(2 * _PI * y),
+                       4 * _PI ** 3 * torch.sin(2 * _PI * x) * torch.sin(_PI * y) ** 2
+                       - 2 * _PI ** 3 * torch.sin(2 * _PI * x) * torch.cos(2 * _PI * y)], dim=-1)
+    p = torch.sin(_PI * x) * torch.cos(_PI * y)
+    gp = torch.stack([_PI * torch.cos(_PI * x) * torch.cos(_PI * y),
+                      -_PI * torch.sin(_PI * x) * torch.sin(_PI * y)], dim=-1)
+    return u, p, lap, gp, -lap + gp
+
+
+def _grid_pts(n):
+    xs = torch.linspace(0, 1, n, dtype=torch.float64)
+    yy, xx = torch.meshgrid(xs, xs, indexing="ij")           # row -> y, col -> x
+    return torch.stack([xx, yy], dim=-1)                      # [n, n, 2]
+
+
+def test_stokes_fd_residual_is_second_order_at_a_manufactured_solution():
+    """The strong-form FD residual of an exact Stokes solution vanishes at O(h^2), and both
+    equations do. This also pins the axis convention: with d/dx and d/dy swapped the momentum
+    residual would be O(1) rather than shrinking."""
+    errs = []
+    for n in (17, 33, 65):
+        pts = _grid_pts(n)
+        u, p, _, _, f = _stokes_manufactured(pts)
+        out = torch.cat([u.permute(2, 0, 1), p[None]], dim=0)[None].double()   # [1, 3, n, n]
+        f_grid = f.permute(2, 0, 1)[None]                                       # [1, 2, n, n]
+        mom, div = PINOStokesLoss((n, n), mu=1.0).residual(out)
+        f_int = f_grid.permute(0, 2, 3, 1)[:, 1:-1, 1:-1]
+        rel_mom = ((mom - f_int) ** 2).mean().sqrt() / (f_int ** 2).mean().sqrt()
+        rel_div = (div ** 2).mean().sqrt() / (u ** 2).mean().sqrt()
+        errs.append((1.0 / (n - 1), rel_mom.item(), rel_div.item()))
+    assert errs[0][1] < 0.2, errs                                  # right axes, right signs
+    for (h0, m0, _), (h1, m1, _) in zip(errs, errs[1:]):
+        assert math.log(m0 / m1) / math.log(h0 / h1) > 1.8, errs
+    # For this curl field the central-difference divergence cancels exactly (both terms carry
+    # the same sin(2*pi*h)/h factor), so it is ~1e-15 at every h rather than O(h^2). That still
+    # tests the axes: with d/dx and d/dy swapped it would be O(1).
+    assert all(d < 1e-10 for _, _, d in errs), errs
+
+
+def test_stokes_rel_reduction_is_the_ratio_of_residual_to_force():
+    """The 'rel' Stokes loss is ||(r_mom, w r_div)|| / ||f|| with r_mom the residual: it must be
+    O(h^2) at the exact solution and exactly 1 for the all-zero prediction (r_mom = -f). A version
+    that fed the residual through rel_lp(residual, f) subtracted f twice, giving 1.0 at the
+    solution and 2.0 at zero, and trained every Stokes baseline toward the solution for 2f."""
+    n = 33
+    pts = _grid_pts(n)
+    u, p, _, _, f = _stokes_manufactured(pts)
+    out = torch.cat([u.permute(2, 0, 1), p[None]], dim=0)[None].double()
+    f_grid = f.permute(2, 0, 1)[None]
+    loss = PINOStokesLoss((n, n), mu=1.0, reduction="rel", div_weight=1.0)
+    assert loss(out, f_grid).item() < 0.02
+    assert loss(torch.zeros_like(out), f_grid).item() == pytest.approx(1.0, rel=1e-6)
+    # the momentum-only part dominates: scaling u, p by 2 doubles the residual against f
+    assert loss(2 * out, f_grid).item() == pytest.approx(1.0, abs=0.03)
+
+
+class _AnalyticStokesModel(torch.nn.Module):
+    """A 'model' whose forward_at returns the manufactured (u_x, u_y, p) -- to test autodiff."""
+    def forward_at(self, f_grid, coords):
+        u, p, _, _, _ = _stokes_manufactured(coords)
+        return torch.cat([u, p.unsqueeze(-1)], dim=-1)          # [B, Q, 3]
+
+
+def test_autodiff_stokes_matches_the_analytic_derivatives():
+    torch.manual_seed(0)
+    coords = torch.rand(2, 50, 2, dtype=torch.float64).requires_grad_(True)
+    d = autodiff_stokes(_AnalyticStokesModel(), None, coords, p_scale=1.0)
+    u, p, lap, gp, _ = _stokes_manufactured(coords.detach())
+    assert torch.allclose(d["u"], u) and torch.allclose(d["p"], p)
+    assert torch.allclose(d["lap_u"], lap, atol=1e-8, rtol=1e-8)
+    assert torch.allclose(d["grad_p"], gp, atol=1e-8, rtol=1e-8)
+    assert d["div_u"].abs().max() < 1e-8                         # curl field: exactly solenoidal
+    # p_scale is applied to the pressure and hence to its gradient
+    d2 = autodiff_stokes(_AnalyticStokesModel(), None, coords, p_scale=50.0)
+    assert torch.allclose(d2["grad_p"], 50.0 * gp, atol=1e-6, rtol=1e-8)
+
+
+def test_multi_output_deeponet_bc_acts_on_the_velocity_channels_only():
+    n = 9
+    torch.manual_seed(0)
+    f = torch.randn(2, 2, n, n)
+    for kw in (dict(zero_boundary=True), dict(mollify=True)):
+        model = DeepONetModel((n, n), in_channels=2, out_channels=3, bc_channels=(0, 1),
+                              p=8, width=16, depth=2, **kw)
+        out = model(f)
+        assert out.shape == (2, 3, n, n)
+        for c in (0, 1):
+            for sl in (out[:, c, 0, :], out[:, c, -1, :], out[:, c, :, 0], out[:, c, :, -1]):
+                assert sl.abs().max().item() == 0.0
+        assert out[:, 2, 0, :].abs().max().item() > 0.0        # pressure boundary untouched
+        q = model.forward_at(f, torch.rand(5, 2))
+        assert q.shape == (2, 5, 3)
+    # single-output contract unchanged
+    m1 = DeepONetModel((n, n), p=8, width=16, depth=2)
+    assert m1(torch.randn(2, 1, n, n)).shape == (2, 1, n, n)
+    assert m1.forward_at(torch.randn(2, 1, n, n), torch.rand(5, 2)).shape == (2, 5)
+
+
+def test_pino_and_pi_deeponet_stokes_losses_agree_on_a_resolved_field():
+    """Same residual, same reduction; FD vs autodiff differ only by the O(h^2) stencil error,
+    which is small for a smooth (low-frequency trunk) DeepONet field on a 33^2 grid."""
+    n = 33
+    torch.manual_seed(0)
+    model = DeepONetModel((n, n), in_channels=2, out_channels=3, p=8, width=16, depth=2,
+                          trunk_fourier=4, fourier_scale=0.5).double()
+    f_grid = torch.ones(2, 2, n, n, dtype=torch.float64)      # f = (1, 1): nonzero, smooth
+    out = model(f_grid)                                          # [2, 3, n, n], raw
+    fd_loss = PINOStokesLoss((n, n), mu=1.0, reduction="mse", div_weight=2.0)(out, f_grid)
+    bmask = torch.zeros(n, n, dtype=torch.bool)
+    bmask[0, :] = bmask[-1, :] = bmask[:, 0] = bmask[:, -1] = True
+    coords = model.grid_coords[~bmask.reshape(-1)].unsqueeze(0).expand(2, -1, -1).clone().requires_grad_(True)
+    f_at = torch.ones(2, coords.shape[1], 2, dtype=torch.float64)
+    ad_loss = PIDeepONetStokesLoss(mu=1.0, reduction="mse", div_weight=2.0)(model, f_grid, coords, f_at)
+    assert ad_loss.item() == pytest.approx(fd_loss.item(), rel=0.05)
+    ad_loss.backward()
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.parameters())
+
+
+def test_stokes_baseline_trainers_run_an_epoch(tmp_path):
+    """PINO, PI-DeepONet (both BC modes) and our data loss on a DeepONet all train and
+    evaluate through the inherited StokesTrainer on a 9^2 problem."""
+    from tensorpils.baselines import (PINOStokesTrainer, PIDeepONetStokesTrainer,
+                                      DeepONetStokesTrainer)
+    from tensorpils.data import create_stokes_datasets
+    from tensorpils.models import FNOModel
+
+    tr, va, te = create_stokes_datasets(n_train=4, n_val=2, n_test=2, K=2, grid_resolution=9)
+    common = dict(train_dataset=tr, val_dataset=va, test_dataset=te, epochs=1, batch_size=2,
+                  device="cpu", output_dir=str(tmp_path), lr=1e-3, lr_min=1e-4)
+    fno = FNOModel(n_modes=(4, 4), hidden_channels=8, in_channels=2, out_channels=3, n_layers=2)
+    don = lambda **kw: DeepONetModel((9, 9), in_channels=2, out_channels=3, bc_channels=(0, 1),
+                                     p=8, width=16, depth=2, **kw)
+    trainers = [
+        PINOStokesTrainer(model=fno, pino_reduction="rel", div_weight=0.5, **common),
+        PIDeepONetStokesTrainer(model=don(mollify=True), pi_bc="mollifier", **common),
+        PIDeepONetStokesTrainer(model=don(zero_boundary=True), pi_bc="zero", lambda_bc_pi=1.0,
+                                n_colloc=16, **common),
+        DeepONetStokesTrainer(model=don(), loss_type="data", **common),
+    ]
+    prefixes = set()
+    for t in trainers:
+        loss = t.train_epoch()
+        assert math.isfinite(loss)
+        val = t.validate()
+        assert math.isfinite(val)
+        prefixes.add(t._file_prefix())
+    assert len(prefixes) == 4, prefixes
+    assert any("_stokes_pino-rel-dw0.5_" in p for p in prefixes)
+    assert any("deeponet_stokes_pi-rel-c16-zbc1_" in p for p in prefixes)
+    assert any(p.startswith("deeponet_stokes_data_") for p in prefixes)
+

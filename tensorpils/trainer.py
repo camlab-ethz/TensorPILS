@@ -13,6 +13,7 @@ the training loss, so model selection and the reported error stay comparable.
 
 import math
 import os
+import time
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -57,6 +58,9 @@ class TrainingStats:
     # Stokes: the two fields are scored separately (different spaces and grids).
     val_rel_l2_u: List[float] = field(default_factory=list)
     val_rel_l2_p: List[float] = field(default_factory=list)
+    # Wall-clock seconds of each training epoch (train_epoch only, no validation) -- the source
+    # for the paper's time-per-epoch column. Missing in results written before it existed.
+    epoch_times: List[float] = field(default_factory=list)
     # Preconditioner identity + conditioning (for the sweep / collapse plot).
     precond_kind: str = ""
     precond_strength: float = float("nan")
@@ -139,7 +143,9 @@ class BaseTrainer:
 
         with tqdm(range(self.epochs), desc="Training", unit="epoch", colour="green") as bar:
             for epoch in bar:
+                t0 = time.perf_counter()
                 tr = self.train_epoch()
+                self.stats.epoch_times.append(time.perf_counter() - t0)
                 vl = self.validate()
                 self.scheduler.step()
                 lr = self.scheduler.get_last_lr()[0]

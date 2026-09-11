@@ -90,12 +90,15 @@ objective).
 |---|---|
 | [`poisson/`](poisson/README.md) | The headline table: PINO and PI-DeepONet against supervised and preconditioned FEM training at `64²`, `K=4`. |
 | [`allen_cahn/`](allen_cahn/README.md) | The same comparison for a nonlinear, time-dependent problem, as an autoregressive one-step stepper. |
+| [`stokes/`](stokes/README.md) | The strong-form port of both baselines to the saddle point (stacked momentum + continuity residual, velocity-only BC, full-grid pressure), with tests pinning the FD and autodiff operators. The runs are in [`experiments/stokes/stokes_paper/stokes_benchmark/`](../stokes/stokes_paper/stokes_benchmark/README.md) (the Table 1 rows). |
 
 ## Scope
 
-- **Stokes has no baseline arm.** Its paper section is not yet written, and strong-form collocation
-  has no canonical saddle-point formulation (inf-sup, pressure gauge, two fields at different
-  polynomial orders). Revisit once the section exists.
+- **Stokes now has both baseline arms** — strong-form momentum + continuity on the velocity grid,
+  stacked in one relative residual with a tunable continuity weight (`--pi_div_weight`), pressure
+  taken on the full fine grid, BC on the velocity pair only. See [`stokes/`](stokes/README.md) for
+  the port and its three design decisions; the Table 1 runs are in
+  `experiments/stokes/stokes_paper/stokes_benchmark/`.
 - **Collocation points are the grid nodes**, optionally subsampled (`--pi_n_colloc`). This matches
   every other arm's discretisation budget, and for Allen–Cahn it is forced: the reference comes
   from a FEM Newton solve and exists only at nodes, so off-node collocation would require

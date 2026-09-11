@@ -1,0 +1,640 @@
+
+\documentclass{article} % For LaTeX2e
+\usepackage{iclr2027_conference,times}
+
+% Optional math commands from https://github.com/goodfeli/dlbook_notation.
+\input{math_commands.tex}
+
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{graphicx}
+\usepackage{wrapfig}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{multirow}
+
+
+\title{Physics-Informed Training at the Operator Level}
+
+% Authors must not appear in the submitted version. They should be hidden
+% as long as the \iclrfinalcopy macro remains commented out below.
+% Non-anonymous submissions will be rejected without review.
+
+\author{
+Shizheng Wen\thanks{Equal contribution.} \\
+ETH Zürich \\
+\texttt{shizheng.wen@math.ethz.ch}
+\And
+Marius Zeinhofer\footnotemark[1] \\
+ETH Zürich \\
+\texttt{marius.zeinhofer@math.ethz.ch}
+\And
+Siddhartha Mishra \\
+ETH Zürich \\
+\texttt{siddhartha.mishra@math.ethz.ch}
+}
+
+% The \author macro works with any number of authors. There are two commands
+% used to separate the names and addresses of multiple authors: \And and \AND.
+%
+% Using \And between authors leaves it to \LaTeX{} to determine where to break
+% the lines. Using \AND forces a linebreak at that point. So, if \LaTeX{}
+% puts 3 of 4 authors names on the first line, and the last on the second
+% line, try using \AND instead of \And before the third author name.
+
+\newcommand{\fix}{\marginpar{FIX}}
+\newcommand{\new}{\marginpar{NEW}}
+
+%\iclrfinalcopy % Uncomment for camera-ready version, but NOT for submission.
+\begin{document}
+
+
+\maketitle
+
+\begin{abstract}
+   We present an approach to train neural operators physics-informed, i.e., in a self-supervised fashion, purely relying on the governing physical equations. This enables training on infinite datasets where no sample is visited twice and removes the need to produce training data in an offline phase. While previous attempts for physics-informed training at the operator level were limited to benign problems and performed considerably worse than data-driven learning, our approach matches the gold-standard of data-driven training at a similar optimization cost. Our method is based on modifying the physics-informed loss functions to include a preconditioner such as a multigrid method to drastically reduce the ill-conditioning caused by unbounded PDE operators. We derive the improved conditioning theoretically, and illustrate the potential of the method for the Poisson, Allen-Cahn, and stationary Stokes equation, where it performs virtually identical to data-driven training at a comparable computational cost.
+\end{abstract}
+
+\section{Introduction}
+
+% Importance of fast solutions of PDEs. A tool for this in the age of AI: neural operators
+\paragraph{Neural Operators}
+Despite a century of development of numerical methods, partial differential equations (PDEs) remain expensive to solve, even more so in many-query situations, such as uncertainty quantification, optimal control, and inverse problems. The development of fast PDE solution techniques, e.g., through reduced-order/surrogate models therefore is of utmost importance. In the wake of the deep learning revolution, neural operators emerged as a powerful computational tool for surrogate modeling, drastically reducing PDE solution time in many applications. Neural operators approximate maps between infinite-dimensional spaces (operators) by a neural network, and are typically trained in a supervised fashion. They hence require a dataset that is built in an offline fashion, before they can be trained, and eventually used downstream. Data generation can constitute a substantial part of the computation and engineering effort, even more so in the context of physics foundation models that are pre-trained over an array of different PDE instances.
+
+% Declared here, after the text that fills page 1, so [t] places it at the top of page 2.
+% Regenerate with
+%   python experiments/graphical_abstract/plot_abstract.py \
+%       --bare output/graphical_abstract/abstract_v1_65grid_omega_opt/bare.npz \
+%       --mg   output/graphical_abstract/abstract_v1_65grid_omega_opt/mg.npz \
+%       --out  paper/figures/graphical_abstract.png
+% Authored at exactly \textwidth, so do not rescale it.
+\begin{figure}[t]
+   \centering
+   \includegraphics[width=\linewidth]{figures/graphical_abstract.pdf}
+   \caption{Ill-conditioning in physics-informed learning: The figure compares Adam minimization of a linear model with and without preconditioning for a physics-informed loss originating from a Poisson problem on a $65^2$ grid. The \textbf{left} and \textbf{centre} report error in each eigenmode of $A$ along the iteration, with the smoothest mode at the bottom. The \textbf{right} figure compares the relative $L^2$ error during training.}
+   \label{fig:graphical_abstract}
+\end{figure}
+
+% Physics-Informed Training: desirable but presently infeasible (prior to this work)
+\paragraph{Physics-Informed Training}
+
+Whenever the governing physics in the form of PDEs are known, neural operators can---in principle---be trained in a self-supervised fashion, relying on the physics residual or variational principles as a loss function. This approach is referred to as \emph{physics-informed neural operator training}, and a natural idea present in the community since the inceptions of neural operators []. However, the success of physics-informed training of neural operators has remained limited to benign equations and learning tasks. More often than not, purely physics-informed learning fails to converge. In fact, supervised learning with its offline data-generation pipeline remains the gold standard for almost all applications. Nevertheless, physics-informed training offers unique advantages, such as the training in the infinite data-limit, where no sample is revisited, and, of course, it removes the need of an expensive dataset generation process.
+
+% We identify the culprit that has prevented physics-informed neural operator learning
+\paragraph{Ill-Conditioning of PDE Operators}
+In this manuscript, we show that the pathologies of physics-informed neural operator learning can be attributed to a single foundational property of PDE operators: PDE operators are unbounded maps, meaning they magnify their inputs without bounds, and thus lead to severe ill-conditioning in physics-informed loss functions. To make this concrete, take the derivative operator
+\begin{equation}\label{eq:derivative_operator}
+   \frac{d}{dx}: C^1(0,1) \subset L^2(0,1) \to L^2(0,1), \quad u \mapsto u',
+\end{equation}
+which amplifies oscillations: $x\mapsto \sin(\omega x)$ is bounded in $L^2(0,1)$ independent of $\omega \in \mathbb R$, but its derivative $x\mapsto \omega \cos(\omega x)$ grows without bound in $L^2(0,1)$ when $\omega \to \infty$. This phenomenon is inherent in all PDE operators. In the case of Poisson's equation, and for a linear model that is the linear combination of a given basis set $\phi_1, \dots, \phi_n$, the physics-informed least-squares loss\footnote{If the equation admits, energy formulations (variational principles) are an attractive alternative.} on a single data point $f$ takes the form
+\begin{equation}\label{eq:physics_informed_ls_loss_no_precond}
+   L_{\textup{LS}}(u) = \frac12 \| Au - f \|^2, \quad A_{ij} = \int_\Omega \nabla \phi_j \nabla \phi_i\,\mathrm dx,
+\end{equation}
+where $A\in\mathbb R^{N\times N}$ is the stiffness matrix. The condition number of $A$ scales like $h^{-2}$ for standard bases, where $h$ is the characteristic mesh-size. Conditioning thus deteriorates under mesh refinement, as higher oscillating frequencies can be resolved, the same manifestation of the unbounded nature of PDE operators stressed in \ref{eq:derivative_operator}. Note tha $\nabla^2L_{\textup{LS}} = A^2$, hence the condition number governing the convergence speed of gradient descent (GD) scales like $h^{-4}$. Figure \ref{fig:graphical_abstract} illustrates that this ill-conditioning is so severe that training with first-order methods like GD and Adam becomes infeasible already for very coarse meshes, even in the benign case of a linear ansatz (no neural network at all). In the remainder of this article, we show that precisely this ill-conditioning renders physics-informed neural operator learning infeasible.
+
+\paragraph{Preconditioned Physics-Informed Training}
+
+To counter the ill-conditioning of the least-squares loss \eqref{eq:physics_informed_ls_loss_no_precond}, we rely on \emph{preconditioning}---precisely the tool the numerical analysis community uses to efficiently employ iterative methods in ill-conditioned settings in classical scientific computing. Abstractly, we \emph{modify the least-squares loss} to include an invertible preconditioner $P$ and a positive definite and symmetric weighting matrix $B$
+\begin{equation}\label{eq:preconditiones_least_squares_loss}
+   L_{\textup{PLS}}(u) = \frac12 \| P[Au - f] \|_B^2,
+\end{equation}
+We stress that this construction is agnostic to the neural operator architecture employed and adds zero overhead to the inference once training finishes as it only influences the loss function. On a conceptual level, the preconditioned loss \eqref{eq:preconditiones_least_squares_loss} changes the norm in which the error is measured. For any given $P$ we can recast the 
+\begin{equation*}
+   L_{\textup{PLS}}(u) 
+   =
+   \frac12 \| P[Au - f] \|_B^2 
+   =
+   \frac12(PAe, PAe)_B
+\end{equation*}
+with the error $e=u - A^{-1}f$. This means $P$ maps $Ae$ into a different space and thereby improves conditioning, and $B$ measures the error in this space in an appropriate manner. The choice $P=A^{-1}$ and $B=I$\footnote{Or alternatively, $B=M$, where $M$ is the mass matrix.} recovers data-driven training and reduces the condition number of $\nabla^2L_{\textup{PLS}}$ to unity. In practice, this is realized through fast approximate inverses $P\approx A^{-1}$, e.g., via multigrid methods []. Note that $P\approx A^{-1}$ is not the only choice; for saddle point problems, we alternatively employ block-diagonal preconditioners. Additionally, whenever applicable, we investigate energy formulations, as these are naturally less ill-conditioned.
+
+\subsection{Main Contributions} The main contributions are
+\begin{itemize}
+   \item \textbf{Efficient physics-informed neural operator training.} We demonstrate that preconditioned physics-informed neural operator training allows data-free training of neural operators at comparable cost and accuracy of the gold standard of data-driven training. Our approach vastly outperforms previous approaches and is demonstrated for the Poisson, Allen-Cahn, and Stokes equation.
+   \item \textbf{Flexibility and inference speed.} Our method can be combined with any neural operator architecture and once trained, adds no additional cost to the inference.
+   \item \textbf{Training at infinite data limit.} Physics-informed training allows to practically approximate the infinite data limit, where no sample is visited twice. We demonstrate empirically that this is a favorable training paradigm for neural operators.
+\end{itemize}
+
+\subsection{Related Literature}
+\begin{itemize}
+    \item Discussion of physics-informed training in general, in particular for PINNs and NQS.
+    \item Paper of Wolfgang and Markus on preconditioning.
+    \item OG paper on physics-informed neural operators.
+    \item Papers on suboptimal fixes for physics-informed neural operator training.
+\end{itemize}
+
+\section{Physics-Informed Training of Neural Operators}
+
+Our goal is to approximate an operator $\mathcal G:\mathcal F \to \mathcal U$ between function spaces $\mathcal U$ and $\mathcal F$. We aim to approximate $\mathcal G$ by a neural network $\mathcal G \approx \mathcal G_\theta$. Neural operators are a special class of neural networks well-suited to the infinite-dimensional nature of the function spaces appearing in PDE applications. However, the concrete neural network structure of $\mathcal G_\theta$ is secondary for our proposed training methodology. A simple but crucial observation we make, is that we can always write the neural operator output in the \emph{interpolated form} %I want this representation to get a name
+\begin{equation}\label{eq:neural_operator_interpolated_form}
+   \mathcal G_\theta(f) = \sum_{i=1}^n \mathbf{u}(\theta, f)_i \phi_i,
+\end{equation}
+where $\mathbf u(\theta, f)\in\mathbb R^n$ are coefficients depending on the trainable weights and the functional input $f$. The functions $\phi_1, \dots,\phi_n$ are a fixed basis and span a finite-dimensional function space $\mathcal U_h$, where $h$ denotes a characteristic mesh-size\footnote{Or more general, a quantification of how ``fine'' the space $\mathcal U_h$ is.}. Typical choices are finite element spaces, like piecewise polynomial spaces on a triangulated computational domain. It is crucial to stress that $\phi_1,\dots, \phi_n$, and thus $\mathcal U_h$ is a modeling choice, and a standard neural operator architecture will not automatically map into $\mathcal U_h$. However, we can always interpolate into $\mathcal U_h$. This is a typically sparse, non-trainable operation that adds negligible computational overhead and we will from now on assume that our neural operator is the form described in \eqref{eq:neural_operator_interpolated_form}.
+
+\subsection{Physics-Informed Loss Functions}
+For simplicity of exposition, we will work in the setting of linear PDEs that can be formulated in terms of bilinear forms, and we will restrict the discussion to learning the solution operator of such PDEs, although our experimental evaluation is broader. The operator learning problem is to find $u\in\mathcal U$ such that for given $f\in\mathcal F$ it holds
+\begin{equation}\label{eq:weak_formulation}
+   a(u,v) = f(v), \quad \text{for all }v\in\mathcal U.
+\end{equation}
+Here, $a$ is a bounded and symmetric bilinear form on $\mathcal U$, and the setting implies $\mathcal F=\mathcal U^*$. We assume all spaces to be Hilbert spaces. The solution operator is $\mathcal G:f\mapsto u$, where $u$ solves \eqref{eq:weak_formulation}. The weak equation can be written as a matrix equation, once $u$ is approximated in $\mathcal U_h$, and takes the form
+\begin{equation*}
+   A\mathbf u = \mathbf f, \quad \text{with }A_{ij} = a(\phi_j, \phi_i), \quad \mathbf f_i=f(\phi_i).
+\end{equation*}
+From this equation, we derive the single sample physics-informed loss function via a least-squares construction
+\begin{equation}\label{eq:LS_loss_in_theta}
+   L_{\textup{LS}}(\theta) = \frac12 \| A \mathbf u(\theta, f) - \mathbf f \|^2.
+\end{equation}
+For analysis purposes, we will frequently ignore the nonlinear parametrization $\mathbf u(\theta, f)$ and work in the Euclidean space of $\mathbf u\in\mathbb R^n$ directly. We indicate this by writing $L_{\textup{LS}}(u) = \frac 12 \| A\mathbf u - \mathbf f \|^2$ with the understanding that everything is in the variable $\mathbf u$.
+% \begin{equation}\label{eq:LS_loss_in_u}
+%    L_{\textup{LS}}(u) = \frac 12 \| A\mathbf u - \mathbf f \|^2
+% \end{equation}
+If $a$ is coercive and symmetric, an energy formulation is an attractive alternative to \eqref{eq:weak_formulation}. In this case, we can find the solution $u$ via a variational principle as the minimizer of the energy $\tfrac12 a(v,v)-f(v)$. The loss function to train the neural operator is, again on a single sample
+\begin{equation}\label{eq:variational_loss_in_theta}
+   L_{\textup{Var}}(\theta)= \frac12 \mathbf u(\theta, f)^\top A \mathbf u(\theta, f) - \mathbf f^\top \mathbf u(\theta, f).
+\end{equation}
+
+
+\subsection{Preconditioning} %state convergence result of GD to illustrate why ill-conditioning is relevant?
+The least-square loss \ref{eq:LS_loss_in_theta}, although faithfully recovering the solution of $A\mathbf u = \mathbf f$ whenever $A$ is bijective, is unworkable in practice due to its ill-conditioning. This can be seen by computing the Hessian $\nabla_u^2 L_{\textup{LS}}=A^\top A$. In the representative scenario of the Poisson equation [], the condition number $\kappa(A^\top A)$ scales like $h^{-4}$, and makes iterative methods inefficient or, due to round-off errors, entirely useless. To counter this effect, we propose the preconditioned least-squares loss
+\begin{equation}
+   L_{\textup{PLS}}(u) = \frac12 \| P[A\mathbf u - \mathbf f] \|_B^2,
+\end{equation}
+where $P\in\mathbb R^{n\times n}$ is an invertible matrix, and $B\in\mathbb R^{n\times n}$ is symmetric and positive definite, hence induces an inner product. The choice of $P$ and $B$ is intuitively coupled: $P$ transforms the range space of $A$ thereby improving conditioning, and $B$ should induce a meaningful norm on the transformed space. To assess conditioning of $L_{\textup{PLS}}$, we compute the Hessian with respect to $\mathbf u$
+\begin{equation}
+   \nabla^2_u L_{\textup{PLS}}(u) = A^\top P^\top B P A.
+\end{equation}
+We discuss a few choices of $P$ and $A$.
+
+\subsubsection{Approximate Inverse Preconditioners}\label{sec:approximate_inverse_preconditioner} We refer to the choice $P\approx A^{-1}$ and $B=I$ or a similarly well-conditioned matrix, like the mass matrix $M_{ij}=(\phi_i,\phi_j)_{L^2}$ as the approximate inverse setting. As proven in Lemma [] in the Appendix, this yields
+\begin{equation*}
+   \kappa(PA)^2 
+   \approx
+   \frac{\kappa(PA)^2}{\kappa(B)}
+   \leq
+   \kappa(A^\top P^\top B P A) 
+   \leq 
+   \kappa(PA)^2\kappa(B)
+   \approx 
+   \kappa(PA)^2
+\end{equation*}
+and in the case of a well conditioned matrix $B$, the conditioning is determined by the accuracy of the approximation $P\approx A^{-1}$. The approximate inverse setting is only practical when the application of $P$ is computationally efficient. For elliptic equations, multigrid methods provide such a preconditioner $P$ at the optimal complexity $\mathcal O(n)$, see [].
+
+\subsubsection{Block-diagonal Preconditioners}\label{sec:block_diagonal_preconditioner} We assume the following block structure for $A$, $\mathbf u$ and $\mathbf f$
+\begin{align*}
+   A = 
+   \begin{pmatrix}
+      K & D^\top \\ 
+      D & 0   
+   \end{pmatrix},
+   \quad
+   \mathbf u = 
+   \begin{pmatrix}
+      \mathbf w \\
+      \mathbf p
+   \end{pmatrix},
+   \quad
+   \mathbf f =
+   \begin{pmatrix}
+      \mathbf g \\
+      0
+   \end{pmatrix}.
+\end{align*}
+We assume that $K$ is symmetric and positive definite, and that $D^\top$ is injective. In this situation the symmetric system $A$ is indefinite and invertible---a well-posed discretization of a saddle point problem, as arises from Stokes equation. The Schur complement is $S=DK^{-1}D^\top$, and the classical choice of block-diagonal preconditioner is
+\begin{equation*}
+   P \approx \operatorname{diag}(K^{-1}, S^{-1}),
+\end{equation*}
+where in applications the block inverses can frequently be handled by multigrid methods. The key property of the preconditioner is that $PA$ has exactly three eigenvalues $\{ 1, \frac{1+\sqrt 5}{2}, \frac{1-\sqrt 5}{2} \}$. However, $PA$ remains ill-conditioned in Euclidean norm as it is a non-normal matrix, and in particular, $P$ is not an approximate inverse of $A$. To leverage $P$ in the context of the least-squares loss, we use it to measure the norm of the residual (we use it as $B$ in \eqref{eq:preconditiones_least_squares_loss}), i.e., the loss becomes
+\begin{equation*}
+   \frac{1}{2} \| A\mathbf u - \mathbf f \|^2_P 
+   =
+   \frac12 \| K\mathbf w + D^\top \mathbf p - \mathbf g \|^2_{K^{-1}} + \frac12 \| D\mathbf p \|^2_{S^{-1}}.
+\end{equation*}
+As $A$ is symmetric, its Hessian is $APA$, and Lemma [] shows 
+\begin{equation*}
+   \kappa(APA) \leq \kappa(P)\left(\frac{\max|\lambda(PA)|}{\min|\lambda(PA)|}\right)^2.
+\end{equation*}
+Hence conditioning is governed by $\kappa(P)$, which is $\mathcal O(h^{-2})$ for the prototypical case of Stokes equation, hence ill-conditioning remains, but is drastically improved from the $\mathcal O(h^{-4})$ scaling without preconditioner. We discuss further preconditioning options with the block-diagonal preconditioner in Appendix [], but stress that all lead to worse outcomes. Finally, we mention that for Stokes equation monolithic multigrid methods exist, and these fall under the approximate inverse setting.
+
+\subsubsection{Preconditioning Energy Formulations}
+Whenever the form $a$ is symmetric and coercive, we can use the loss function $L_{\textup{Var}}(\mathbf u) = \tfrac12\mathbf u^\top A \mathbf u - \mathbf f^\top u$. Its Hessian in $\mathbf u$ is
+$
+   \nabla^2_u L_{\textup{Var}} = A,
+$
+hence its conditioning is the square root of $L_\textup{LS}$; and in the prototypical setting of the Poisson equation, it is $\mathcal O(h^{-2})$. Under the restrictive assumption that $P$ and $A$ commute and $P$ is symmetric and positive definite, we can define the preconditioned variational loss
+\begin{equation*}
+   L_{\textup{PVar}}(\mathbf u) = \frac12 (\mathbf u, A \mathbf u)_P - (\mathbf f, \mathbf u)_P.
+\end{equation*}
+The critical points $\nabla_u L_{\textup{PVar}}(\mathbf u) = 0$ are characterized by $PA\mathbf u = P\mathbf f$, and thus the minimizer of $L_\textup{Var}$ is unchanged under this transformation. The Hessian is
+$
+   \nabla^2_u L_{\textup{PVar}}(\mathbf u) = PA.
+$
+Preconditioners that commute with $A$ are e.g. polynomials in $A$ like []. In practice, we \emph{violate the requirement} $PA=AP$ and merely modify the gradient $\nabla_u L_\textup{Var}(\mathbf u) = A\mathbf u - \mathbf f$ to be $P[A\mathbf u - \mathbf f]$ in the backward pass. Empirically, the choice $P\approx A^{-1}$ via a multigrid method performs reasonable although commutativity is not exactly satisfied.
+
+\subsubsection{Preconditioning Through Architecture Modification}
+For both $L_{\textup{LS}}$ and $L_{\textup{Var}}$ we can---in principle---achieve preconditioning by a transformation with $P$: $\tilde L_\textup{LS}(\mathbf u) = L_\textup{LS}(P\mathbf u)$. This yields for $B=I$ for simplicity
+\begin{equation*}
+   \nabla_u^2 \tilde L_{\textup{LS}}(\mathbf u) = P^\top A^\top A P,
+\end{equation*}
+and similarly $\nabla_u^2 \tilde L_{\textup{Var}}(\mathbf u) = P^\top A P$. However, this construction requires $P$ to be evaluated at inference time as a part of the forward pass of the model, which is why we do not develop this idea further in this manuscript.
+
+\section{Numerical Results}
+
+We summarize our main experimental findings in Table~\ref{tab:summary}.
+
+\begin{table}[t]
+  \caption{Summary across the three PDE instances. Errors are relative $L^2$ on the test
+  set at the best-validation checkpoint, mean $\pm$ half-range over three seeds. For Stokes each
+  cell lists the velocity and pressure errors separately as $u$ / $p$, each in its own finite
+  element $L^2$ norm; model selection uses their mean. The last column is the wall-clock time of
+  one training epoch on a single RTX 4090, in seconds.}
+  \label{tab:summary}
+  \centering
+  \footnotesize
+  \begin{tabular}{llccr r}
+    \toprule
+    PDE & loss & physics-informed & derivatives & rel.\ test $L^2$ & time / epoch \\
+    \midrule
+    \midrule
+    \multirow{4}{*}{Poisson}
+      & $L_\textup{PLS}$ & yes & FEM & $0.051 \pm 0.008$ & 1.2 \\
+      & $L_\textup{data}$ & no & --- & $0.047 \pm 0.008$ & 1.1 \\
+      & PINO & yes & FD & $0.331 \pm 0.011$ & 1.1 \\
+      & PI-DeepONet & yes & AD & $0.214 \pm 0.047$ & 3.1 \\
+    \midrule
+    \multirow{4}{*}{Allen--Cahn}
+      & $L_\textup{PLS}$ & yes & FEM & \textit{pending} & --- \\
+      & $L_\textup{data}$ & no & --- & \textit{pending} & --- \\
+      & PINO & yes & FD & \textit{pending} & --- \\
+      & PI-DeepONet & yes & AD & \textit{pending} & --- \\
+    \midrule
+    \multirow{4}{*}{Stokes}
+      & $L_\textup{PLS}$ & yes & FEM & $0.024 \pm 0.003$ / $0.017 \pm 0.003$ & 1.6 \\
+      & $L_\textup{data}$ & no & --- & $0.028 \pm 0.003$ / $0.028 \pm 0.002$ & 1.4 \\
+      & PINO & yes & FD & $0.021 \pm 0.003$ / $0.015 \pm 0.002$ & 1.1 \\
+      & PI-DeepONet & yes & AD & $0.330 \pm 0.012$ / $0.342 \pm 0.015$ & 1.6 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+
+\subsection{Poisson Equation}
+We approximate the solution operator $\mathcal G$ of the homogeneous Poisson equation
+\begin{align}\label{eq:poisson_equation}
+   \begin{split}
+      -\Delta u &= f \quad \text{in }\Omega,
+      \\
+      u &= 0 \quad \text{on }\partial\Omega,
+   \end{split}
+\end{align}
+on the domain $\Omega = [0,1]$ by a FNO $\mathcal G_\theta$. More precisely, $\mathcal G$ maps $f$ to the solution $u$ of \eqref{eq:poisson_equation}. We work on a structured tensor-product grid, and the output of the FNO is interpolated into the space $\mathcal U_h = Q_1^h$ of bilinear quadrilateral finite elements, with basis functions denoted by $\phi_1, \dots,\phi_n$. The corresponding stiffness matrix $A_{ij} = \int_\Omega \nabla \phi_j \nabla \phi_i\,\mathrm dx$ is symmetric and positive definite, which makes both the least-squares loss \ref{eq:LS_loss_in_theta} and variational loss \ref{eq:variational_loss_in_theta} available. As preconditioner $P=P_{\textup{GMG}}$, we employ single V-cycle di-adic geometric multigrid, which falls in the approximate inverse setting \ref{sec:approximate_inverse_preconditioner}. The full details are given in Appendix \ref{appendix:details_poisson}.
+
+\subsubsection{Ill-Conditioning Prevents Physics-Informed Training}
+In this experiment, we show that the ill-conditioning of the stiffness matrix $A$ is the reason physics-informed training fails without a preconditioner. To demonstrate this, we use the physics-informed least-squares loss with $B=I$ and a parametrized preconditioner
+\begin{equation}
+   L^t_\textup{PLS}(\mathbf u) = \frac12 \|P_t[A\mathbf u - \mathbf f] \|^2_2, \quad P_t = (1-t)I + t A^{-1}.
+\end{equation}
+
+\begin{wrapfigure}{r}{0.40\textwidth}
+   \vspace{-\intextsep}
+   % Authored at exactly 0.40\textwidth by
+   % experiments/poisson/poisson_paper/infinite_data/plot_scaling.py, so do not rescale it.
+   \includegraphics[width=\linewidth]{figures/infinite_data.pdf}
+   \vspace{-1em}
+   \caption{Test error vs.\ training set size at a fixed optimization budget for finite and infinite datasets.}
+   \label{fig:data-scaling}
+\end{wrapfigure}
+
+The preconditioner $P_t$ is a convex mixing between no preconditioning $P_0=I$ and data-driven training $P_1 = A^{-1}$. This pedagogical choice is possible on a small $65\times 65$ grid, and serves to illustrate the effect of preconditioning on the training dynamics. We monitor the relative $L^2(\Omega)$ error averaged over the validation set during training for a number of $t$-values, and compare to the single di-adic V-cycle geometric multigrid preconditioner. The results are reported in Figure [], where we additionally report the condition number of the Hessian $H_t=\nabla_u^2 L_\textup{PLS}^t = AP_t^2A$. The dataset uses $K=4$.
+
+\begin{figure}[t]
+  \centering
+  % Both authored at exactly 0.49\textwidth (2.695 in) by
+  % experiments/poisson/sweep_blend/plot_paper.py, so do not rescale them.
+  \includegraphics[width=0.49\linewidth]{figures/sweep_overlay.pdf}
+  \hfill
+  \includegraphics[width=0.49\linewidth]{figures/sweep_collapse.pdf}
+  \caption{Preconditioned least-squares training for the Poisson equation. \textbf{Left:} validation relative $L^2$ vs.\ epoch as the preconditioner $P_t$ is swept from $I$ to $A^{-1}$, together with the geometric multigrid preconditioner \textbf{Right:} test error, at the best-validation checkpoint, of the $P_t$ preconditioned sweeps against the condition number $\kappa(H_t)$ of the preconditioned loss Hessian; the dashed line is the geometric multigrid preconditioner, which has no finite $\kappa(H_t)$.}
+  \label{fig:pls-overlay}
+\end{figure}
+
+
+Figure \ref{fig:pls-overlay} shows that that preconditioning is essential to obtain efficient physics-informed training. The un-preconditioned run ($t=0$) converges to $\approx 30\%$ relative $L^2$ error after 500 epochs of training with Adam., while data-driven training ($t=1$) lands at below $1\%$ error for the same amount of training epochs. Intermediate values of $t$ interpolate the training dynamics, which leads us to conclude that ill-conditioning prevents efficient physics-informed neural operator training, and preconditioning is an effective strategy to mitigate this. This is further supported by tracking the condition numbers of $H_t$ in dependence on $t$. For $t=0$, we have $\kappa(H_t)=6.5e+05$ and of course for data-driven training it holds $\kappa(H_1)=1$. Interestingly, as visualized on the right of Figure \ref{fig:pls-overlay} below a conditioning of $approx 10^3-10^4$ (corresponding to $t\in[0.05, 0.1]$) we observe diminishing returns for making the preconditioners more accurate. We attribute this to ill-conditioning induced by the neural network parametrization, which is not resolved in our analysis. This suggests, that a highly-accurate preconditioner may not be needed for accurate physics-informed training, and in fact, the geometric multigrid preconditioner performs virtually identical to the gold standard of data-driven training.
+
+\emph{The deep Ritz results come here, or if space is scarce, we put them in the Appendix. They are nice, but not fundamental.}
+
+\subsubsection{Training at The Infinite Data Limit}
+Physics-informed training is not bound to a dataset. Instead, we may draw a fresh batch of samples for every update of the model's parameters. We refer to this as \emph{training at the infinite data limit}. To illustrate the benefit of training in this regime, we fix an optimization budget: 1000 epochs' worth of forward passes at a dataset size of 1024 (double check) and compare the final relative test $L^2$ error achieved for datasets of growing size, see Figure []. We clearly see the benefit of training in the infinite data regime, even for a fixed finite training budget. Dataset uses $K=10$.
+
+\subsection{Allen-Cahn Equation}
+We now learn a time-increment operator for the Allen-Cahn equation with homogeneous Dirichlet boundary conditions
+\begin{align}\label{eq:allen_cahn}
+   \begin{split}
+      \partial_t u = \Delta u + \varepsilon^2 u(1-u), \quad u_{|\partial\Omega}=0,
+   \end{split}
+\end{align}
+on the domain $\Omega=[0,1]$ and time interval $I=[0,1]$ with $\eps=32$. The Allen-Cahn equation is the $L^2$ gradient flow of the Ginzburg-Landau energy, see Appendix [] for details, and it models phase separation of non-mixing phases. We again use a FNO $\mathcal G_\theta$ and interpolate its output into the space $\mathcal U_h = Q_1^h$ on a tensor-product grid. Discretizing \eqref{eq:allen_cahn} in $Q_1^h$ and employing a convex-concave splitting integrator, the discrete timestep $\mathbf u_{k+1}$ given $\mathbf u_k$ satisfies
+\begin{equation}\label{eq:convex_concave_time_stepper}
+   0 
+   =
+   M\left[ \frac{\mathbf u_{k+1} - \mathbf u_k}{\tau} + \varepsilon^2\left( \mathbf u_{k+1}^3 - \mathbf u_k \right) \right]
+   +
+   A \mathbf u_{k+1}
+   =:
+   \phi(\mathbf u_{k+1}, \mathbf u_k), 
+\end{equation}
+where $A_{ij}=\int_\Omega \nabla \phi_j\nabla \phi_i\,\mathrm dx$ is the stiffness matrix, and $M=\int_\Omega \phi_j \phi_i\,\mathrm dx$ is the mass matrix. The scheme \ref{eq:convex_concave_time_stepper} is used to produce a ground truth dataset over a sinusoidal distribution of initial conditions using \texttt{TensorMesh} []. Alternatively, we employ a minimizing movement-type loss that produces $\mathbf u_{k+1}$ from $\mathbf u_k$ as the minimizer
+\begin{align}
+   \begin{split}
+      \mathbf u_{k+1}
+      =
+      \underset{\mathbf u}{\operatorname{argmin}}\, J(\mathbf u, \mathbf u_k)
+      &=
+      \frac12\mathbf u^\top A \mathbf u 
+      +
+      \frac{\eps^2}{4} \mathbf 1^\top M \mathbf u^4 
+      -
+      \varepsilon^2 \mathbf u_k^\top M \mathbf u 
+      \\&+
+      \frac{1}{2 \tau}(\mathbf u - \mathbf u_k)^\top M(\mathbf u - \mathbf u_k). 
+   \end{split}
+\end{align}
+We derive $J$ from a variational principle in the Appendix [], note that essentially $\nabla_u J(\mathbf u,\mathbf u_k)=\phi(\mathbf u, \mathbf u_k)$.
+
+\subsubsection{Preconditioned Physics-Informed Training}
+Given an initial condition $\mathbf u_0$, we denote the reference roll-out by $\mathbf u_i$, $i=0,\dots,T$ which is produced from \ref{eq:convex_concave_time_stepper} with a finite element method. The roll-out of the FNO is denoted by $\mathcal G_\theta^i(\mathbf u_0)$, and when we write $\hat{\mathbf u}_i$, we mean $\mathcal G_\theta^i(\mathbf u_0)$ with \emph{detached gradients}. The data-driven loss on a single trajectory is
+\begin{equation}
+   L_{\textup{data}}(\theta) = \frac12 \sum_{k=0}^{R-1}\left\| \mathcal G_\theta(\hat{\mathbf u}_k) - \mathbf u_{k+1} \right\|^2
+\end{equation}
+where we use $\hat{\mathbf u}_k$ to avoid backpropagation through the graph of $\mathcal G_\theta^k$---the $k$-th power of the FNO and $R\in\mathbb N$ is a hyperparameter of the training setup. The least-squares loss and the minimizing movement loss are
+\begin{equation}
+   L_{\textup{LS}(\theta)}=\frac12\sum_{k=0}^{R-1}\left\| \phi(\mathcal G_\theta(\hat{\mathbf u}_k), \hat{\mathbf u}_k) \right\|^2, 
+   \quad
+   L_{\textup{MM}}(\theta) = \sum_{k=0}^{R-1}J(\mathcal G_\theta(\hat{\mathbf u}_k), \hat{\mathbf u}_k)
+\end{equation}
+\emph{todo: Discuss ill-conditioning.} Finally, we propose a preconditioned variant
+\begin{equation}
+   L_{\textup{PLS}}(\theta) = \frac12\sum_{k=0}^{R-1}\left\| P[\phi(\mathcal G_\theta(\hat{\mathbf u}_k), \hat{\mathbf u}_k)] \right\|^2,
+   \quad
+   P\approx \left( (3\varepsilon^2 + \tau^{-1})M + A \right)^{-1}
+\end{equation}
+which is based on an approximate inverse of the Jacobian $\nabla_u\phi$ and can be realized efficiently via geometric multigrid method.
+
+\subsection{Stokes Equation}
+Finally, we learn the solution operator $\mathcal G: f \mapsto (u, p)$ of the stationary Stokes equations
+\begin{align}\label{eq:stokes_equation}
+   \begin{split}
+      -\mu\Delta u + \nabla p &= f, \qquad \nabla\cdot u = 0 \quad \text{in } \Omega = [0,1]^2,
+      \\
+      u &= 0 \quad \text{on } \partial\Omega, \qquad \textstyle\int_\Omega p\,\mathrm dx = 0,
+   \end{split}
+\end{align}
+with $\mu = 1$, from the same family of sine-series body forces as in the Poisson experiment ($K = 10$). The FNO now emits three channels $(u_x, u_y, p)$, which we interpolate into the Taylor--Hood pair $\mathcal U_h = Q_2^h \times Q_1^h$ on a $65^2$ velocity grid, the pressure living on the $33^2$ corner subgrid. The resulting system $\mathcal K \mathbf c = \mathbf b$ is symmetric but \emph{indefinite}, so the Hessian of the least-squares loss is $\mathcal K^2$ with $\kappa = \mathcal O(h^{-4})$, and no block-diagonal operator approximates $\mathcal K^{-1}$. Following Section~\ref{sec:block_diagonal_preconditioner}, we therefore use the block-diagonal preconditioner $\mathcal P = \mathrm{diag}(\hat A^{-1}, \hat S^{-1})$ --- one multigrid V-cycle per velocity component and the lumped pressure mass matrix, weighted by $\omega_S$, for the Schur complement --- as the \emph{weighting matrix} of the loss, $L_{\textup{PLS}} = \tfrac12\, \mathbf r^\top \mathcal P \mathbf r$, for which $\kappa(\mathcal K\mathcal P\mathcal K) = \mathcal O(h^{-2})$. The two baselines minimize the strong form of \eqref{eq:stokes_equation} on the velocity grid, with the momentum and continuity residuals stacked into one relative ratio, $\|(r_{\mathrm{mom}}, w\,r_{\mathrm{div}})\|/\|(f,0)\|$, and the boundary condition imposed on the velocity exactly as for our own arms. All details, grids and selected values are collected in Appendix~\ref{appendix:details_stokes}.
+
+\textbf{Weighting the residual blocks is what makes the saddle point trainable.} The bare least-squares loss reaches $21.6\%$ velocity and $8.6\%$ pressure error at this budget (Appendix~\ref{appendix:details_stokes}), and both preconditioned formulations depend decisively on how the continuity equation is weighted against the momentum equation: sweeping the Schur weight $\omega_S$ of $\mathcal P$ from the value $0.5$ used in our earlier experiments to $256$ takes $L_\textup{PLS}$ from $3.6\%$ to $2.4\%$ velocity error, and sweeping the continuity weight $w$ of PINO from $0.3$ to $300$ takes it from $75\%$ to $2.1\%$. The mechanism is the one identified in Section~\ref{sec:block_diagonal_preconditioner}: $w$ is a block-diagonal weighting $B = \mathrm{diag}(I, w^2 I)$ of the residual, and at small $w$ an irrotational velocity error is absorbed by the pressure at almost no cost. Both weights were consequently tuned on the validation set like a learning rate.
+
+\textbf{With the weights tuned, the label-free losses match or surpass supervised training.} Table~\ref{tab:summary} reports $2.4 \pm 0.3\%$ / $1.7 \pm 0.3\%$ for $L_\textup{PLS}$ and $2.1 \pm 0.3\%$ / $1.5 \pm 0.2\%$ for PINO against $2.8 \pm 0.3\%$ / $2.8 \pm 0.2\%$ for supervised training, at a comparable cost per epoch; the two physics-informed arms are within their seed spread of each other on the velocity. PI-DeepONet does not train on the saddle point: its best validation error is attained after $100$--$230$ epochs and deteriorates thereafter, and it ends at $33\%$ / $34\%$. Refining the mesh to $129^2$ leaves the ordering unchanged, and the monolithic preconditioner of Appendix~\ref{appendix:details_stokes}, a genuine $\mathcal P \approx \mathcal K^{-1}$, reproduces the supervised numbers at eight times the cost per epoch --- consistent with $\mathcal P\mathbf r \approx \mathbf c - \mathbf c^\ast$ making it the supervised objective computed from the residual.
+
+\section{Conclusion}
+
+
+%Citations within the text should be based on the \texttt{natbib} package
+%and include the authors' last names and year (with the ``et~al.'' construct
+%for more than two authors). When the authors or the publication are
+%included in the sentence, the citation should not be in parenthesis using \verb|\citet{}| (as
+%in ``See \citet{Hinton06} for more information.''). Otherwise, the citation
+%should be in parenthesis using \verb|\citep{}| (as in ``Deep learning shows promise to make progress
+%towards AI~\citep{Bengio+chapter2007}.'').
+
+%The corresponding references are to be listed in alphabetical order of
+%authors, in the \textsc{References} section. As to the format of the
+%references themselves, any style is acceptable as long as it is used
+%consistently.
+
+
+
+\subsection*{AI use statement}
+
+(This section is \textbf{required} and does not count toward the page limit.)
+
+% TEMPORARY HOME. Parked here so the figure is not full-width while the Allen-Cahn
+% discussion is still empty; move it back into that subsection once there is text to wrap.
+\begin{wrapfigure}{r}{0.40\textwidth}
+   \vspace{-\intextsep}
+   \includegraphics[width=\linewidth]{figures/rollout_error.pdf}
+   \caption{Allen-Cahn rollout error vs.\ the convex-concave reference; solid test, dashed train.
+   Bare $L_{\textup{LS}}$ collapses and is omitted.}
+   \label{fig:ac-rollout}
+\end{wrapfigure}
+In this work, we used generative AI tools for software implementation and language refinement.
+We have not used generative AI tools for drafting the manuscript,
+and [the rest of the required disclosure tasks] are not applicable to this work.
+Additionally, we used generative AI tools for [tasks with recommended
+disclosure]. We have reviewed all AI-assisted work. LLM-generated code was verified and tested for correctness
+by the authors. We take responsibility for the final content of this work,
+including text, claims or artifacts produced with the aid of generative AI.
+
+
+\subsection*{Ethics statement}
+
+(This section is \textbf{recommended} and does not count toward the page limit.)
+
+If authors feel that their paper submission raises questions regarding the Code
+of Ethics, they are encouraged to include a paragraph of Ethics Statement (at
+the end of the main text before references) to address potential concerns where
+appropriate. Topics include, but are not limited to, studies that involve human
+subjects, practices to data set releases, potentially harmful insights,
+methodologies and applications, potential conflicts of interest and sponsorship,
+discrimination/bias/fairness concerns, privacy and security issues, legal
+compliance, and research integrity issues (e.g., IRB, documentation, research
+ethics). This statement should not be more than 1 page.
+
+\subsection*{Reproducibility statement}
+
+(This section is \textbf{recommended} and does not count toward the page limit.)
+
+It is important that the work published in ICLR is reproducible. Authors are
+strongly encouraged to include a paragraph-long Reproducibility Statement at the
+end of the main text (before references) to discuss the efforts that have been
+made to ensure reproducibility. This paragraph should not itself describe
+details needed for reproducing the results, but rather reference the parts of
+the main paper, appendix, and supplemental materials that will help with
+reproducibility. For example, for novel models or algorithms, a link to an
+anonymous downloadable source code can be submitted as supplementary materials;
+for theoretical results, clear explanations of any assumptions and a complete
+proof of the claims can be included in the appendix; for any datasets used in
+the experiments, a complete description of the data processing steps can be
+provided in the supplementary materials. Each of the above are examples of
+things that can be referenced in the reproducibility statement.
+
+\subsubsection*{Author Contributions}
+If you'd like to, you may include  a section for author contributions as is done
+in many journals. This is optional and at the discretion of the authors.
+
+\subsubsection*{Acknowledgments}
+Use unnumbered third level headings for the acknowledgments. All
+acknowledgments, including those to funding agencies, go at the end of the paper.
+
+
+\bibliography{iclr2027_conference}
+\bibliographystyle{iclr2027_conference}
+
+\appendix
+\section{Details of the Poisson Equation Experiment}\label{appendix:details_poisson}
+
+\paragraph{Operator} We consider the Poisson equation with homogeneous Dirichlet boundary conditions on the unit square $\Omega = [0,1]^2$,
+\begin{equation}\label{eq:appendix_poisson}
+   -\Delta u = f \quad \text{in } \Omega, \qquad u = 0 \quad \text{on } \partial\Omega.
+\end{equation}
+For every $f\in H^{1}_0(\Omega)^*$ the Poisson equation admits a unique weak solution $u\in H^1_0(\Omega)$. We learn the associated solution operator 
+\begin{equation*}
+   \mathcal G: \mathcal F \to \mathcal U, \quad f \mapsto u,
+\end{equation*}
+with $\mathcal U = H^1_0(\Omega)$ and $\mathcal F=\mathcal U^*$. Hence $\mathcal G$ is the inverse of the Laplace operator.
+
+\paragraph{Data Set} The dataset pairs $(f, u)$ are constructed through the eigenfunctions of the Laplacian, hence require no PDE solve. We draw coefficients $a_{ij}\sim\mathrm{Unif}[-1,1]$, independently for $i,j=1,\dots,K$, and set
+\begin{align}\label{eq:appendix_poisson_data}
+   \begin{split}
+      f(x,y) &= \frac{\pi}{K^2}\sum_{i,j=1}^{K} a_{ij}\,(i^2+j^2)^{1/2}\,\sin(\pi i x)\sin(\pi j y),
+      \\
+      u(x,y) &= \frac{1}{\pi K^2}\sum_{i,j=1}^{K} a_{ij}\,(i^2+j^2)^{-1/2}\,\sin(\pi i x)\sin(\pi j y).
+   \end{split}
+\end{align}
+The pairs satisfy $-\Delta u = f$ exactly and vanish at the boundary. The parameter $K$ controls the amount of frequencies in the data, and a larger $K$ constitutes a more challenging learning problem. Figure~\ref{fig:poisson_dataset} shows one draw at each value.
+
+\begin{figure}[htb]
+   \centering
+   \includegraphics[width=\linewidth]{figures/poisson_dataset_samples.pdf}
+   \caption{Samples from the Poisson data set, drawn from \eqref{eq:appendix_poisson_data} on a $65^2$ grid: source and solution at $K=4$ (left pair) and at $K=10$ (right pair). Note the differing magnitudes of $u$.}
+   \label{fig:poisson_dataset}
+\end{figure}
+
+\paragraph{Discretization} We partition $\Omega$ into a uniform grid of $(n_x-1)^2$ squares with mesh size $h = 1/(n_x-1)$, and approximate in the space of continuous, piecewise \emph{bilinear} finite elements
+\begin{equation*}
+   \mathcal U_h = Q_1^h = \big\{ v \in C(\overline\Omega) \;:\; v|_T \in \operatorname{span}\{1, x, y, xy\} \text{ for every cell } T, \quad v|_{\partial\Omega} = 0 \big\}.
+\end{equation*}
+We write $\phi_1, \dots, \phi_n$ for the associated global basis functions that are characterized through $\phi_i(x_j) = \delta_{ij}$ on the interior grid nodes $x_1, \dots, x_n$. This means that $n = \dim \mathcal U_h = (n_x-2)^2$. We use $n_x = 65$, hence $n = 3969$. The stiffness and mass matrices are
+\begin{equation}\label{eq:appendix_stiffness_mass}
+   A_{ij} = \int_\Omega \nabla\phi_j \cdot \nabla\phi_i \,\mathrm dx,
+   \qquad
+   M_{ij} = \int_\Omega \phi_j\,\phi_i \,\mathrm dx,
+\end{equation}
+which we assemble with an exact quadrature rule. For the analytical sources $f$ we use its \emph{nodal approximation}, i.e., we replace $f$ by its interpolant $\sum_{j=1}^n f(x_j)\phi_j \in \mathcal U_h$. The discretized forcing thus becomes
+\begin{equation}\label{eq:appendix_consistent_rhs}
+   \mathbf f_i = \sum_{j=1}^n M_{ij}\,f(x_j).
+\end{equation}
+
+\paragraph{Neural Operator} We use a FNO as implemented in the \texttt{neuraloperator} package []. The hyperparameters are collected in Table~\ref{tab:fno}. Because the FNO grid coincides with the finite element nodes, the interpolation into $\mathcal U_h$ of \eqref{eq:neural_operator_interpolated_form} is the identity. Zero boundary conditions are hard-enforced by projecting to zero on $\partial\Omega$, so the model output lies in $\mathcal U_h$ exactly.
+
+\paragraph{Baselines} PINO [] and PI-DeepONet [] are the two published label-free approaches we compare against. Both minimize the \emph{strong-form} residual $-\Delta u - f$ at the interior grid nodes, reduced as the relative ratio $\|{-\Delta_h u} - f\|_2 / \|f\|_2$ of the reference implementation, and they differ in how the Laplacian is obtained: PINO uses the FNO of Table~\ref{tab:fno} with second-order central differences on the grid (the \texttt{FiniteDiff} utility of the reference library), whereas PI-DeepONet uses an unstacked DeepONet ($p=128$ basis functions, branch and trunk MLPs of width $256$ and depth $4$, $64$ random Fourier features on the trunk input, $1.4\cdot 10^6$ parameters) differentiated exactly by automatic differentiation through the coordinate input of the trunk. The two residuals are the same PDE at the same accuracy: evaluated at the analytical solution they agree to $0.7\%$, and both converge at second order. We impose the boundary condition on both baselines exactly as on our own arms, by setting the boundary nodes of the output to zero. The reference implementations instead multiply the output by the ansatz $\sin(\pi x)\sin(\pi y)$, which on the present data set, a truncated sine series, encodes much of the structure of the solution and does not transfer to other geometries; we therefore report it only as a control. For PINO the zeroed boundary ring enters the residual through the finite-difference stencil, whereas a pointwise autodiff Laplacian cannot see a mask, so PI-DeepONet additionally carries the soft boundary penalty of the original formulation, $\lambda_{\mathrm{bc}}$ times the root-mean-square of the prediction on $\partial\Omega$ relative to its root-mean-square in the interior; without it the objective is invariant under the addition of harmonic functions, and the relative error exceeds $160\%$. With the ansatz PI-DeepONet reaches $0.191 \pm 0.005$ instead of the $0.214 \pm 0.047$ of Table~\ref{tab:summary}. Its seed-to-seed spread, $0.163$ to $0.258$, is the largest in the table, and every baseline run is still descending at the end of the budget, so these numbers characterize the fixed budget rather than a converged state.
+
+\begin{table}[htb]
+   \caption{FNO hyperparameters used for all Poisson experiments.}
+   \label{tab:fno}
+   \begin{center}
+   \begin{tabular}{ll}
+      \multicolumn{1}{c}{\bf Component} & \multicolumn{1}{c}{\bf Value} \\ \hline \\
+      Fourier modes.             & $16\times16$ \\
+      Hidden channels (width)    & $64$ \\
+      Fourier layers             & $5$ \\
+      Lifting / projection channels & $128$ / $128$ \\
+      Positional embedding       & grid coordinates, appended as channels \\
+      Input / output channels    & $1$ / $1$ \\
+      Trainable parameters       & $3.01\times10^{6}$ \\
+   \end{tabular}
+   \end{center}
+\end{table}
+
+\paragraph{Multigrid Preconditioner} We take $P$ to be a single geometric multigrid V-cycle for $A$ starting from a zero initial guess. We use dyadic coarsening on grids of fineness $2^k+1$ to guarantee nested grids, and denote by $A_\ell$ the stiffness matrix on level $\ell=0,\dots,L-1$, where $\ell=0$ is the finest grid and $L$ the number of levels. As smoother, we use weighted Jacobi with $\nu_1=\nu_2=2$ iterations and damping $\omega=8/9$, which is the optimal value for $Q_1$ elements in two dimensions, bilinear prolongation $\Pi_\ell$ with restriction $\Pi_\ell^\top$, and a direct solve on the coarsest grid; Algorithm~\ref{alg:vcycle} summarizes the V-cycle.
+
+\begin{algorithm}[htb]
+   \caption{V-cycle $\mathrm{V}(\ell,\mathbf r)$ on level $\ell$; the preconditioner is $P\mathbf r := \mathrm{V}(0,\mathbf r)$. Here $D_\ell = \operatorname{diag}(A_\ell)$.}
+   \label{alg:vcycle}
+   \begin{algorithmic}[1]
+      \If{$\ell = L-1$}
+         \State \Return $A_{L-1}^{-1}\mathbf r$ \Comment{coarsest grid: direct solve}
+      \EndIf
+      \State $\mathbf e \gets \mathbf 0$
+      \For{$\nu_1$ sweeps}
+         \State $\mathbf e \gets \mathbf e + \omega\, D_\ell^{-1}\big(\mathbf r - A_\ell \mathbf e\big)$ \Comment{pre-smoothing}
+      \EndFor
+      \State $\mathbf r_c \gets \Pi_\ell^\top\big(\mathbf r - A_\ell \mathbf e\big)$ \Comment{restrict the residual}
+      \State $\mathbf e \gets \mathbf e + \Pi_\ell\, \mathrm{V}(\ell+1, \mathbf r_c)$ \Comment{coarse-grid correction}
+      \For{$\nu_2$ sweeps}
+         \State $\mathbf e \gets \mathbf e + \omega\, D_\ell^{-1}\big(\mathbf r - A_\ell \mathbf e\big)$ \Comment{post-smoothing}
+      \EndFor
+      \State \Return $\mathbf e$
+   \end{algorithmic}
+\end{algorithm}
+
+\paragraph{Optimization} The FNO is trained with Adam and a cosine annealed learning rate; see Table~\ref{tab:optim}. Every setting is shared across losses and preconditioners \emph{except the learning rate}, which is tuned per loss. The rate is selected by a grid search over $\{10^{-4}, 3\cdot 10^{-4}, 10^{-3}, 3\cdot 10^{-3}, 10^{-2}, 3\cdot 10^{-2}\}$, run at the full $500$-epoch budget with a single seed, choosing the rate that attains the lowest validation relative $L^2$ over training. For PI-DeepONet, whose boundary penalty introduces a second hyperparameter, the weight $\lambda_{\mathrm{bc}}$ is tuned jointly with the learning rate on the grid $\{3\cdot 10^{-5}, 10^{-4}, 3\cdot 10^{-4}, 10^{-3}\} \times \{0.3, 1, 3\}$, extended to $\lambda_{\mathrm{bc}} \in \{0.1, 0.03, 0.01, 0.003, 0.001, 0\}$ at the best rates whenever the optimum fell on the edge of the grid; the selected pair $(10^{-4}, 0.03)$ is an interior optimum in both variables, with the validation error rising to $0.24$ at $\lambda_{\mathrm{bc}}=0.01$ and $0.30$ at $0.1$. The final runs then repeat the selected configuration over three seeds. Throughout, the checkpoint attaining the lowest validation error is restored after training, and the reported test error is evaluated at that checkpoint.
+
+\begin{table}[htb]
+   \caption{Optimization hyperparameters for the Poisson experiments. Shared across losses except
+   the learning rate, which is swept per loss as described above.}
+   \label{tab:optim}
+   \begin{center}
+   \begin{tabular}{ll}
+      \multicolumn{1}{c}{\bf Setting} & \multicolumn{1}{c}{\bf Value} \\ \hline \\
+      Optimizer                 & Adam, $\beta_1 = 0.9$, $\beta_2 = 0.999$, $\varepsilon = 10^{-8}$ \\
+      Weight decay              & $0$ \\
+      Schedule                  & cosine, annealed from $\eta$ to $\eta/10$ over all epochs \\
+      Learning rate $\eta$      & $3\cdot 10^{-4}$ for $L_\textup{data}$ and $L_\textup{PLS}$ \\
+                                & $3\cdot 10^{-3}$ for $L_\textup{LS}$ and PINO \\
+                                & $10^{-4}$ for PI-DeepONet, with boundary penalty weight $\lambda_{\mathrm{bc}} = 0.03$ \\
+      Epochs                    & $500$ \\
+      Batch size                & $32$ \\
+      Train / validation / test samples & $1024$ / $128$ / $256$ \\
+      Model selection           & lowest validation relative $L^2$, restored after training \\
+      Random seeds              & $42, 43, 44$ (final runs); $42$ for the learning-rate sweep \\
+   \end{tabular}
+   \end{center}
+\end{table}
+
+\section{Details of the Stokes Equation Experiment}\label{appendix:details_stokes}
+
+\paragraph{Operator} We consider the stationary Stokes equations \eqref{eq:stokes_equation} with viscosity $\mu = 1$ and learn the solution operator $\mathcal G: f \mapsto (u, p)$ from the body force to the velocity--pressure pair. In the weak form, $\mathcal U = H^1_0(\Omega)^2 \times L^2_0(\Omega)$ and $a\big((u,p),(v,q)\big) = \mu(\nabla u, \nabla v) - (p, \nabla\cdot v) - (q, \nabla\cdot u)$, a symmetric but indefinite bilinear form; this is the saddle point setting of Section~\ref{sec:block_diagonal_preconditioner}, and it is the reason the preconditioner enters the loss as a norm weight rather than as an approximate inverse.
+
+\paragraph{Data Set} Each component of the body force is a truncated sine series with the same spectral decay as the Poisson sources,
+\begin{equation}\label{eq:appendix_stokes_data}
+   f_c(x,y) = \sum_{k,l=1}^{K} a_{ckl}\,(k^2+l^2)^{-1/2}\,\sin(k\pi x)\sin(l\pi y), \qquad c = 1, 2, \qquad a_{ckl} \sim \mathrm{Unif}[-1,1],
+\end{equation}
+with $K = 10$ as in the Poisson experiment. Unlike the Poisson pairs, no closed-form solution exists; the reference $(u, p)$ is the \emph{discrete} Taylor--Hood solution of the system of the next paragraph, computed once per sample by a sparse direct solve in double precision with the pressure pinned at one node and subsequently re-gauged to zero mean, so that the label-free residual and the labels target the same discrete state. Stokes is linear, and we use the one free constant per sample to rescale $(f, u, p)$ so that the reference velocity has unit finite element $L^2$ norm. The physics then fixes the other two magnitudes, $u \sim f/(\mu k^2)$ and $p \sim f/k$: at unit velocity the nodal root-mean-square values are $193$ for $f$ and $46$ for $p$. The network therefore sees $f / f_{\mathrm{scale}}$ with $f_{\mathrm{scale}} = 193.3$, and its pressure channel is read as $p_{\mathrm{scale}}$ times the raw output with $p_{\mathrm{scale}} = 46.4$; both are fixed constants of the data set applied at the network boundary, and neither the operator, the residual nor the reference sees them. Training, validation and test sets of $1024$, $128$ and $256$ samples are contiguous slices of one pool; as for Poisson, the seed draws both the pool and the initialization.
+
+\paragraph{Discretization} We use the Taylor--Hood $Q_2/Q_1$ pair on $32^2$ biquadratic cells: the velocity lives on the $65^2$ node grid ($2 \cdot 65^2 = 8450$ degrees of freedom, $512$ of them constrained on $\partial\Omega$) and the pressure on the $33^2$ cell-corner grid ($1089$ degrees of freedom), which is exactly the $[::2, ::2]$ subgrid of the velocity grid, so that a single $3$-channel image on the velocity grid carries both fields. Assembling the bilinear form gives the symmetric indefinite system
+\begin{equation}\label{eq:appendix_stokes_system}
+   \mathcal K \mathbf c = \begin{pmatrix} A & B^\top \\ B & 0 \end{pmatrix} \begin{pmatrix} \mathbf u \\ \mathbf p \end{pmatrix} = \begin{pmatrix} M_u \mathbf f \\ 0 \end{pmatrix},
+\end{equation}
+where $A = \mu\,\mathrm{diag}(A_{Q_2}, A_{Q_2})$ is the vector stiffness matrix, $B$ the discrete divergence, and $M_u \mathbf f$ the consistent load of the nodal interpolant of $f$, all integrated with a Gauss rule of order $5$. The residual is set to zero on the constrained velocity degrees of freedom, and for every arm --- at training and evaluation time alike --- the prediction is projected onto the admissible space: the velocity to zero on $\partial\Omega$ and the pressure to zero mean in the lumped $M_p$ inner product, since $B^\top \mathbf 1 = 0$ makes the residual blind to the constant pressure mode.
+
+\paragraph{Neural Operator} We use the FNO of Table~\ref{tab:fno} with two input and three output channels $(u_x, u_y, p)$, $3.01\cdot 10^{6}$ parameters; the pressure channel is restricted to the corner subgrid.
+
+\paragraph{Preconditioner} We take the block-diagonal preconditioner $\mathcal P = \mathrm{diag}(\hat A^{-1}, \hat S^{-1})$ of Section~\ref{sec:block_diagonal_preconditioner}. $\hat A^{-1}$ applies one geometric multigrid V-cycle of Algorithm~\ref{alg:vcycle} to each velocity component and divides by $\mu$, on the bilinear hierarchy $65 \to 33 \to 17 \to 9$ ($4$ levels, $\nu_1 = \nu_2 = 2$, damping $\omega = 2/3$ for these experiments); $\hat S^{-1} = \omega_S\,\mu\,\mathrm{diag}(M_p)^{-1}$ is the lumped pressure mass matrix, the classical spectrally equivalent surrogate of the Schur complement. Since no block-diagonal operator approximates $\mathcal K^{-1}$, $\mathcal P$ enters the least-squares loss as the weighting matrix $B$ of \eqref{eq:preconditiones_least_squares_loss}, $L_{\mathrm{PLS}}(\mathbf c) = \tfrac12\, (\mathcal K \mathbf c - \mathbf b)^\top \mathcal P (\mathcal K \mathbf c - \mathbf b)$, whose Hessian $\mathcal K \mathcal P \mathcal K$ has condition number $\mathcal O(h^{-2})$ instead of the $\mathcal O(h^{-4})$ of the bare residual. The Schur weight $\omega_S$ is the one free parameter of $\mathcal P$: it sets the weight of the continuity rows of the residual relative to the momentum rows, and is the exact counterpart of the baselines' continuity weight $w$. We treat it as a hyperparameter and tune it on the validation set (below); our earlier Stokes experiments used $\omega_S = 0.5$, which is markedly suboptimal here.
+
+\paragraph{Baselines} PINO and PI-DeepONet minimize the strong form of \eqref{eq:stokes_equation} at the interior nodes of the velocity grid, with the momentum and continuity residuals stacked into one relative ratio, $\|(r_{\mathrm{mom}}, w\, r_{\mathrm{div}})\|_2 / \|(f, 0)\|_2$, the strong-form analogue of the bare residual $\tfrac12\|\mathcal K \mathbf c - \mathbf b\|^2$. The continuity weight $w$ is the one hyperparameter a saddle point adds to the Poisson recipe, and it is decisive. The two equations have different units, $\nabla\cdot u \sim k\,u$ against $f \sim \mu k^2 u$, so under the relative reduction the divergence of a unit-velocity field is worth $\mathcal O(10)$ against $\|f\| \approx 190$: at small $w$ an irrotational velocity error $\nabla\varphi$ is almost free, because the momentum equation absorbs it into the pressure, $p \mapsto p + \mu\Delta\varphi$, and only the continuity equation sees it. We observe exactly this failure mode: at $w = 0.3$ PINO drives the residual to $0.09$ while the velocity error grows to $223\%$, with the error smooth and irrotational rather than oscillatory; the validation error then decreases monotonically with $w$ over three decades before turning up (at the selected rate $3\cdot 10^{-3}$: $67$, $30$, $6.9$, $2.4$, $1.7$, $1.65$, $1.55$ and $2.0\%$ for $w = 0.3, 1, 3, 10, 30, 100, 300, 1000$). No reference implementation fixes this ratio, so we tune $w$ on the validation set together with the learning rate. Both baselines read the pressure on the full velocity grid, since a strong-form residual needs $\nabla p$ at every interior node, and impose the boundary condition on the velocity only, exactly as on our own arms: PINO (the FNO of Table~\ref{tab:fno}, second-order central differences) has its velocity boundary ring set to zero, and PI-DeepONet (a DeepONet with three output channels, $p = 128$ basis functions, branch and trunk of width $256$ and depth $4$, $64$ random Fourier features, $2.66\cdot 10^{6}$ parameters, exact derivatives by automatic differentiation) has its velocity boundary nodes set to zero and carries the relative boundary penalty $\lambda_{\mathrm{bc}}$ of the Poisson experiment on the velocity; the pressure has a gauge, not a boundary condition, and $\nabla p$ never sees it. The autodiff residual retains a second-order graph for three fields at every collocation point, so PI-DeepONet is evaluated at $1024$ interior nodes drawn afresh at every step out of the $3969$ available (the stochastic-collocation regime it is normally trained in); at all nodes it costs $4$ times the time and $3.5$ times the memory per epoch. Its validation error is best after $100$--$230$ epochs and deteriorates thereafter for every setting we tried, so the reported checkpoint is an early one.
+
+\paragraph{Optimization} The protocol is that of the Poisson experiment (Table~\ref{tab:optim}): Adam with a cosine schedule from $\eta$ to $\eta/10$ over $500$ epochs, batch size $32$, $1024$/$128$/$256$ samples, and for every arm a grid search at the full budget on seed $42$ selecting the configuration with the lowest validation error, followed by three seeds. The validation error, and hence the model selection, is the mean of the velocity and pressure relative errors. Whenever a selected value fell on the boundary of its grid, the grid was extended by half a decade in that direction until the optimum was interior. The grids, including these extensions, were: $\eta \in \{10^{-4}, 3\cdot 10^{-4}, 10^{-3}, 3\cdot 10^{-3}\}$ for $L_{\mathrm{data}}$ and $L_{\mathrm{PLS}}$, the latter with $\omega_S \in \{0.5, 4, 16, 64, 256, 1024\}$ at $\eta = 10^{-3}$ (and $\{4, 16\}$ at $3\cdot 10^{-3}$, $\{16, 64\}$ at $3\cdot 10^{-4}$), where the validation error reads $3.14$, $2.37$, $2.14$, $2.05$, $1.94$ and $2.09\%$ along the $\omega_S$ sequence; $\eta \in \{3\cdot 10^{-4}, 10^{-3}, 3\cdot 10^{-3}, 10^{-2}\} \times w \in \{0.3, 1, 3, 10\}$ for PINO, extended to $w \in \{30, 100, 300\}$ at the three smaller rates and $w = 1000$ at $\{10^{-3}, 3\cdot 10^{-3}\}$; and $\eta \in \{3\cdot 10^{-5}, 10^{-4}, 3\cdot 10^{-4}\} \times \lambda_{\mathrm{bc}} \in \{0.01, 0.03, 0.1\}$ at $w = 1$ for PI-DeepONet, extended to $\lambda_{\mathrm{bc}} \in \{0.3, 1\}$ and then $w \in \{3, 10, 30, 100, 300, 1000\}$ at the selected $(\eta, \lambda_{\mathrm{bc}}) = (10^{-4}, 0.1)$, along which the validation error reads $49$, $48$, $36$, $32.3$, $32.2$, $36$ and $67\%$ for $w = 1, 3, 10, 30, 100, 300, 1000$. Table~\ref{tab:optim_stokes} lists the selected values; every one of them is interior to its grid.
+
+\begin{table}[htb]
+   \caption{Optimization hyperparameters for the Stokes experiments; everything not listed is as in Table~\ref{tab:optim}.}
+   \label{tab:optim_stokes}
+   \begin{center}
+   \begin{tabular}{ll}
+      \multicolumn{1}{c}{\bf Setting} & \multicolumn{1}{c}{\bf Value} \\ \hline \\
+      Learning rate $\eta$      & $10^{-3}$ for $L_\textup{PLS}$, with Schur weight $\omega_S = 256$ \\
+                                & $3\cdot 10^{-4}$ for $L_\textup{data}$ \\
+                                & $3\cdot 10^{-3}$ for PINO, with continuity weight $w = 300$ \\
+                                & $10^{-4}$ for PI-DeepONet, with $w = 100$ and $\lambda_{\mathrm{bc}} = 0.1$ \\
+      Collocation (PI-DeepONet) & $1024$ interior nodes per step, resampled every step \\
+      Model selection           & lowest validation mean of the velocity and pressure relative $L^2$ \\
+      Preconditioner            & block, $4$ levels, $\nu_1 = \nu_2 = 2$, $\omega = 2/3$ \\
+      Random seeds              & $42, 43, 44$ (final runs); $42$ for the grid search \\
+   \end{tabular}
+   \end{center}
+\end{table}
+
+\paragraph{Metric} Velocity and pressure are scored separately, each in its own finite element $L^2$ norm against the discrete reference, as the dataset-level relative error $\big(\sum_i \|e_i\|_M^2 / \sum_i \|c^*_i\|_M^2\big)^{1/2}$ with $M = M_u$ for the velocity and $M = M_p$ for the pressure, on the test set at the best-validation checkpoint; Table~\ref{tab:summary} reports both, each as mean $\pm$ half-range over the three seeds. Except for PI-DeepONet, every arm is still improving at the end of the budget (best epoch $\geq 488$ of $500$), so the numbers characterize the fixed budget rather than a converged state.
+
+\paragraph{Further controls} Four additional single-seed runs at the same setting put Table~\ref{tab:summary} in context. (i) The bare least-squares loss $L_\textup{LS} = \tfrac12\|\mathcal K\mathbf c - \mathbf b\|^2$, our negative control, reaches $21.6\%$ / $8.6\%$ at $\eta = 3\cdot 10^{-3}$ and $40.9\%$ / $13.2\%$ at $10^{-3}$. (ii) $L_\textup{PLS}$ with the Schur weight $\omega_S = 0.5$ of our earlier experiments reaches $3.64 \pm 0.44\%$ / $2.60 \pm 0.30\%$ over three seeds, against $2.38 \pm 0.31\%$ / $1.69 \pm 0.27\%$ with $\omega_S = 256$. (iii) The monolithic multigrid preconditioner, a genuine $\mathcal P \approx \mathcal K^{-1}$ (symmetric Uzawa smoother with $4$ pre- and post-sweeps and a degree-$8$ Chebyshev velocity solve, used in the applied form $\tfrac12\|\mathcal P\mathbf r\|^2$ in the finite element metric), reaches $2.80\%$ / $2.61\%$ at $\eta = 3\cdot 10^{-4}$ and $2.88\%$ / $2.62\%$ at $10^{-3}$, i.e. the supervised numbers, at $13.3$ seconds per epoch against $1.6$ for the block preconditioner. (iv) Refining the velocity grid to $129^2$ (pressure $65^2$, everything else unchanged) gives $2.35\%$ / $1.62\%$ for $L_\textup{PLS}$ at $\omega_S = 16$, $1.81\%$ / $1.16\%$ for PINO, $2.82\%$ / $2.74\%$ for supervised training and $3.50\%$ / $2.27\%$ for $L_\textup{PLS}$ at $\omega_S = 0.5$: the ordering of Table~\ref{tab:summary} is unchanged under one refinement.
+
+\end{document}
