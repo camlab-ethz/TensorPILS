@@ -165,7 +165,8 @@ def panel_long_rollout(ev, out_dir, figures_dir):
     ax.set_xlim(0, dt * (len(t) - 1))
     ax.set_xlabel(r"time $t$", fontsize=FS_LAB, labelpad=1.5)
     ax.set_ylabel(r"test rel. $L^2$", fontsize=FS_LAB, labelpad=2)
-    legend(ax, loc="lower right")
+    # PI-DeepONet sits near 1 and every other arm below ~0.07, leaving the band between free.
+    legend(ax, loc="center right")
     finish(ax)
     fig.tight_layout(pad=0.3)
     save(fig, out_dir, "ac_long_rollout", figures_dir)
