@@ -18,6 +18,24 @@ __all__ = ["plot_loss_curve", "visualize_sample", "compute_error_distribution",
            "visualize_stokes_sample", "compute_stokes_error_distribution"]
 
 
+def _log_yscale(ax, values):
+    """Log y-axis if the series has a finite positive value, else stay linear and say so.
+    matplotlib raises on a log axis with nothing positive to show -- e.g. a diverged, all-NaN run --
+    and a diagnostic plot must not be what takes a run down."""
+    v = np.asarray(values, dtype=float)
+    if np.any(np.isfinite(v) & (v > 0)):
+        ax.set_yscale("log")
+    else:
+        ax.text(0.5, 0.5, "no finite positive values (diverged?)", transform=ax.transAxes,
+                ha="center", va="center", color="red")
+
+
+def _best_line(ax, value, label_fmt):
+    """Horizontal best-value marker, skipped when no epoch ever improved (value stays inf)."""
+    if np.isfinite(value):
+        ax.axhline(value, color="g", linestyle=":", label=label_fmt.format(value))
+
+
 def plot_loss_curve(stats, loss_type: str, K: int, save_path: str):
     """Training-diagnostics figure. Panel 0 is always the training loss (optimization health).
     For the rollout trainers (Allen–Cahn / Wave) the validation panels are the space-time and
@@ -32,15 +50,17 @@ def plot_loss_curve(stats, loss_type: str, K: int, save_path: str):
 
     # Panel 0 — training loss. A variational-energy loss (minimizing-movement, Deep Ritz) can go
     # non-positive, which log-scale cannot render; fall back to symlog whenever any value ≤ 0.
+    # Only finite values decide: NaN/inf epochs (divergence) are left out of the scale choice.
     axes[0].plot(epochs, stats.train_losses, label="Train Loss", linewidth=2)
     axes[0].axvline(stats.best_epoch, color="r", linestyle="--",
                     label=f"best epoch ({stats.best_epoch})")
-    tl = stats.train_losses
-    if tl and min(tl) <= 0:
+    tl = np.asarray(stats.train_losses, dtype=float)
+    tl = tl[np.isfinite(tl)]
+    if tl.size and tl.min() <= 0:
         min_abs = min((abs(v) for v in tl if v != 0), default=1e-6)
         axes[0].set_yscale("symlog", linthresh=max(min_abs * 0.1, 1e-6))
     else:
-        axes[0].set_yscale("log")
+        _log_yscale(axes[0], tl)
     axes[0].set_xlabel("Epoch"); axes[0].set_ylabel("Loss")
     axes[0].set_title(f"FNO Training Loss ({loss_type}, K={K})")
     axes[0].legend(); axes[0].grid(alpha=0.4)
@@ -50,9 +70,8 @@ def plot_loss_curve(stats, loss_type: str, K: int, save_path: str):
         pct = [v * 100 for v in stats.val_st_rel_l2]
         axes[1].plot(epochs, pct, label="Val rel-L2 space-time (%)", linewidth=2, color="teal")
         axes[1].axvline(stats.best_epoch, color="r", linestyle="--")
-        axes[1].axhline(stats.best_val_error * 100, color="g", linestyle=":",
-                        label=f"best={stats.best_val_error * 100:.2f}%")
-        axes[1].set_yscale("log")
+        _best_line(axes[1], stats.best_val_error * 100, "best={:.2f}%")
+        _log_yscale(axes[1], pct)
         axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("rel-L2 (%)")
         axes[1].set_title("Validation relative L2 — space-time  (√ΣΣ‖ê−u‖²_M / ΣΣ‖u‖²_M)")
         axes[1].legend(); axes[1].grid(alpha=0.4)
@@ -60,16 +79,15 @@ def plot_loss_curve(stats, loss_type: str, K: int, save_path: str):
         pctf = [v * 100 for v in stats.val_final_rel_l2]
         axes[2].plot(epochs, pctf, label="Val rel-L2 final step (%)", linewidth=2, color="darkorange")
         axes[2].axvline(stats.best_epoch, color="r", linestyle="--")
-        axes[2].set_yscale("log")
+        _log_yscale(axes[2], pctf)
         axes[2].set_xlabel("Epoch"); axes[2].set_ylabel("rel-L2 (%)")
         axes[2].set_title("Validation relative L2 — final rollout step")
         axes[2].legend(); axes[2].grid(alpha=0.4)
     else:
         axes[1].plot(epochs, stats.val_errors, label="Val MSE", linewidth=2, color="orange")
         axes[1].axvline(stats.best_epoch, color="r", linestyle="--")
-        axes[1].axhline(stats.best_val_error, color="g", linestyle=":",
-                        label=f"best val={stats.best_val_error:.2e}")
-        axes[1].set_yscale("log")
+        _best_line(axes[1], stats.best_val_error, "best val={:.2e}")
+        _log_yscale(axes[1], stats.val_errors)
         axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("MSE")
         axes[1].set_title("Validation MSE")
         axes[1].legend(); axes[1].grid(alpha=0.4)
@@ -78,7 +96,7 @@ def plot_loss_curve(stats, loss_type: str, K: int, save_path: str):
         if has_l2:
             axes[panel].plot(epochs, stats.val_l2_errors, label="Val FEM-L2", linewidth=2, color="purple")
             axes[panel].axvline(stats.best_epoch, color="r", linestyle="--")
-            axes[panel].set_yscale("log")
+            _log_yscale(axes[panel], stats.val_l2_errors)
             axes[panel].set_xlabel("Epoch"); axes[panel].set_ylabel("FEM-L2")
             axes[panel].set_title("Validation FEM-L2  (√eᵀMe)")
             axes[panel].legend(); axes[panel].grid(alpha=0.4)
@@ -87,7 +105,7 @@ def plot_loss_curve(stats, loss_type: str, K: int, save_path: str):
             pct = [v * 100 for v in stats.val_rel_l2_errors]
             axes[panel].plot(epochs, pct, label="Val rel-L2 (%)", linewidth=2, color="teal")
             axes[panel].axvline(stats.best_epoch, color="r", linestyle="--")
-            axes[panel].set_yscale("log")
+            _log_yscale(axes[panel], pct)
             axes[panel].set_xlabel("Epoch"); axes[panel].set_ylabel("rel-L2 (%)")
             axes[panel].set_title("Validation relative FEM-L2  (√eᵀMe / √uᵀMu)")
             axes[panel].legend(); axes[panel].grid(alpha=0.4)

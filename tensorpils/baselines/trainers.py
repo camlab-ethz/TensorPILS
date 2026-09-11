@@ -136,7 +136,9 @@ class PINOACTrainer(ACTrainer):
             seed = torch.stack([self._project_zero_bc(trajs_grid[:, i])
                                 for i in range(ns)], dim=1)              # [B, ns, H, W]
             seq_grid = torch.cat([seed, preds_grid], dim=1)              # [B, ns+R, H, W]
-            loss = self.lambda_galerkin * self.criterion(seq_grid)
+            loss = preds_grid.new_zeros(())
+            if self.lambda_galerkin != 0.0:          # never evaluate an unused residual: 0 * NaN = NaN
+                loss = loss + self.lambda_galerkin * self.criterion(seq_grid)
             if self.lambda_data > 0.0:
                 ref = trajs_grid[:, ns:ns + R]
                 loss = loss + self.lambda_data * ((preds_grid - ref) ** 2).mean()
@@ -308,7 +310,9 @@ class PIDeepONetACTrainer(ACTrainer):
             self.optimizer.zero_grad()
             trajs_grid = trajs_grid.to(self.device)
             seq_node, laps, preds_grid = self._rollout_autodiff(trajs_grid)
-            loss = self.lambda_galerkin * self.criterion(seq_node, laps)
+            loss = preds_grid.new_zeros(())
+            if self.lambda_galerkin != 0.0:          # never evaluate an unused residual: 0 * NaN = NaN
+                loss = loss + self.lambda_galerkin * self.criterion(seq_node, laps)
             if self.lambda_data > 0.0:
                 ref = trajs_grid[:, ns:ns + R]
                 loss = loss + self.lambda_data * ((preds_grid - ref) ** 2).mean()

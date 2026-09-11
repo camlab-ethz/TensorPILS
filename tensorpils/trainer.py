@@ -13,6 +13,7 @@ the training loss, so model selection and the reported error stay comparable.
 
 import math
 import os
+import traceback
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -140,6 +141,19 @@ class BaseTrainer:
     def _after_train_viz(self):
         """Hook run after training to write sample panels / error distribution."""
 
+    def _save_results(self):
+        """Hook run right after the test evaluation and BEFORE any plotting: persist the run's
+        results (the results JSON). Plots are diagnostics and must never cost a finished run its
+        results -- a failing loss-curve plot used to abort ``train()`` before the JSON was written."""
+
+    def _run_viz(self, fn, *args):
+        """Run one diagnostic plotting step; a failure is reported with its traceback, not raised."""
+        try:
+            fn(*args)
+        except Exception:
+            print(f"WARNING: {getattr(fn, '__name__', fn)} failed -- results are already saved:")
+            traceback.print_exc()
+
     def train(self) -> float:
         print(f"Training FNO with {self.loss_type} loss  (device: {self.device})\n")
         self._before_train()
@@ -171,8 +185,9 @@ class BaseTrainer:
 
         test_err = self.test()
         print(f"{self._test_label}: {test_err:.2e}")
-        self.plot_loss_curve()
-        self._after_train_viz()
+        self._save_results()
+        self._run_viz(self.plot_loss_curve)
+        self._run_viz(self._after_train_viz)
         return test_err
 
     # -------------------- checkpointing --------------------
@@ -474,11 +489,11 @@ class PoissonTrainer(BaseTrainer):
 
         test_mse, test_l2, test_rl2 = self.test()
         print(f"Test MSE: {test_mse:.2e}  Test FEM-L2: {test_l2:.2e}  Test rel-L2: {test_rl2:.2%}")
-        self.plot_loss_curve()
-        self.visualize_sample(self.train_dataset, "train", 0)
-        self.visualize_sample(self.test_dataset, "test", 0)
-        self.compute_error_distribution()
-        self._save_results_json((test_mse, test_l2, test_rl2))
+        self._save_results_json((test_mse, test_l2, test_rl2))      # before any plotting
+        self._run_viz(self.plot_loss_curve)
+        self._run_viz(self.visualize_sample, self.train_dataset, "train", 0)
+        self._run_viz(self.visualize_sample, self.test_dataset, "test", 0)
+        self._run_viz(self.compute_error_distribution)
         return test_mse, test_l2, test_rl2
 
     def _save_results_json(self, test_metrics) -> None:
@@ -661,7 +676,9 @@ class RolloutTrainer(BaseTrainer):
             self.optimizer.zero_grad()
             trajs_grid = trajs_grid.to(self.device)
             preds_grid, seq_node = self._rollout(trajs_grid)
-            loss = self.lambda_galerkin * self.criterion(seq_node)
+            loss = preds_grid.new_zeros(())
+            if self.lambda_galerkin != 0.0:          # never evaluate an unused residual: 0 * NaN = NaN
+                loss = loss + self.lambda_galerkin * self.criterion(seq_node)
             if self.lambda_data > 0.0:
                 ref = trajs_grid[:, ns:ns + R]                           # [B, R, H, W]
                 loss = loss + self.lambda_data * ((preds_grid - ref) ** 2).mean()
@@ -718,13 +735,10 @@ class RolloutTrainer(BaseTrainer):
     def test(self):
         return self._eval_full(self.test_loader)[0]
 
-    def train(self) -> float:
-        """Run the base training loop, then persist per-epoch stats + config to a results JSON
-        (the plottable record; the ``.pth`` checkpoint also holds stats but is excluded from
-        cross-run sync)."""
-        result = super().train()
+    def _save_results(self):
+        """Persist per-epoch stats + config to a results JSON (the plottable record; the ``.pth``
+        checkpoint also holds stats but is excluded from cross-run sync)."""
         self._save_results_json()
-        return result
 
     def _save_results_json(self) -> None:
         """Dump stats + config to ``results/{prefix}.json`` for cross-run aggregation. The per-epoch
@@ -1059,13 +1073,11 @@ class StokesTrainer(BaseTrainer):
         if self.precond is not None:
             self.precond.report()
 
-    def train(self):
-        result = super().train()
+    def _save_results(self):
         sq, ru, rp = self._eval_loader(self.test_loader)
         print(f"Test rel-L2 — velocity: {ru:.2%}   pressure: {rp:.2%}   "
               f"(combined FE-L2 squared error {sq:.3e})")
         self._save_results_json((sq, ru, rp))
-        return result
 
     def _save_results_json(self, test_metrics) -> None:
         import json
