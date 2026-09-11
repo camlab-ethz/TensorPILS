@@ -322,13 +322,13 @@ Figure \ref{fig:pls-overlay} shows that that preconditioning is essential to obt
 Physics-informed training is not bound to a dataset. Instead, we may draw a fresh batch of samples for every update of the model's parameters. We refer to this as \emph{training at the infinite data limit}. To illustrate the benefit of training in this regime, we fix an optimization budget: 1000 epochs' worth of forward passes at a dataset size of 1024 (double check) and compare the final relative test $L^2$ error achieved for datasets of growing size, see Figure []. We clearly see the benefit of training in the infinite data regime, even for a fixed finite training budget. Dataset uses $K=10$.
 
 \subsection{Allen-Cahn Equation}
-We now learn a time-increment operator for the Allen-Cahn equation with homogeneous Dirichlet boundary conditions
+We now learn a time-stepping operator for the Allen-Cahn equation with homogeneous Dirichlet boundary conditions
 \begin{align}\label{eq:allen_cahn}
    \begin{split}
-      \partial_t u = \Delta u + \varepsilon^2 u(1-u), \quad u_{|\partial\Omega}=0,
+      \partial_t u = \Delta u + \varepsilon^2 u(1-u^2), \quad u_{|\partial\Omega}=0, \quad u_{|t=0} = u_0
    \end{split}
 \end{align}
-on the domain $\Omega=[0,1]$ and time interval $I=[0,1]$ with $\eps=32$. The Allen-Cahn equation is the $L^2$ gradient flow of the Ginzburg-Landau energy, see Appendix [] for details, and it models phase separation of non-mixing phases. We again use a FNO $\mathcal G_\theta$ and interpolate its output into the space $\mathcal U_h = Q_1^h$ on a tensor-product grid. Discretizing \eqref{eq:allen_cahn} in $Q_1^h$ and employing a convex-concave splitting integrator, the discrete timestep $\mathbf u_{k+1}$ given $\mathbf u_k$ satisfies
+on the domain $\Omega=[0,1]^2$ and time interval $I=[0,1]$ with $\varepsilon=32$. The Allen-Cahn equation models phase separation of non-mixing phases. We put a sinusoidal distribution on the initial conditions and aim to learn the time stepping operator corresponding to a convex-concave splitting integrator for \eqref{eq:allen_cahn}. We again use a FNO $\mathcal G_\theta$ and interpolate its output into the space $\mathcal U_h = Q_1^h$ on a tensor-product grid. Discretizing \eqref{eq:allen_cahn} in $Q_1^h$, the timestep $\mathbf u_{k+1}$ given $\mathbf u_k$ satisfies
 \begin{equation}\label{eq:convex_concave_time_stepper}
    0 
    =
@@ -338,42 +338,45 @@ on the domain $\Omega=[0,1]$ and time interval $I=[0,1]$ with $\eps=32$. The All
    =:
    \phi(\mathbf u_{k+1}, \mathbf u_k), 
 \end{equation}
-where $A_{ij}=\int_\Omega \nabla \phi_j\nabla \phi_i\,\mathrm dx$ is the stiffness matrix, and $M=\int_\Omega \phi_j \phi_i\,\mathrm dx$ is the mass matrix. The scheme \ref{eq:convex_concave_time_stepper} is used to produce a ground truth dataset over a sinusoidal distribution of initial conditions using \texttt{TensorMesh} []. Alternatively, we employ a minimizing movement-type loss that produces $\mathbf u_{k+1}$ from $\mathbf u_k$ as the minimizer
-\begin{align}
-   \begin{split}
-      \mathbf u_{k+1}
-      =
-      \underset{\mathbf u}{\operatorname{argmin}}\, J(\mathbf u, \mathbf u_k)
-      &=
-      \frac12\mathbf u^\top A \mathbf u 
-      +
-      \frac{\eps^2}{4} \mathbf 1^\top M \mathbf u^4 
-      -
-      \varepsilon^2 \mathbf u_k^\top M \mathbf u 
-      \\&+
-      \frac{1}{2 \tau}(\mathbf u - \mathbf u_k)^\top M(\mathbf u - \mathbf u_k). 
-   \end{split}
-\end{align}
-We derive $J$ from a variational principle in the Appendix [], note that essentially $\nabla_u J(\mathbf u,\mathbf u_k)=\phi(\mathbf u, \mathbf u_k)$.
+where $A_{ij}=\int_\Omega \nabla \phi_j\nabla \phi_i\,\mathrm dx$ is the stiffness matrix, and $M=\int_\Omega \phi_j \phi_i\,\mathrm dx$ is the mass matrix. In our experiment, we use a $128\times128$ grid, set $\tau=0.01$ and $\varepsilon=32$. We train $\mathcal G_\theta$ on 10 timesteps between $t=0$ and $t=0.1$, and roll out the prediction until the final time $T=1$. The full details are given in Appendix~\ref{appendix:details_allen_cahn}.
 
-\subsubsection{Preconditioned Physics-Informed Training}
-Given an initial condition $\mathbf u_0$, we denote the reference roll-out by $\mathbf u_i$, $i=0,\dots,T$ which is produced from \ref{eq:convex_concave_time_stepper} with a finite element method. The roll-out of the FNO is denoted by $\mathcal G_\theta^i(\mathbf u_0)$, and when we write $\hat{\mathbf u}_i$, we mean $\mathcal G_\theta^i(\mathbf u_0)$ with \emph{detached gradients}. The data-driven loss on a single trajectory is
+
+
+\subsubsection{Loss Functions}
+
+
+Given an initial condition $\mathbf u_0$, we denote the reference roll-out by $\mathbf u_0, \mathbf u_1, \dots, \mathbf u_T$ which is produced from \ref{eq:convex_concave_time_stepper} with a finite element method. The roll-out of the FNO is denoted by $\mathcal G_\theta^i(\mathbf u_0)$, and when we write $\hat{\mathbf u}_i$, we mean $\mathcal G_\theta^i(\mathbf u_0)$ with \emph{detached gradients}. The data-driven loss on a single trajectory is
 \begin{equation}
    L_{\textup{data}}(\theta) = \frac12 \sum_{k=0}^{R-1}\left\| \mathcal G_\theta(\hat{\mathbf u}_k) - \mathbf u_{k+1} \right\|^2
 \end{equation}
-where we use $\hat{\mathbf u}_k$ to avoid backpropagation through the graph of $\mathcal G_\theta^k$---the $k$-th power of the FNO and $R\in\mathbb N$ is a hyperparameter of the training setup. The least-squares loss and the minimizing movement loss are
+where we use $\hat{\mathbf u}_k$ to avoid backpropagation through the graph of $\mathcal G_\theta^k$---the $k$-th power of the FNO and $R\in\mathbb N$ is a hyperparameter of the training setup, we use $R=10$, hence train for 10 timesteps between $t=0$ and $t=0.1$. The least-squares loss is
 \begin{equation}
-   L_{\textup{LS}(\theta)}=\frac12\sum_{k=0}^{R-1}\left\| \phi(\mathcal G_\theta(\hat{\mathbf u}_k), \hat{\mathbf u}_k) \right\|^2, 
-   \quad
-   L_{\textup{MM}}(\theta) = \sum_{k=0}^{R-1}J(\mathcal G_\theta(\hat{\mathbf u}_k), \hat{\mathbf u}_k)
+   L_{\textup{LS}}(\theta)=\frac12\sum_{k=0}^{R-1}\left\| \phi(\mathcal G_\theta(\hat{\mathbf u}_k), \hat{\mathbf u}_k) \right\|^2
 \end{equation}
-\emph{todo: Discuss ill-conditioning.} Finally, we propose a preconditioned variant
+and its preconditioned variant is based on an approximate inverse of the Jacobian of $\phi(\cdot, \mathbf u_k)$ realized via geometric multigrid
 \begin{equation}
    L_{\textup{PLS}}(\theta) = \frac12\sum_{k=0}^{R-1}\left\| P[\phi(\mathcal G_\theta(\hat{\mathbf u}_k), \hat{\mathbf u}_k)] \right\|^2,
    \quad
-   P\approx \left( (3\varepsilon^2 + \tau^{-1})M + A \right)^{-1}
+   P\approx \left( (3\varepsilon^2 + \tau^{-1})M + A \right)^{-1}.
 \end{equation}
-which is based on an approximate inverse of the Jacobian $\nabla_u\phi$ and can be realized efficiently via geometric multigrid method.
+For a detailed derivation and the additional baselines PI-DeepONet and PINO, see Appendix~\ref{appendix:details_allen_cahn}.
+
+\begin{figure}[t]
+  \centering
+  % Both panels authored at exactly 0.49\textwidth (2.695 in) by
+  % experiments/allen_cahn/ac_paper/plot_paper.py, so do not rescale them.
+  \includegraphics[width=0.49\linewidth]{figures/ac_val_curves.pdf}
+  \hfill
+  % Right panel pending: ac_long_rollout.pdf, from experiments/allen_cahn/ac_paper/evaluate_test.py
+  % on Euler. Replace the box below with \includegraphics[width=0.49\linewidth]{figures/ac_long_rollout.pdf}.
+  \fbox{\parbox[b][2.15in][c]{0.46\linewidth}{\centering\small long roll-out to $T=1$\\(pending)}}
+  \caption{Allen--Cahn. \textbf{Left:} validation space-time relative $L^2$ (pooled over the validation set) vs.\ epoch; mean over three seeds with min--max band, smoothed by a centered 15-epoch moving average. $L_\textup{data}$ currently has one seed. \textbf{Right:} test relative $L^2$ per time step of a free roll-out to $T=1$, mean over test samples of the per-sample error, for the best seed of each loss (selected on validation). The dotted line marks the training horizon $t=0.1$.}
+  \label{fig:ac-results}
+\end{figure}
+
+\subsubsection{Discussion}
+
+
 
 \subsection{Stokes Equation}
 
@@ -570,5 +573,72 @@ which we assemble with an exact quadrature rule. For the analytical sources $f$ 
    \end{tabular}
    \end{center}
 \end{table}
+
+\section{Details of the Allen--Cahn Experiment}\label{appendix:details_allen_cahn}
+
+\paragraph{Operator} We consider the Allen--Cahn equation with homogeneous Dirichlet boundary conditions on the unit square $\Omega = [0,1]^2$ and the time interval $I = [0,T]$,
+\begin{equation}\label{eq:appendix_allen_cahn}
+   \partial_t u - \Delta u + \varepsilon^2\big(u^3 - u\big) = 0 \quad \text{in } I\times\Omega,
+   \qquad
+   u = 0 \quad \text{on } I\times\partial\Omega,
+   \qquad
+   u(0) = u_0 \quad \text{in } \Omega.
+\end{equation}
+The Allen--Cahn equation is the $L^2(\Omega)$ gradient flow $\partial_t u = -E'(u)$ of the Ginzburg--Landau energy
+\begin{equation}\label{eq:appendix_ginzburg_landau}
+   E(u) = \frac12\int_\Omega |\nabla u|^2\,\mathrm dx + \frac{\varepsilon^2}{4}\int_\Omega \big(u^2 - 1\big)^2\,\mathrm dx,
+\end{equation}
+hence $t\mapsto E(u(t))$ is non-increasing. The double-well potential drives $u$ towards the two phases $u = \pm 1$, which are separated by interfaces of width $\mathcal O(\varepsilon^{-1})$; we use $\varepsilon = 32$. For every $u_0\in L^2(\Omega)$, \eqref{eq:appendix_allen_cahn} admits a unique weak solution
+\begin{equation*}
+   u \in L^2(I;H^1_0(\Omega)) \cap L^4(I\times\Omega) \cap C(I;L^2(\Omega)),
+   \qquad
+   \partial_t u \in L^2(I;H^{-1}(\Omega)) + L^{4/3}(I\times\Omega),
+\end{equation*}
+by the theory of monotone operators: $u\mapsto -\Delta u + \varepsilon^2 u^3$ is monotone and $u\mapsto -\varepsilon^2 u$ is a Lipschitz perturbation, see []. The initial conditions we use satisfy $\|u_0\|_{L^\infty(\Omega)} \leq 0.96$, see the data set description below, and by the maximum principle the solution then satisfies $\|u(t)\|_{L^\infty(\Omega)}\leq 1$ for all $t\in I$. The cubic term is therefore bounded along all trajectories we consider, and the solutions lie in the standard energy space
+\begin{equation*}
+   W(I) = \big\{ u\in L^2(I;H^1_0(\Omega)) \;:\; \partial_t u \in L^2(I;H^{-1}(\Omega)) \big\} \hookrightarrow C(I;L^2(\Omega)).
+\end{equation*}
+We denote by $S(t)u_0 = u(t)$ the solution semigroup on $L^2(\Omega)$. Testing the difference of two solutions with itself, and using that $u\mapsto u^3$ is monotone and that $2\pi^2$ is the smallest eigenvalue of $-\Delta$ on $\Omega$, yields
+\begin{equation}\label{eq:appendix_ac_stability}
+   \|S(t)u_0 - S(t)v_0\|_{L^2(\Omega)} \leq e^{(\varepsilon^2 - 2\pi^2)\,t}\,\|u_0 - v_0\|_{L^2(\Omega)}.
+\end{equation}
+The exponential factor is not an artifact of the estimate: linearizing \eqref{eq:appendix_allen_cahn} at the unstable equilibrium $u = 0$ shows that the mode $\sin(\pi i x)\sin(\pi j y)$ grows at rate $\varepsilon^2 - \pi^2(i^2 + j^2)$, which is the mechanism behind phase separation. Perturbations of an early, small-amplitude state are hence strongly amplified, which is relevant for autoregressive rollouts. Rather than approximating $S(t)$ directly, we learn a time-discrete approximation of $S(\tau)$ for a fixed time step $\tau > 0$, which we define next.
+
+\paragraph{Time Discretization} We split the energy into two convex parts, $E = E_+ - E_-$, with
+\begin{equation*}
+   E_+(u) = \frac12\int_\Omega |\nabla u|^2\,\mathrm dx + \frac{\varepsilon^2}{4}\int_\Omega \big(u^4 + 1\big)\,\mathrm dx,
+   \qquad
+   E_-(u) = \frac{\varepsilon^2}{2}\int_\Omega u^2\,\mathrm dx,
+\end{equation*}
+and discretize the gradient flow with the convex--concave splitting of [], which treats $E_+$ implicitly and $E_-$ explicitly. Given $u_k \in L^2(\Omega)$, the next time step $u_{k+1}\in H^1_0(\Omega)$ solves
+\begin{equation}\label{eq:appendix_cc_step}
+   \frac1\tau\big(u_{k+1} - u_k, v\big) + \big(\nabla u_{k+1}, \nabla v\big) + \varepsilon^2\big(u_{k+1}^3 - u_k, v\big) = 0
+   \quad \text{for all } v\in H^1_0(\Omega),
+\end{equation}
+where $(\cdot,\cdot)$ denotes the $L^2(\Omega)$ inner product. Equivalently, $u_{k+1}$ is the minimizer of
+\begin{equation}\label{eq:appendix_cc_functional}
+   J(v; u_k) = E_+(v) - \varepsilon^2 (u_k, v) + \frac{1}{2\tau}\|v - u_k\|^2_{L^2(\Omega)},
+   \qquad v \in H^1_0(\Omega),
+\end{equation}
+and \eqref{eq:appendix_cc_step} is its Euler--Lagrange equation. As $H^1_0(\Omega)\hookrightarrow L^4(\Omega)$ in two dimensions, $J(\cdot\,; u_k)$ is finite, strictly convex, coercive and weakly lower semicontinuous on $H^1_0(\Omega)$. It thus has a unique minimizer for every $u_k\in L^2(\Omega)$ and every $\tau > 0$, and the scheme is well defined without a step size restriction. It is moreover unconditionally energy stable: for $u_k\in H^1_0(\Omega)$, convexity of $E_+$ at $u_{k+1}$ and of $E_-$ at $u_k$ gives
+\begin{equation*}
+   E(u_{k+1}) - E(u_k)
+   \leq
+   \big\langle E_+'(u_{k+1}) - E_-'(u_k),\, u_{k+1} - u_k \big\rangle
+   =
+   -\frac1\tau\|u_{k+1} - u_k\|^2_{L^2(\Omega)},
+\end{equation*}
+where the equality is \eqref{eq:appendix_cc_step} tested with $v = u_{k+1} - u_k$. The operator we learn is the resulting time-stepping operator
+\begin{equation*}
+   \mathcal G_\tau : L^2(\Omega) \to H^1_0(\Omega), \quad u_k \mapsto u_{k+1},
+\end{equation*}
+whose iterates $\mathcal G_\tau^k(u_0)$ are a first-order approximation in $\tau$ of $u(k\tau) = S(k\tau)u_0$. For the loss functions it is convenient to characterize $\mathcal G_\tau$ through the residual $\Phi : H^1_0(\Omega)\times L^2(\Omega) \to H^{-1}(\Omega)$, defined by
+\begin{equation}\label{eq:appendix_cc_residual}
+   \big\langle \Phi(w, u_k), v \big\rangle
+   =
+   \frac1\tau\big(w - u_k, v\big) + \big(\nabla w, \nabla v\big) + \varepsilon^2\big(w^3 - u_k, v\big)
+   \quad \text{for all } v\in H^1_0(\Omega),
+\end{equation}
+so that $\Phi(\cdot, u_k) = D_v J(\cdot\,; u_k)$ and $\mathcal G_\tau(u_k)$ is the unique root of $\Phi(\cdot, u_k)$. Restricting $w$ and $v$ in \eqref{eq:appendix_cc_residual} to $\mathcal U_h = Q_1^h$, and replacing $w^3$ by its nodal interpolant, yields the discrete residual $\phi$ of \eqref{eq:convex_concave_time_stepper}.
 
 \end{document}
