@@ -141,6 +141,10 @@ def build_parser() -> ArgumentParser:
                    help="Max Newton iterations per step for the FEM reference solver.")
     p.add_argument("--ac_ref_chunk", type=int, default=64,
                    help="Sample chunk size for the batched FEM reference solve (memory control).")
+    p.add_argument("--ac_ref_device", choices=["cpu", "cuda"], default="cpu",
+                   help="Device for the FEM reference solve. 'cpu' (default): scipy sparse direct "
+                        "solver, exact and deterministic. 'cuda': without cupy this is torch_sla's "
+                        "iterative PBiCGStab, which can break down and has produced NaN labels.")
     p.add_argument("--ac_integrator", choices=["convex_concave", "backward_euler"],
                    default="convex_concave",
                    help="Allen–Cahn time integrator for BOTH the reference data and the physics "
@@ -449,7 +453,8 @@ def run_ac(args, device):
         print(f"precond     : {args.ac_precond}  ½‖P R‖², P≈(a²A+cM)⁻¹  "
               f"(a²={args.ac_a ** 2:g}, c=1/dt+3ε²={c_shift:g}, mg_levels={args.mg_levels})")
     print(f"bptt mode   : {args.bptt_mode or 'default (per-loss)'}")
-    print(f"reference   : FEM {args.ac_integrator} + Newton (build cost ~ {total}x{args.n_steps} steps; "
+    print(f"reference   : FEM {args.ac_integrator} + Newton on {args.ac_ref_device} "
+          f"(build cost ~ {total}x{args.n_steps} steps; "
           f"no analytical solution exists for AC)")
     _print_common(args, device)
 
@@ -460,6 +465,7 @@ def run_ac(args, device):
         dt=args.dt, n_steps=args.n_steps, a=args.ac_a, eps=args.ac_eps, r=args.ac_r,
         newton_tol=args.ac_newton_tol, newton_max=args.ac_newton_max,
         ref_chunk=args.ac_ref_chunk, integrator=args.ac_integrator, seed=args.seed,
+        ref_device=args.ac_ref_device,
     )
     print(f"  train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}, "
           f"grid={train_ds.grid_size}, frames/sample={args.n_steps + 1}\n")

@@ -421,6 +421,7 @@ class ACDataset(Dataset):
         newton_max: int = 20,
         ref_chunk: int = 64,
         integrator: str = "convex_concave",
+        ref_device: str = "cpu",
         mesh=None,
         problem: Optional[ACProblem] = None,
         all_data: Optional[dict] = None,
@@ -465,13 +466,26 @@ class ACDataset(Dataset):
                 for s in range(0, num_samples, ref_chunk)
             ], dim=0)                                               # [num, N]
             # FEM implicit-Euler + Newton reference trajectory (no analytical solution exists).
-            # Run the (dense, batched) solve on the GPU when available; store results on CPU.
-            solve_dev = "cuda" if torch.cuda.is_available() else "cpu"
+            # ref_device="cpu" (default) solves each Newton system with scipy's sparse direct solver:
+            # exact and deterministic. On CUDA without cupy, TensorMesh falls back to torch_sla's
+            # iterative PBiCGStab, which breaks down nondeterministically and has produced NaN
+            # reference trajectories (the data-driven AC finals at seeds 43/44). Results stored on CPU.
+            solve_dev = "cuda" if ref_device == "cuda" and torch.cuda.is_available() else "cpu"
             all_trajs = self.problem.fem_reference(
                 u0.to(solve_dev), a=a, eps=eps, dt=dt, n_steps=n_steps,
                 newton_tol=newton_tol, newton_max=newton_max, chunk=ref_chunk,
                 integrator=integrator,
             ).cpu()                                                 # [num, T+1, N]
+            # A single non-finite label poisons data-driven training (NaN loss from the first batch)
+            # and any validation/test metric it enters, silently. Refuse to build instead.
+            bad = (~torch.isfinite(all_trajs)).flatten(1).any(1).nonzero().flatten().tolist()
+            if bad:
+                raise RuntimeError(
+                    f"{len(bad)} of {num_samples} FEM reference trajectories are non-finite "
+                    f"(samples {bad[:10]}{' ...' if len(bad) > 10 else ''}; solved on {solve_dev}). "
+                    "Refusing to build the dataset. "
+                    + ("Rebuild with ref_device='cpu' (--ac_ref_device cpu)." if solve_dev == "cuda" else
+                       "The direct solver should not do this: inspect these initial conditions."))
 
             self.trajs = [all_trajs[i] for i in range(num_samples)]
             self._all_data = {"trajs": self.trajs, "l_a": self.l_a}
@@ -495,14 +509,14 @@ def create_ac_datasets(n_train: int, n_val: int, n_test: int,
                        a: float = 1.0, eps: float = 2.0, r: float = 0.5,
                        newton_tol: float = 1e-8, newton_max: int = 20,
                        ref_chunk: int = 64, integrator: str = "convex_concave",
-                       seed: int = 42):
+                       seed: int = 42, ref_device: str = "cpu"):
     """Build train/val/test Allen–Cahn splits that share one mesh, one :class:`ACProblem`,
-    and a single pool of FEM reference trajectories."""
+    and a single pool of FEM reference trajectories (solved on ``ref_device``; see ACDataset)."""
     total = n_train + (n_val if n_val > 0 else 0) + (n_test if n_test > 0 else 0)
     base = ACDataset(num_samples=total, K=K, seed=seed, grid_resolution=grid_resolution,
                      dt=dt, n_steps=n_steps, a=a, eps=eps, r=r,
                      newton_tol=newton_tol, newton_max=newton_max, ref_chunk=ref_chunk,
-                     integrator=integrator)
+                     integrator=integrator, ref_device=ref_device)
     mesh, problem, all_data = base.get_shared_resources()
 
     train_idx = list(range(n_train))
