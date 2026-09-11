@@ -70,6 +70,13 @@ class TrainingStats:
 
 
 class BaseTrainer:
+    #: Write the best-model ``.pth``? Set to False for sweeps, where the checkpoints are never
+    #: reloaded and each one carries the optimizer state as well (Adam's two moment buffers),
+    #: roughly 3x the parameter count. Model selection is UNAFFECTED either way: ``best_state``
+    #: lives in memory and is restored after training regardless. A class attribute rather than a
+    #: constructor argument, so it does not have to be threaded through five subclass signatures.
+    save_checkpoints = True
+
     """Shared training scaffolding. Subclasses build their datasets/loaders/criterion,
     then implement ``train_epoch``, ``validate``/``test``, ``_file_prefix`` and the
     end-of-training visualization hook ``_after_train_viz``."""
@@ -179,6 +186,8 @@ class BaseTrainer:
         raise NotImplementedError
 
     def _save_checkpoint(self, epoch, val_error):
+        if not self.save_checkpoints:
+            return
         path = f"{self.output_dir}/checkpoints/{self._file_prefix()}_best.pth"
         torch.save({
             "epoch": epoch,
