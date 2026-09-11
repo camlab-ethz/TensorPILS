@@ -370,7 +370,10 @@ For a detailed derivation and the additional baselines PI-DeepONet and PINO, see
   \includegraphics[width=0.49\linewidth]{figures/ac_val_curves.pdf}
   \hfill
   \includegraphics[width=0.49\linewidth]{figures/ac_long_rollout.pdf}
-  \caption{Allen--Cahn. \textbf{Left:} validation space-time relative $L^2$ (pooled over the validation set) vs.\ epoch; mean over three seeds with min--max band, smoothed by a centered 15-epoch moving average. $L_\textup{data}$ currently has one seed. \textbf{Right:} test relative $L^2$ per time step of a free roll-out to $T=1$, mean over test samples of the per-sample error, for the best seed of each loss (selected on validation). The dotted line marks the training horizon $t=0.1$.}
+  \par\vspace{2pt}
+  % One-row legend shared by both panels, authored at the full text width by plot_paper.py.
+  \includegraphics[width=\linewidth]{figures/ac_legend.pdf}
+  \caption{Allen--Cahn. \textbf{Left:} validation space-time relative $L^2$ (pooled over the validation set) vs.\ epoch; mean over three seeds with min--max band, smoothed by a centered 15-epoch moving average. \textbf{Right:} test relative $L^2$ per time step of a free roll-out to $T=1$, mean over test samples of the per-sample error, for the best seed of each loss (selected on validation); PI-DeepONet, whose error stays between $0.7$ and $1$, is omitted. The dashed line marks the training horizon $t=0.1$.}
   \label{fig:ac-results}
 \end{figure}
 

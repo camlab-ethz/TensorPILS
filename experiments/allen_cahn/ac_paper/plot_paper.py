@@ -7,8 +7,10 @@ authored at exactly 0.49 x 5.5 = 2.695 in and ``\\includegraphics`` does not res
 ``ac_val_curves.{pdf,png}``   (a) validation space-time relative L2 vs epoch, mean over seeds with a
                               min-max band. Read from ``<final>/seed*/results/*.json``.
 ``ac_long_rollout.{pdf,png}`` (b) test relative L2 per time step of a free rollout to T = 1, the mean
-                              over test samples of the per-sample error, best seed per arm. Read
-                              from ``test_eval.json`` written on Euler by ``evaluate_test.py``.
+                              over test samples of the per-sample error, best seed per arm; the
+                              failed PI-DeepONet arm is left out. Read from ``test_eval.json``
+                              written on Euler by ``evaluate_test.py``.
+``ac_legend.{pdf,png}``       one-row legend shared by both panels, placed below them at full width.
 
 With ``test_eval.json`` present it also prints the Allen-Cahn rows of the paper's summary table:
 the test space-time relative L2 as the mean over test samples of the per-sample error (steps 0-10),
@@ -35,6 +37,7 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")            # headless: render to file, no display needed
 import matplotlib.pyplot as plt
+import matplotlib.ticker
 from matplotlib.ticker import NullFormatter
 
 from plot_final import load as load_final
@@ -128,26 +131,30 @@ def panel_val_curves(final_root, out_dir, figures_dir, window):
             mean, lo, hi = np.nanmean(arr, 0), np.nanmin(arr, 0), np.nanmax(arr, 0)
         if len(runs) > 1:
             ax.fill_between(ep, smooth(lo, window), smooth(hi, window), color=colour, alpha=0.11, lw=0)
-        ax.plot(ep, smooth(mean, window), color=colour, lw=1.2, ls=dash,
-                label=label if len(runs) > 1 else f"{label} (1 seed)")
+        ax.plot(ep, smooth(mean, window), color=colour, lw=1.2, ls=dash)
     ax.set_yscale("log")
     ax.set_xlim(0, 500)
-    # Every curve stays above ~2.5e-2, so a floor at 8e-3 opens a strip along the bottom for the
-    # legend instead of laying it over the fast-converging L_PLS / L_data curves.
-    ax.set_ylim(8e-3, 2.5)
     ax.set_xlabel("epoch", fontsize=FS_LAB, labelpad=1.5)
     ax.set_ylabel(r"val. space-time rel. $L^2$", fontsize=FS_LAB, labelpad=2)
-    legend(ax, loc="lower left", ncol=2, columnspacing=1.0)
     finish(ax)
     fig.tight_layout(pad=0.3)
     save(fig, out_dir, "ac_val_curves", figures_dir)
 
 
 # --------------------------------------------------------------------------- panel (b)
+# PI-DeepONet is left out: it fails (error ~0.7-1 throughout) and would stretch the axis over two
+# decades, flattening the differences between the arms that train. The caption says so.
+LONG_EXCLUDE = ("pideeponet",)
+NICE_TICKS = [0.01, 0.02, 0.03, 0.05, 0.1, 0.2, 0.3, 0.5, 1.0]
+
+
 def panel_long_rollout(ev, out_dir, figures_dir):
     dt, horizon = ev["config"]["dt"], ev["config"]["rollout_steps"]
     fig, ax = plt.subplots(figsize=(W_IN, H_IN))
+    ymin, ymax = np.inf, 0.0
     for key, label, colour, dash in ARMS:
+        if key in LONG_EXCLUDE:
+            continue
         runs = [r for r in ev["runs"] if r["arm"] == key and r["best_seed_for_arm"]]
         if not runs:
             print(f"  (no long rollout for {key})")
@@ -159,17 +166,35 @@ def panel_long_rollout(ev, out_dir, figures_dir):
         if bad.any():
             print(f"  WARNING {key} seed {r['seed']}: non-finite samples from step "
                   f"{int(np.argmax(bad > 0))} (max {bad.max()} of {r['n_samples']}); mean over finite ones")
-        ax.plot(t[1:], y[1:], color=colour, lw=1.2, ls=dash, label=label)   # step 0 is the exact IC
-    ax.axvline(dt * horizon, color=MUTED, lw=0.6, ls=":", zorder=0)
+        ax.plot(t[1:], y[1:], color=colour, lw=1.2, ls=dash)             # step 0 is the exact IC
+        ymin, ymax = min(ymin, np.nanmin(y[1:])), max(ymax, np.nanmax(y[1:]))
     ax.set_yscale("log")
+    lo, hi = ymin / 1.25, ymax * 1.25
+    ax.set_ylim(lo, hi)
+    # Less than a decade of range: label round values, not just the one power of ten in view.
+    ax.set_yticks([v for v in NICE_TICKS if lo <= v <= hi])
+    ax.set_yticklabels([f"{v:g}" for v in NICE_TICKS if lo <= v <= hi])
+    ax.yaxis.set_minor_locator(matplotlib.ticker.NullLocator())
+    th = dt * horizon
+    ax.axvline(th, color=TEXT, lw=1.0, ls=(0, (3, 2)), zorder=1)
+    ax.text(th + 0.012, hi / 1.08, "training horizon", fontsize=FS_LEG, color=TEXT, va="top", ha="left")
     ax.set_xlim(0, dt * (len(t) - 1))
     ax.set_xlabel(r"time $t$", fontsize=FS_LAB, labelpad=1.5)
     ax.set_ylabel(r"test rel. $L^2$", fontsize=FS_LAB, labelpad=2)
-    # PI-DeepONet sits near 1 and every other arm below ~0.07, leaving the band between free.
-    legend(ax, loc="center right")
     finish(ax)
     fig.tight_layout(pad=0.3)
     save(fig, out_dir, "ac_long_rollout", figures_dir)
+
+
+# --------------------------------------------------------------------------- shared legend
+def legend_strip(out_dir, figures_dir):
+    """One legend below both panels, authored at the full text width (5.5 in) in a single row."""
+    from matplotlib.lines import Line2D
+    handles = [Line2D([], [], color=c, lw=1.2, ls=d) for _, _, c, d in ARMS]
+    fig = plt.figure(figsize=(5.5, 0.22))
+    fig.legend(handles, [lab for _, lab, _, _ in ARMS], loc="center", ncol=len(ARMS), frameon=False,
+               fontsize=FS_LAB - 1, handlelength=2.6, columnspacing=1.6, borderaxespad=0)
+    save(fig, out_dir, "ac_legend", figures_dir)
 
 
 # --------------------------------------------------------------------------- table rows
@@ -211,6 +236,8 @@ def main():
 
     print("panel (a): validation curves")
     panel_val_curves(args.final, args.out_dir, args.figures_dir, args.window)
+    print("shared legend")
+    legend_strip(args.out_dir, args.figures_dir)
 
     ev_path = args.eval or os.path.join(args.final, "test_eval.json")
     if not os.path.exists(ev_path):
