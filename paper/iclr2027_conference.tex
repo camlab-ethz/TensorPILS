@@ -244,7 +244,9 @@ We summarize our main experimental findings in Table~\ref{tab:summary}.
 
 \begin{table}[t]
   \caption{Summary across the three PDE instances. Errors are relative $L^2$ on the test
-  set at the best-validation checkpoint, mean $\pm$ half-range over three seeds.}
+  set at the best-validation checkpoint, averaged over test samples. Poisson: mean $\pm$
+  half-range over three seeds. Allen--Cahn: space-time relative $L^2$ over the ten training
+  steps, mean $[\min, \max]$ over three seeds ($L_\textup{data}$: one seed).}
   \label{tab:summary}
   \centering
   \footnotesize
@@ -260,10 +262,10 @@ We summarize our main experimental findings in Table~\ref{tab:summary}.
       & PI-DeepONet & yes & AD & $0.191 \pm 0.005$ & --- \\
     \midrule
     \multirow{4}{*}{Allen--Cahn}
-      & $L_\textup{PLS}$ & yes & FEM & \textit{pending} & --- \\
-      & $L_\textup{data}$ & no & --- & \textit{pending} & --- \\
-      & PINO & yes & FD & \textit{pending} & --- \\
-      & PI-DeepONet & yes & AD & \textit{pending} & --- \\
+      & $L_\textup{PLS}$ & yes & FEM & $0.032$ $[0.029, 0.035]$ & --- \\
+      & $L_\textup{data}$ & no & --- & $0.023$ (1 seed) & --- \\
+      & PINO & yes & FD & $0.053$ $[0.042, 0.074]$ & --- \\
+      & PI-DeepONet & yes & AD & $0.900$ $[0.888, 0.922]$ & --- \\
     \midrule
     \multirow{2}{*}{Stokes}
       & $L_\textup{PLS}$ & yes & FEM & \textit{pending} & --- \\
@@ -338,7 +340,7 @@ on the domain $\Omega=[0,1]^2$ and time interval $I=[0,1]$ with $\varepsilon=32$
    =:
    \phi(\mathbf u_{k+1}, \mathbf u_k), 
 \end{equation}
-where $A_{ij}=\int_\Omega \nabla \phi_j\nabla \phi_i\,\mathrm dx$ is the stiffness matrix, and $M=\int_\Omega \phi_j \phi_i\,\mathrm dx$ is the mass matrix. In our experiment, we use a $128\times128$ grid, set $\tau=0.01$ and $\varepsilon=32$. We train $\mathcal G_\theta$ on 10 timesteps between $t=0$ and $t=0.1$, and roll out the prediction until the final time $T=1$. The full details are given in Appendix~\ref{appendix:details_allen_cahn}.
+where $A_{ij}=\int_\Omega \nabla \phi_j\nabla \phi_i\,\mathrm dx$ is the stiffness matrix, and $M=\int_\Omega \phi_j \phi_i\,\mathrm dx$ is the mass matrix. In our experiment, we use a $129\times129$ grid, set $\tau=0.01$ and $\varepsilon=32$. We train $\mathcal G_\theta$ on 10 timesteps between $t=0$ and $t=0.1$, and roll out the prediction until the final time $T=1$. The full details are given in Appendix~\ref{appendix:details_allen_cahn}.
 
 
 
@@ -367,9 +369,7 @@ For a detailed derivation and the additional baselines PI-DeepONet and PINO, see
   % experiments/allen_cahn/ac_paper/plot_paper.py, so do not rescale them.
   \includegraphics[width=0.49\linewidth]{figures/ac_val_curves.pdf}
   \hfill
-  % Right panel pending: ac_long_rollout.pdf, from experiments/allen_cahn/ac_paper/evaluate_test.py
-  % on Euler. Replace the box below with \includegraphics[width=0.49\linewidth]{figures/ac_long_rollout.pdf}.
-  \fbox{\parbox[b][2.15in][c]{0.46\linewidth}{\centering\small long roll-out to $T=1$\\(pending)}}
+  \includegraphics[width=0.49\linewidth]{figures/ac_long_rollout.pdf}
   \caption{Allen--Cahn. \textbf{Left:} validation space-time relative $L^2$ (pooled over the validation set) vs.\ epoch; mean over three seeds with min--max band, smoothed by a centered 15-epoch moving average. $L_\textup{data}$ currently has one seed. \textbf{Right:} test relative $L^2$ per time step of a free roll-out to $T=1$, mean over test samples of the per-sample error, for the best seed of each loss (selected on validation). The dotted line marks the training horizon $t=0.1$.}
   \label{fig:ac-results}
 \end{figure}
