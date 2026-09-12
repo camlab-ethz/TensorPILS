@@ -147,6 +147,12 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", default="output/allen_cahn/ac_paper/final")
     ap.add_argument("--out", default=None, help="default: <root>/test_eval.json")
+    ap.add_argument("--arms", nargs="+", default=None, choices=[k for k, _, _ in ARMS],
+                    help="evaluate only these arms (default: all). The reference solve dominates "
+                         "the cost, so re-evaluating one arm after a re-run is much cheaper.")
+    ap.add_argument("--merge", action="store_true",
+                    help="merge into an existing --out file: entries of the evaluated arms are "
+                         "replaced, all others are carried over unchanged.")
     ap.add_argument("--grid_resolution", type=int, default=128,
                     help="nodes per side; not recorded in the AC results JSON (ac_paper uses 128)")
     ap.add_argument("--long_steps", type=int, default=100,
@@ -161,6 +167,10 @@ def main():
     out_path = args.out or os.path.join(args.root, "test_eval.json")
 
     runs = discover(args.root)
+    if args.arms:
+        runs = [r for r in runs if r["arm"] in args.arms]
+        print(f"evaluating arms {sorted(set(r['arm'] for r in runs))} only "
+              f"({len(runs)} runs); best seed is still chosen within each arm")
     if not runs:
         raise SystemExit(f"no results with checkpoints under {args.root}")
     r0 = runs[0]["rec"]
@@ -238,6 +248,16 @@ def main():
             del model
         del ref
 
+    if args.merge and os.path.exists(out_path):
+        with open(out_path) as fh:
+            old = json.load(fh)
+        done = {r["arm"] for r in out["runs"]}
+        kept = [r for r in old.get("runs", []) if r["arm"] not in done]
+        print(f"merging into {out_path}: {len(out['runs'])} new runs, {len(kept)} carried over "
+              f"({sorted({r['arm'] for r in kept})})")
+        out["runs"] = kept + out["runs"]
+        out["config"] = {**old.get("config", {}), **out["config"]}
+    out["runs"].sort(key=lambda r: ([k for k, _, _ in ARMS].index(r["arm"]), r["seed"]))
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     with open(out_path, "w") as fh:
         json.dump(out, fh)
