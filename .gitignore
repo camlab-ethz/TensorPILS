@@ -71,5 +71,6 @@ uv.lock
 
 # Compiled documents. Figure PDFs (e.g. paper/figures/*.pdf) are LaTeX *inputs*
 # and stay tracked, so these are listed by name rather than globbing *.pdf.
-paper/iclr2027_conference.pdf
+paper/main.pdf
+paper/old_versions/*.pdf
 notes/paper_story/paper_story_experiments.pdf
