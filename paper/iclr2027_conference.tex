@@ -246,7 +246,7 @@ We summarize our main experimental findings in Table~\ref{tab:summary}.
   \caption{Summary across the three PDE instances. Errors are relative $L^2$ on the test
   set at the best-validation checkpoint, averaged over test samples. Poisson: mean $\pm$
   half-range over three seeds. Allen--Cahn: space-time relative $L^2$ over the ten training
-  steps, mean $[\min, \max]$ over three seeds ($L_\textup{data}$: one seed).}
+  steps, mean $[\min, \max]$ over three seeds. Time per epoch is the median over the final runs on one GPU model, an NVIDIA RTX 2080 Ti for Poisson and an RTX 4090 for Allen--Cahn; the Allen--Cahn epochs are longer because every sample is a ten-step roll-out on a $129^2$ grid.}
   \label{tab:summary}
   \centering
   \footnotesize
@@ -256,16 +256,16 @@ We summarize our main experimental findings in Table~\ref{tab:summary}.
     \midrule
     \midrule
     \multirow{4}{*}{Poisson}
-      & $L_\textup{PLS}$ & yes & FEM & $0.051 \pm 0.008$ & --- \\
-      & $L_\textup{data}$ & no & --- & $0.047 \pm 0.008$ & --- \\
-      & PINO & yes & FD & $0.331 \pm 0.011$ & --- \\
-      & PI-DeepONet & yes & AD & $0.191 \pm 0.005$ & --- \\
+      & $L_\textup{PLS}$ & yes & FEM & $0.051 \pm 0.008$ & $2.4$\,s \\
+      & $L_\textup{data}$ & no & --- & $0.047 \pm 0.008$ & $1.9$\,s \\
+      & PINO & yes & FD & $0.331 \pm 0.011$ & $1.9$\,s \\
+      & PI-DeepONet & yes & AD & $0.191 \pm 0.005$ & $7.1$\,s \\
     \midrule
     \multirow{4}{*}{Allen--Cahn}
-      & $L_\textup{PLS}$ & yes & FEM & $0.032$ $[0.029, 0.035]$ & --- \\
-      & $L_\textup{data}$ & no & --- & $0.023$ (1 seed) & --- \\
-      & PINO & yes & FD & $0.053$ $[0.042, 0.074]$ & --- \\
-      & PI-DeepONet & yes & AD & $0.900$ $[0.888, 0.922]$ & --- \\
+      & $L_\textup{PLS}$ & yes & FEM & $0.032$ $[0.029, 0.035]$ & $46$\,s \\
+      & $L_\textup{data}$ & no & --- & $0.020$ $[0.019, 0.023]$ & $40$\,s \\
+      & PINO & yes & FD & $0.053$ $[0.042, 0.074]$ & $40$\,s \\
+      & PI-DeepONet & yes & AD & $0.900$ $[0.888, 0.922]$ & $8$\,s \\
     \midrule
     \multirow{2}{*}{Stokes}
       & $L_\textup{PLS}$ & yes & FEM & \textit{pending} & --- \\
@@ -468,6 +468,56 @@ acknowledgments, including those to funding agencies, go at the end of the paper
 \bibliographystyle{iclr2027_conference}
 
 \appendix
+
+\section{Interpolated Neural Operators}
+In this section, we explain why the form
+\begin{equation*}
+   \mathcal G_\theta(\rho) 
+   =
+   \sum_{i=1}^n\mathbf u(\theta, \rho)_i\,\phi_i
+\end{equation*}
+of \eqref{eq:neural_operator_interpolated_form} is not an essential restriction on the neural operator architecture. This simple observation is crucial for combining finite element tools with the flexibility of neural operators. Let us denote a neural operator parametrized by $\theta\in\Theta\cong \mathbb R^D$ by
+\begin{equation*}
+   \mathcal G_\theta:\mathcal P \to \mathcal U, \quad \rho \mapsto u = \mathcal G_\theta(\rho).
+\end{equation*}
+On this level $\mathcal G_\theta$ is abstract and maps functions to functions. For a given finite-dimensional subspace $\mathcal U_h\subset \mathcal U$ spanned by the basis $\phi_1,\dots,\phi_n$ and an \emph{interpolation operator}
+\begin{equation*}
+   \mathcal I_h : \mathcal U \to \mathcal U_h, \quad u\mapsto \mathcal I_h(u)
+\end{equation*}
+we can write $\mathcal I_h(u)$ in terms of the basis as
+\begin{equation*}
+   \mathcal I_h(u)
+   =
+   \sum_{i=1}^n \mathbf u_i\phi_i.
+\end{equation*}
+To obtain the interpolated neural operator form, we compose $\mathcal G_\theta$ with $\mathcal I_h$
+\begin{equation}\label{eq:appendix_interpolated_form}
+   [\mathcal I_h \circ \mathcal G_\theta](\rho)
+   =
+   \sum_{i=1}^n \mathbf u(\theta, \rho)_i \phi_i.
+\end{equation}
+Let $\mathcal G:\mathcal P\to\mathcal U$ denote the operator we wish to approximate and write $u = \mathcal G(\rho)$ for the exact solution. Assume that $\mathcal I_h$ is linear and stable, i.e., $\|\mathcal I_h(u)\|\leq C_{\mathcal I}\|u\|$ for all $u\in\mathcal U$. Adding and subtracting $\mathcal I_h(u)$ then gives, for every $\rho\in\mathcal P$,
+\begin{align}\label{eq:appendix_interpolation_estimate}
+   \begin{split}
+      \big\| \mathcal G(\rho) - [\mathcal I_h\circ\mathcal G_\theta](\rho) \big\|
+      &\leq
+      \big\| u - \mathcal I_h(u) \big\|
+      +
+      \big\| \mathcal I_h\big(u - \mathcal G_\theta(\rho)\big) \big\|
+      \\
+      &\leq
+      \big\| u - \mathcal I_h(u) \big\|
+      +
+      C_{\mathcal I}\,\big\| \mathcal G(\rho) - \mathcal G_\theta(\rho) \big\|.
+   \end{split}
+\end{align}
+The interpolated operator is thus as accurate as the neural operator itself, up to the stability constant $C_{\mathcal I}$ and the interpolation error of the exact solution.
+
+\paragraph{Example: the FNO} The FNO returns values on a uniform grid and for the space $\mathcal U_h = Q_1^h$ of our experiments the basis functions satisfy $\phi_i(x_j) = \delta_{ij}$, so the coefficients of the interpolant are precisely the point values, $\mathbf u(\theta,\rho)_i = [\mathcal G_\theta(\rho)](x_i)$. If in addition the FNO grid coincides with the nodes $x_1,\dots,x_n$, the interpolation is the identity in coordinates: $\mathcal I_h$ attaches the basis functions to the entries of the network's output array. For homogeneous Dirichlet boundary values, the basis spans the interior nodes only and $\mathcal I_h$ discards the values on $\partial\Omega$.
+
+
+Interpolating a neural operator can be viewed as part of its architectural design, in which $\mathcal I_h$ acts as a problem-adapted, non-trainable output layer. By \eqref{eq:appendix_interpolation_estimate}, however, its accuracy cannot fall below the interpolation error $\| u - \mathcal I_h(u) \|$.
+
 \section{Details of the Poisson Equation Experiment}\label{appendix:details_poisson}
 
 \paragraph{Operator} We consider the Poisson equation with homogeneous Dirichlet boundary conditions on the unit square $\Omega = [0,1]^2$,
@@ -512,10 +562,17 @@ which we assemble with an exact quadrature rule. For the analytical sources $f$ 
    \mathbf f_i = \sum_{j=1}^n M_{ij}\,f(x_j).
 \end{equation}
 
-\paragraph{Neural Operator} We use a FNO as implemented in the \texttt{neuraloperator} package []. The hyperparameters are collected in Table~\ref{tab:fno}. Because the FNO grid coincides with the finite element nodes, the interpolation into $\mathcal U_h$ of \eqref{eq:neural_operator_interpolated_form} is the identity. Zero boundary conditions are hard-enforced by projecting to zero on $\partial\Omega$, so the model output lies in $\mathcal U_h$ exactly.
+\paragraph{Neural Operators} For all losses except PI-DeepONet we use a FNO as implemented in the \texttt{neuraloperator} package []; its hyperparameters are collected in Table~\ref{tab:fno}. Because the FNO grid coincides with the finite element nodes, the interpolation into $\mathcal U_h$ of \eqref{eq:neural_operator_interpolated_form} is the identity. Zero boundary conditions are hard-enforced by projecting to zero on $\partial\Omega$, so the model output lies in $\mathcal U_h$ exactly.
+
+The PI-DeepONet baseline requires a DeepONet [], which we implement in its standard unstacked form
+\begin{equation}\label{eq:appendix_deeponet}
+   \mathcal G_\theta(f)(z) = m(z)\Big( \frac{1}{\sqrt p}\sum_{k=1}^{p} b_k\big(f/f_s\big)\, t_k\big(\gamma(z)\big) + b_0 \Big),
+   \qquad m(z) = \sin(\pi z_1)\sin(\pi z_2),
+\end{equation}
+for a query point $z = (z_1, z_2)\in\Omega$. The branch network $b = (b_1,\dots,b_p)$ is an MLP acting on the source sampled at the $n_x^2$ grid nodes and normalized by $f_s$, the mean of $|f|$ over the training sources. The trunk network $t = (t_1,\dots,t_p)$ is an MLP acting on the random Fourier features $\gamma(z) = [\sin(2\pi W z), \cos(2\pi W z)]$, where $W$ is a fixed matrix with independent Gaussian entries; they counteract the spectral bias of the MLP on the multi-frequency data. The factor $p^{-1/2}$ makes the output magnitude at initialization independent of $p$, and $b_0$ is a trainable scalar. Multiplication with $m$ imposes the zero boundary condition exactly. The hyperparameters are collected in Table~\ref{tab:deeponet}.
 
 \begin{table}[htb]
-   \caption{FNO hyperparameters used for all Poisson experiments.}
+   \caption{FNO hyperparameters used for all Poisson experiments except PI-DeepONet.}
    \label{tab:fno}
    \begin{center}
    \begin{tabular}{ll}
@@ -527,6 +584,23 @@ which we assemble with an exact quadrature rule. For the analytical sources $f$ 
       Positional embedding       & grid coordinates, appended as channels \\
       Input / output channels    & $1$ / $1$ \\
       Trainable parameters       & $3.01\times10^{6}$ \\
+   \end{tabular}
+   \end{center}
+\end{table}
+
+\begin{table}[htb]
+   \caption{DeepONet hyperparameters of the PI-DeepONet baseline in the Poisson experiments; see \eqref{eq:appendix_deeponet}.}
+   \label{tab:deeponet}
+   \begin{center}
+   \begin{tabular}{ll}
+      \multicolumn{1}{c}{\bf Component} & \multicolumn{1}{c}{\bf Value} \\ \hline \\
+      Basis functions $p$        & $128$ \\
+      Branch network $b$         & MLP, 4 linear layers, hidden width $256$, $\tanh$ \\
+      Branch input               & $f/f_s$ at the $65\times65$ grid nodes ($4225$ sensors) \\
+      Trunk network $t$          & MLP, 4 linear layers, hidden width $256$, $\tanh$ \\
+      Trunk input $\gamma(z)$    & $64$ random frequencies ($128$ features), $W_{ij}\sim\mathcal N(0, 2^2)$, fixed \\
+      Boundary condition         & output multiplied by $\sin(\pi z_1)\sin(\pi z_2)$ \\
+      Trainable parameters       & $1.44\times10^{6}$ \\
    \end{tabular}
    \end{center}
 \end{table}
@@ -576,6 +650,18 @@ which we assemble with an exact quadrature rule. For the analytical sources $f$ 
    \end{tabular}
    \end{center}
 \end{table}
+
+\paragraph{Loss Functions} Denote by $\mathbf u(\theta, f)\in\mathbb R^n$ the values of the network output at the interior nodes, i.e., the coefficients of $\mathcal G_\theta(f)$ in the basis $\phi_1,\dots,\phi_n$, see \eqref{eq:neural_operator_interpolated_form}. For a batch of sources $f^{(1)},\dots,f^{(N_b)}$ with discretized forcings $\mathbf f^{(b)}$ given by \eqref{eq:appendix_consistent_rhs}, the data-driven loss, the least-squares loss of \eqref{eq:LS_loss_in_theta}, and its preconditioned variant are
+\begin{align}\label{eq:appendix_poisson_losses}
+   \begin{split}
+      L_{\textup{data}}(\theta) &= \frac{1}{2N_b}\sum_{b=1}^{N_b} \big\| \mathbf u(\theta, f^{(b)}) - \mathbf u_\star^{(b)} \big\|_2^2,
+      \\
+      L_{\textup{LS}}(\theta) &= \frac{1}{2N_b}\sum_{b=1}^{N_b} \big\| A\,\mathbf u(\theta, f^{(b)}) - \mathbf f^{(b)} \big\|_2^2,
+      \\
+      L_{\textup{PLS}}(\theta) &= \frac{1}{2N_b}\sum_{b=1}^{N_b} \big\| P\big[A\,\mathbf u(\theta, f^{(b)}) - \mathbf f^{(b)}\big] \big\|_2^2,
+   \end{split}
+\end{align}
+where $\mathbf u_\star^{(b)}\in\mathbb R^n$ is the finite element solution, $A\mathbf u_\star^{(b)} = \mathbf f^{(b)}$, and $P$ is the single V-cycle of Algorithm~\ref{alg:vcycle}, i.e., the approximate inverse setting of Section~\ref{sec:approximate_inverse_preconditioner} with $B = I$. The data-driven loss requires the solutions $\mathbf u_\star^{(b)}$ as labels, which in general have to be produced by a numerical simulation, whereas $L_{\textup{LS}}$ and $L_{\textup{PLS}}$ require only the sources and the assembled matrices, and no solution labels.
 
 \section{Details of the Allen--Cahn Experiment}\label{appendix:details_allen_cahn}
 
