@@ -28,9 +28,10 @@ exactly the per-sample derivatives.
 import torch
 import torch.nn as nn
 
-from .pino import rel_lp
+from .pino import rel_lp, stokes_reduce
 
-__all__ = ["autodiff_laplacian", "PIDeepONetPoissonLoss", "PIDeepONetACLoss"]
+__all__ = ["autodiff_laplacian", "autodiff_stokes", "PIDeepONetPoissonLoss",
+           "PIDeepONetACLoss", "PIDeepONetStokesLoss"]
 
 
 def autodiff_laplacian(model, f_grid: torch.Tensor, coords: torch.Tensor):
@@ -56,16 +57,34 @@ def autodiff_laplacian(model, f_grid: torch.Tensor, coords: torch.Tensor):
 
 
 class PIDeepONetPoissonLoss(nn.Module):
-    r"""Strong-form residual for :math:`-\Delta u = f` at collocation points.
+    r"""Strong-form residual for :math:`-\Delta u = f` at collocation points, plus an
+    optional soft boundary penalty.
 
-    ``forward(model, f_grid, coords, f_at_coords)``. ``reduction`` matches
+    ``forward(model, f_grid, coords, f_at_coords, bc_coords=None)``. ``reduction`` matches
     :class:`~tensorpils.baselines.pino.PINOPoissonLoss` so the two baselines are reduced
     identically and only the differentiation differs.
 
-    ``lambda_bc`` adds the soft boundary penalty of the original PI-DeepONet. It is 0 by
-    default because the model is built with ``mollify=True`` (hard BC), matching PINO's
-    mollifier — that removes one tuned hyperparameter from the baseline rather than adding
-    one, and can only help it.
+    ``lambda_bc`` weights the soft boundary penalty of the original PI-DeepONet. It is 0 when
+    the model imposes the BC hard through the mollifier (``--pideeponet_bc mollifier``), which
+    is the reference's choice. Under ``--pideeponet_bc zero`` — the counterpart of
+    ``--pino_bc zero``, boundary nodes of the grid output set to zero as our own arms do — it
+    is the *only* thing that couples the residual to the boundary condition: the autodiff
+    Laplacian at interior points is blind to the boundary values and to any mask on them, so
+    without the penalty the objective is invariant under adding harmonic functions. (PINO's
+    finite-difference stencil sees the zeroed boundary ring; a pointwise derivative does not.)
+
+    The penalty is expressed in the residual's own units, so ``lambda_bc = 1`` is a meaningful
+    default rather than a tuning target:
+
+    * ``rel`` — ``mean_b RMS(u_b|dOmega) / RMS(u_b|Omega)``, dimensionless like the residual's
+      ``||Lu - f|| / ||f||``. The denominator is detached, so the term is a per-sample
+      adaptively weighted boundary RMS: it drives the boundary values to zero relative to the
+      solution's own scale and gives no incentive to inflate the interior. The normalisation
+      is not cosmetic: at ``K=10`` the solutions have RMS ``~1.6e-3`` (``f`` ~0.8) while the
+      relative residual is ``O(1)``, so a plain mean-square boundary penalty at unit weight
+      would be five to six orders of magnitude too weak to matter.
+    * ``mse`` — the mean square of the boundary values, the original PI-DeepONet form, paired
+      with the plain mean-square residual.
     """
 
     def __init__(self, reduction: str = "rel", p: int = 2, lambda_bc: float = 0.0):
@@ -76,15 +95,24 @@ class PIDeepONetPoissonLoss(nn.Module):
         self.p = p
         self.lambda_bc = lambda_bc
 
+    def boundary_term(self, model, f_grid, bc_coords, u_int: torch.Tensor) -> torch.Tensor:
+        """The penalty alone (unweighted); ``u_int`` is ``[B, Q]`` at the interior collocation
+        points and only sets the scale of the ``rel`` form."""
+        u_b = model.forward_at(f_grid, bc_coords)                                # [B, Qb]
+        if self.reduction == "mse":
+            return (u_b ** 2).mean()
+        rms_b = (u_b.pow(2).mean(dim=-1) + 1e-24).sqrt()                         # [B]
+        rms_int = (u_int.detach().pow(2).mean(dim=-1) + 1e-24).sqrt()            # [B]
+        return (rms_b / rms_int).mean()
+
     def forward(self, model, f_grid, coords, f_at_coords,
                 bc_coords=None) -> torch.Tensor:
-        _, lap = autodiff_laplacian(model, f_grid, coords)
+        u_int, lap = autodiff_laplacian(model, f_grid, coords)
         lhs = -lap
         loss = (rel_lp(lhs, f_at_coords, p=self.p) if self.reduction == "rel"
                 else ((lhs - f_at_coords) ** 2).mean())
         if self.lambda_bc > 0.0 and bc_coords is not None:
-            u_b = model.forward_at(f_grid, bc_coords)
-            loss = loss + self.lambda_bc * (u_b ** 2).mean()
+            loss = loss + self.lambda_bc * self.boundary_term(model, f_grid, bc_coords, u_int)
         return loss
 
 
@@ -139,3 +167,88 @@ class PIDeepONetACLoss(nn.Module):
                 r = r[:, self.interior_mask]
             total = total + (self.discount ** k) * (r ** 2).mean()
         return total
+
+
+# ------------------------------------------------------------------------------- Stokes
+
+def autodiff_stokes(model, f_grid: torch.Tensor, coords: torch.Tensor, p_scale: float = 1.0):
+    r"""Evaluate a 3-channel model at ``coords`` and return every derivative the Stokes
+    residual needs, all ``[B, Q, ...]``:
+
+    ``u`` ``[B, Q, 2]`` (raw velocity), ``p`` ``[B, Q]`` (pressure, already times
+    ``p_scale``), ``lap_u`` ``[B, Q, 2]``, ``grad_p`` ``[B, Q, 2]`` and ``div_u`` ``[B, Q]``.
+
+    Same contract as :func:`autodiff_laplacian`: ``coords`` is the per-sample ``[B, Q, 2]``
+    form with ``requires_grad=True``, and ``create_graph`` stays on so the residual remains
+    differentiable in the parameters. Three first-order and four second-order ``grad`` calls.
+    """
+    if coords.dim() != 3:
+        raise ValueError(f"coords must be [B, Q, 2] for per-sample derivatives, got {tuple(coords.shape)}")
+    if not coords.requires_grad:
+        raise ValueError("coords must have requires_grad=True")
+    out = model.forward_at(f_grid, coords)                                   # [B, Q, 3]
+    if out.dim() != 3 or out.shape[-1] != 3:
+        raise ValueError(f"a Stokes model must emit 3 channels at each query, got {tuple(out.shape)}")
+    ux, uy, p = out[..., 0], out[..., 1], out[..., 2] * p_scale
+    gx, = torch.autograd.grad(ux.sum(), coords, create_graph=True)           # [B, Q, 2]
+    gy, = torch.autograd.grad(uy.sum(), coords, create_graph=True)
+    gp, = torch.autograd.grad(p.sum(), coords, create_graph=True)
+    lap = []
+    for g in (gx, gy):
+        acc = torch.zeros_like(ux)
+        for d in range(2):
+            second, = torch.autograd.grad(g[..., d].sum(), coords, create_graph=True)
+            acc = acc + second[..., d]
+        lap.append(acc)
+    return dict(u=torch.stack([ux, uy], dim=-1), p=p, lap_u=torch.stack(lap, dim=-1),
+                grad_p=gp, div_u=gx[..., 0] + gy[..., 1])
+
+
+class PIDeepONetStokesLoss(nn.Module):
+    r"""Strong-form Stokes residual at collocation points, differentiated by autodiff.
+
+    The same residual and the same reduction as :class:`~tensorpils.baselines.pino.PINOStokesLoss`
+    (see :func:`~tensorpils.baselines.pino.stokes_reduce`), so the two baselines differ only
+    in architecture and differentiation. ``forward(model, f_grid, coords, f_at_coords,
+    bc_coords=None)`` with ``f_at_coords`` ``[B, Q, 2]``; ``f_grid`` is whatever the model's
+    branch expects (the trainer hands it ``f / f_scale``, as :meth:`StokesTrainer._predict`
+    does for every arm), and ``p_scale`` puts the third channel in physical units.
+
+    ``lambda_bc`` is the velocity boundary penalty of ``--pideeponet_bc zero`` — the same
+    relative form as the Poisson one (boundary RMS over the detached interior RMS, both
+    components stacked) for the same reason: the autodiff Laplacian cannot see a boundary
+    mask. The pressure has no boundary condition, only a gauge, which the trainer fixes by
+    projection at evaluation and which ``∇p`` never sees.
+    """
+
+    def __init__(self, mu: float, reduction: str = "rel", p: int = 2, div_weight: float = 1.0,
+                 lambda_bc: float = 0.0, p_scale: float = 1.0):
+        super().__init__()
+        if reduction not in ("rel", "mse"):
+            raise ValueError(f"reduction must be 'rel' or 'mse', got {reduction!r}")
+        self.mu = float(mu)
+        self.reduction = reduction
+        self.p = p
+        self.div_weight = float(div_weight)
+        self.lambda_bc = float(lambda_bc)
+        self.p_scale = float(p_scale)
+
+    def boundary_term(self, model, f_grid, bc_coords, u_int: torch.Tensor) -> torch.Tensor:
+        """Unweighted velocity boundary penalty; ``u_int`` ``[B, Q, 2]`` sets the scale."""
+        out_b = model.forward_at(f_grid, bc_coords)                                  # [B, Qb, 3]
+        u_b = out_b[..., :2]
+        if self.reduction == "mse":
+            return (u_b ** 2).mean()
+        rms_b = (u_b.pow(2).mean(dim=(-2, -1)) + 1e-24).sqrt()                       # [B]
+        rms_int = (u_int.detach().pow(2).mean(dim=(-2, -1)) + 1e-24).sqrt()
+        return (rms_b / rms_int).mean()
+
+    def forward(self, model, f_grid, coords, f_at_coords, bc_coords=None) -> torch.Tensor:
+        d = autodiff_stokes(model, f_grid, coords, p_scale=self.p_scale)
+        r_mom = -self.mu * d["lap_u"] + d["grad_p"] - f_at_coords                    # [B, Q, 2]
+        loss = stokes_reduce(r_mom, d["div_u"], f_at_coords, reduction=self.reduction,
+                             p=self.p, div_weight=self.div_weight)
+        if self.lambda_bc > 0.0 and bc_coords is not None:
+            loss = loss + self.lambda_bc * self.boundary_term(model, f_grid, bc_coords, d["u"])
+        return loss
+

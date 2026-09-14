@@ -15,6 +15,7 @@ self-contained experiment: a `README.md` (description, facts, run & plot command
 | [`generalization/`](poisson/generalization/README.md) | Does that loss geometry `t` affect out-of-distribution generalization? Organized into per-regime **scenarios** (`pls_k4/`: K=4→6,8; `pls_k16/`: K=16→20; Deep Ritz variants planned). |
 | [`loss_comparison/`](poisson/loss_comparison/README.md) | Supervised true-L2 (`data_l2`, mass-weighted) vs MSE (`data`) vs label-free Deep Ritz — which training objective minimizes validation relative-L2? |
 | [`data_scaling/`](poisson/data_scaling/README.md) | At a fixed optimization budget, how does test error scale with dataset size — and does the infinite-data (streaming) limit, which eliminates the estimation error exactly, set the floor? |
+| [`poisson_paper/poisson_benchmark/`](poisson/poisson_paper/poisson_benchmark/README.md) | **Table 1, Poisson column.** Five arms (supervised, bare LS, LS + multigrid, PINO, PI-DeepONet) at K=10, 65², 1024/128/256, 500 epochs; per-arm lr tuned on validation at the full budget, three seeds. `pideeponet_zero/` is the PI-DeepONet arm with the zero-BC treatment. |
 
 ### `allen_cahn/`
 
@@ -43,6 +44,7 @@ scored separately, each in its own FE-`L²` norm.
 | [`h_refinement/`](stokes/h_refinement/README.md) | The learning side of the same claim: 3 losses × 3 velocity grids (`33/65/129`) at a fixed budget — does the bare-residual gap widen under refinement? The `65²` column reproduces the paper's headline table. |
 | [`blend_sweep/`](stokes/blend_sweep/README.md) | Sweep `P_t=(1−t)αI+tP` from the bare loss (`t=0`) to the block preconditioner (`t=1`) and collapse the final error onto the *measured* `κ(KP_tK)` — the Stokes analogue of `poisson/sweep_blend/`. |
 | [`monolithic/`](stokes/monolithic/README.md) | The note's monolithic multigrid with a symmetric Uzawa smoother: a genuine `P ≈ K⁻¹`, `O(1)` conditioning instead of `O(h⁻²)`. Also the sharpest result here — `O(1)` conditioning alone makes training *worse*, and fixing the loss **metric** is what turns it into the best label-free arm (19.34 % → 4.33 % velocity). |
+| [`stokes_paper/stokes_benchmark/`](stokes/stokes_paper/stokes_benchmark/README.md) | **Table 1, Stokes column.** `pls` (block P), `data`, PINO and PI-DeepONet (zero-BC) at the Poisson protocol (K=10, 65², 1024/128/256, 500 epochs, per-arm tuning on validation, three seeds); velocity and pressure reported separately. |
 
 ### `baselines/`
 

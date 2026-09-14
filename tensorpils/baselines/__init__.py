@@ -11,7 +11,8 @@ training rather than only against our own ``t=0`` negative control. Two baseline
   **autodiff** through the trunk's coordinate input.
 
 Both are scored by the repo's usual FEM relative-``L²`` metric with the eval-time boundary
-projection, so their numbers drop straight into the existing tables.
+projection, so their numbers drop straight into the existing tables. Each exists for Poisson,
+Allen–Cahn and (strong-form momentum + continuity on the velocity grid) Stokes.
 
 Nothing in ``losses.py`` / ``trainer.py`` / ``physics.py`` is modified: the trainers here
 subclass the production ones and the models are drop-in replacements for
@@ -19,20 +20,21 @@ subclass the production ones and the models are drop-in replacements for
 """
 
 from .pino import (MollifiedModel, ZeroBoundaryModel, PINOPoissonLoss, PINOACLoss,
-                   mollifier_grid, boundary_mask_grid, rel_lp)
+                   PINOStokesLoss, mollifier_grid, boundary_mask_grid, rel_lp, stokes_reduce)
 from .deeponet import DeepONetModel
-from .pi_deeponet import (PIDeepONetPoissonLoss, PIDeepONetACLoss,
-                          autodiff_laplacian)
-from .trainers import (PINOPoissonTrainer, PINOACTrainer,
-                       PIDeepONetPoissonTrainer, PIDeepONetACTrainer,
-                       DeepONetPoissonTrainer, DeepONetACTrainer)
+from .pi_deeponet import (PIDeepONetPoissonLoss, PIDeepONetACLoss, PIDeepONetStokesLoss,
+                          autodiff_laplacian, autodiff_stokes)
+from .trainers import (PINOPoissonTrainer, PINOACTrainer, PINOStokesTrainer,
+                       PIDeepONetPoissonTrainer, PIDeepONetACTrainer, PIDeepONetStokesTrainer,
+                       DeepONetPoissonTrainer, DeepONetACTrainer, DeepONetStokesTrainer)
 
 __all__ = [
-    "MollifiedModel", "ZeroBoundaryModel", "PINOPoissonLoss", "PINOACLoss",
-    "mollifier_grid", "boundary_mask_grid", "rel_lp",
+    "MollifiedModel", "ZeroBoundaryModel", "PINOPoissonLoss", "PINOACLoss", "PINOStokesLoss",
+    "mollifier_grid", "boundary_mask_grid", "rel_lp", "stokes_reduce",
     "DeepONetModel",
-    "PIDeepONetPoissonLoss", "PIDeepONetACLoss", "autodiff_laplacian",
-    "PINOPoissonTrainer", "PINOACTrainer",
-    "PIDeepONetPoissonTrainer", "PIDeepONetACTrainer",
-    "DeepONetPoissonTrainer", "DeepONetACTrainer",
+    "PIDeepONetPoissonLoss", "PIDeepONetACLoss", "PIDeepONetStokesLoss",
+    "autodiff_laplacian", "autodiff_stokes",
+    "PINOPoissonTrainer", "PINOACTrainer", "PINOStokesTrainer",
+    "PIDeepONetPoissonTrainer", "PIDeepONetACTrainer", "PIDeepONetStokesTrainer",
+    "DeepONetPoissonTrainer", "DeepONetACTrainer", "DeepONetStokesTrainer",
 ]

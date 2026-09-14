@@ -74,6 +74,20 @@ Logs land in `logs/pp_lr_<jobid>_<task>.out` and `logs/pp_final_<jobid>_<task>.o
   hierarchy is `65 → 33 → 17 → 9`, exactly dyadic and nested.
 - **PINO zeroes its boundary nodes** (`--pino_bc zero`, the default), the same operation
   `losses.py` applies to our own arms — so it differs from the `ls` arm only in the residual.
-  **PI-DeepONet still carries the `sin(πx)sin(πy)` mollifier**, a hard BC that
-  the `galerkin`/`pls` arms do not get. This is the reference implementations' own choice and it
-  helps them; removing it would be strawmanning. It is worth stating in the paper.
+  **The table's PI-DeepONet arm (`--loss pideeponet` with defaults) still carries the
+  `sin(πx)sin(πy)` mollifier**, a hard BC that the `galerkin`/`pls` arms do not get. This is the
+  reference implementation's own choice and it helps it; it is worth stating in the paper.
+- **`--pideeponet_bc zero` is the PI-DeepONet counterpart of `--pino_bc zero`**: the grid
+  output's boundary nodes are zeroed as our arms do, and — because the autodiff Laplacian at
+  interior points cannot see the boundary values or any mask on them (unlike PINO's FD stencil,
+  which touches the zeroed ring) — the residual gets the original PI-DeepONet soft boundary
+  penalty, weighted by `--pi_lambda_bc`. The penalty is expressed in the residual's own units
+  (boundary RMS relative to the solution's own RMS, denominator detached; see
+  `PIDeepONetPoissonLoss`), so `lambda=1` is a meaningful default; at `K=10` the solutions have
+  RMS `~1.6e-3` and a plain MSE penalty at unit weight would be five to six orders of magnitude
+  too weak.
+  Without the penalty the objective is invariant under adding harmonic functions, i.e. it has no
+  BC at all. The study that produced the table's PI-DeepONet number with this treatment lives in
+  [`pideeponet_zero/`](pideeponet_zero/README.md) (its own two-stage sbatch pair, a compute-node
+  driver, and `summarize.py`); it writes to `output/.../poisson_benchmark/pideeponet_zero/`. Runs
+  are tagged `deeponet_pi-rel-zbc<lambda>_…` so they never collide with the mollified arm's files.

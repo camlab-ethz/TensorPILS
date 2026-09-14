@@ -30,7 +30,7 @@ own $t=0$ negative control. Code lives in \texttt{tensorpils/baselines/}; nothin
 \midrule
 Architecture      & FNO (ours, unchanged)          & DeepONet (new, unstacked) \\
 Derivatives       & 2nd-order central differences  & autodiff through the trunk \\
-Dirichlet BC      & hard, boundary nodes zeroed & hard, $\sin(\pi x)\sin(\pi y)$ \\
+Dirichlet BC      & hard, boundary nodes zeroed & hard, $\sin(\pi x)\sin(\pi y)$; or zeroed + soft penalty (\texttt{--pideeponet\_bc zero}) \\
 Residual form     & strong                         & strong \\
 Evaluated at      & grid nodes, interior only      & collocation points \\
 Reduction         & relative $L^2$ ratio           & relative $L^2$ ratio \\
@@ -66,16 +66,51 @@ the mollified version}; that is the price of making the comparison attributable.
 Masking is bit-exact, so unlike the mollifier it needs no boundary snap: $\sin(\pi\cdot 1.0)$
 evaluates to $8.7\times10^{-8}$ in \texttt{float32}, not $0$.
 
-\paragraph{PI-DeepONet --- the mollifier, for now.} Unchanged from the reference:
-$\sin(\pi x)\sin(\pi y)$, evaluated at the \emph{query} coordinates inside \texttt{forward\_at},
-so the autodiff Laplacian differentiates the mollified field as it must. The same objection
-applies here, and if the mollifier is reinstated it should be reinstated uniformly across all
-methods rather than for one arm.
+\paragraph{PI-DeepONet --- the mollifier (default), or zeroing plus a penalty.} By default
+unchanged from the reference: $\sin(\pi x)\sin(\pi y)$, evaluated at the \emph{query}
+coordinates inside \texttt{forward\_at}, so the autodiff Laplacian differentiates the mollified
+field as it must. The same objection applies here, so \texttt{--pideeponet\_bc zero} provides the
+counterpart of \texttt{--pino\_bc zero}: the grid output's boundary nodes are zeroed exactly as our
+arms do, and the residual gets the original PI-DeepONet soft boundary penalty, weighted by
+\texttt{--pi\_lambda\_bc}. The penalty is not optional there. PINO's finite-difference stencil
+touches the zeroed boundary ring, so masking alone couples the interior residual to the BC; a
+pointwise autodiff Laplacian at interior points is blind to the boundary values and to any mask on
+them, and without the penalty the objective is invariant under adding harmonic functions. To make
+$\lambda_{\mathrm{bc}}=1$ meaningful at any solution magnitude the penalty is written in the
+residual's own units: per sample, the boundary RMS divided by the (detached) interior RMS of the
+prediction, averaged over the batch --- dimensionless like the relative residual
+$\|Lu-f\|/\|f\|$. This matters: at $K=10$ the solutions have RMS $\approx1.6\cdot10^{-3}$ while
+the relative residual is $O(1)$, so a plain mean-square boundary term at unit weight would be five
+to six orders of magnitude too weak. The \texttt{mse} reduction pairs with the plain mean-square boundary penalty of
+the original paper instead.
 
 \textbf{This is an advantage the baselines have over our bare \texttt{galerkin} arm}, which does not
 get a hard BC. It is deliberate: skipping it would be strawmanning. The soft BC penalty of the
 original PI-DeepONet ($\lambda_{\mathrm{bc}}$) is therefore $0$ by default, which removes a tuned
 hyperparameter rather than adding one.
+
+\section*{Stokes: the saddle-point port}
+
+Both baselines exist for Stokes as well (\texttt{--pde stokes --loss pino|pideeponet}). There is
+no reference implementation for a saddle point, so the port is the Darcy recipe applied to each
+equation of $-\mu\Delta u + \nabla p = f$, $\nabla\cdot u = 0$, with three decisions that are the
+Stokes form of choices already fixed above. (i) The residual is evaluated on the velocity grid at
+interior nodes, and the \emph{pressure is taken on the full fine grid} (the FNO's third channel
+times \texttt{p\_scale}) rather than on the $[::2,::2]$ Q1 subgrid the FEM arms read: a strong form
+needs $\nabla p$ at every interior velocity node. Evaluation is unchanged. (ii) The two equations
+are \emph{stacked} in one relative residual, $\|(r_{\mathrm{mom}}, w\,r_{\mathrm{div}})\|/\|(f,0)\|$
+(\texttt{stokes\_reduce}), the strong-form analogue of the negative control $\tfrac12\|Kc-b\|^2$ with
+$b=(M_u f, 0)$. The continuity weight $w$ (\texttt{--pi\_div\_weight}) is the one hyperparameter the
+saddle point adds --- $\nabla\cdot u\sim k u$ against $f\sim\mu k^2 u$, so the rows have different
+units --- and is tuned on validation like a learning rate. (iii) The hard BC, by either mechanism,
+acts on the velocity pair only (\texttt{DeepONetModel(bc\_channels=(0,1))}); the pressure has a gauge,
+not a boundary condition, fixed by projection at evaluation and invisible to $\nabla p$. For PINO no
+wrapper is needed at all: the trainer zeroes the velocity boundary ring itself, exactly as
+\texttt{\_predict} projects every arm. The DeepONet emits three channels through $C$ independent
+groups of $p$ basis functions sharing the hidden layers. Tests pin the port: the FD residual of a
+manufactured Stokes solution converges at rate $2$ (which also fixes the axis convention), the
+autodiff operators match the analytic derivatives, and the FD and autodiff losses agree on a resolved
+field. No Stokes baseline results exist yet; \texttt{experiments/baselines/stokes/} holds the sweep.
 
 \section*{How derivatives are computed}
 
@@ -193,7 +228,8 @@ entry point, and is what the autodiff residual uses.
 \end{verbatim}
 Relevant flags: \texttt{--mollify \{auto,on,off\}} (auto = on for the baseline losses, off
 otherwise, so existing arms are unchanged), \texttt{--pino\_bc \{zero,mollifier\}} (default
-\texttt{zero}), \texttt{--pi\_n\_colloc}, \texttt{--pino\_reduction},
+\texttt{zero}), \texttt{--pideeponet\_bc \{mollifier,zero\}} (default \texttt{mollifier}) with
+\texttt{--pi\_lambda\_bc}, \texttt{--pi\_n\_colloc}, \texttt{--pino\_reduction},
 \texttt{--deeponet\_p/\_width/\_depth}, \texttt{--trunk\_fourier[\_scale]}.
 
 \end{document}

@@ -92,28 +92,64 @@ class DeepONetModel(nn.Module):
         If > 0, use that many random Fourier features on the trunk input.
     f_scale : float
         Branch input is divided by this.
+    mollify : bool
+        Hard zero-Dirichlet BC by multiplying every query by ``sin(pi x) sin(pi y)`` — the
+        reference PI-DeepONet / PINO choice. Acts on ``forward_at`` and hence on ``forward``.
+    out_channels : int
+        Output fields. ``1`` for Poisson / Allen–Cahn; ``3`` for Stokes, ``(u_x, u_y, p)``.
+    bc_channels : sequence of int, optional
+        Channels the hard BC (``mollify`` / ``zero_boundary``) acts on; all by default, the
+        velocity pair ``(0, 1)`` for Stokes.
+    zero_boundary : bool
+        The alternative hard BC, and the counterpart of PINO's ``ZeroBoundaryModel``: the
+        **grid** output's boundary ring is set to exactly zero — the same operation
+        ``losses.py`` applies to our own arms. It acts on ``forward`` only; a coordinate query
+        (``forward_at``) returns the raw network value even on the boundary, so a boundary
+        penalty can still see, and drive down, the boundary values. That is what makes it
+        usable for the PI-DeepONet residual, whose autodiff Laplacian at interior points is
+        blind to the boundary values and to any mask on them.
     """
 
     def __init__(self, grid_size, in_channels: int = 1, p: int = 128,
                  width: int = 256, depth: int = 4, trunk_fourier: int = 64,
                  fourier_scale: float = 4.0, f_scale: float = 1.0,
-                 mollify: bool = False, out_channels: int = 1, seed: int = 0):
+                 mollify: bool = False, zero_boundary: bool = False,
+                 out_channels: int = 1, bc_channels: Optional[Sequence[int]] = None,
+                 seed: int = 0):
         super().__init__()
-        if out_channels != 1:
-            raise NotImplementedError("DeepONetModel currently emits a single channel")
         nx, ny = grid_size
         self.grid_size = (nx, ny)
         self.in_channels = in_channels
+        self.out_channels = int(out_channels)
         self.p = p
         self.f_scale = float(f_scale)
+        # Which output channels the hard BC (mollifier / boundary zeroing) applies to. All of
+        # them by default; for Stokes the CLI passes (0, 1) -- the two velocity components --
+        # because the pressure has no Dirichlet condition (only a gauge, fixed by projection).
+        self.bc_channels = (tuple(range(self.out_channels)) if bc_channels is None
+                            else tuple(int(c) for c in bc_channels))
         # Hard zero-Dirichlet BC by multiplying with sin(pi x) sin(pi y). Unlike the grid-based
         # MollifiedModel used for PINO this must be evaluated at the *query* coordinates, so it
         # lives inside forward_at — which also means the autodiff Laplacian differentiates the
         # mollified field, as it must.
         self.mollify = mollify
+        if mollify and zero_boundary:
+            raise ValueError("mollify and zero_boundary are alternative hard-BC mechanisms; pick one")
+        self.zero_boundary = zero_boundary
+        if zero_boundary:
+            # Registered only when used, so checkpoints of mollified / plain models keep their
+            # exact state_dict keys.
+            mask = torch.ones(ny, nx)
+            mask[0, :] = mask[-1, :] = 0.0
+            mask[:, 0] = mask[:, -1] = 0.0
+            self.register_buffer("boundary_mask", mask)
 
+        # Multi-output: branch and trunk each emit C*p values, read as C independent groups of
+        # p basis functions that share the hidden layers -- the standard "multiple-output
+        # DeepONet" split, and for C=1 exactly the original network.
+        C = self.out_channels
         n_sensors = in_channels * nx * ny
-        self.branch = _mlp([n_sensors] + [width] * (depth - 1) + [p])
+        self.branch = _mlp([n_sensors] + [width] * (depth - 1) + [C * p])
 
         if trunk_fourier > 0:
             self.embed = _FourierFeatures(2, trunk_fourier, scale=fourier_scale, seed=seed)
@@ -121,8 +157,8 @@ class DeepONetModel(nn.Module):
         else:
             self.embed = None
             trunk_in = 2
-        self.trunk = _mlp([trunk_in] + [width] * (depth - 1) + [p])
-        self.bias = nn.Parameter(torch.zeros(1))
+        self.trunk = _mlp([trunk_in] + [width] * (depth - 1) + [C * p])
+        self.bias = nn.Parameter(torch.zeros(C))
 
         # Grid query coordinates, in the repo's row-major node order (row i -> y, col j -> x),
         # so reshaping [B, ny*nx] -> [B, ny, nx] lands each value on its own node.
@@ -146,23 +182,25 @@ class DeepONetModel(nn.Module):
         r"""Evaluate at arbitrary coordinates.
 
         ``coords`` is ``[Q, 2]`` (shared by the batch) or ``[B, Q, 2]`` (per-sample).
-        Returns ``[B, Q]``.
+        Returns ``[B, Q]`` for a single output channel, ``[B, Q, C]`` otherwise.
 
         The per-sample form is what the autodiff residual needs: ``u[b, q]`` then depends
         only on ``coords[b, q]``, so a single ``grad`` of the summed output recovers the
         per-sample derivatives rather than their sum over the batch.
         """
-        b = self._branch(f_grid)                                   # [B, p]
-        t = self._trunk(coords)                                    # [Q, p] or [B, Q, p]
+        C, p = self.out_channels, self.p
+        b = self._branch(f_grid).reshape(-1, C, p)                 # [B, C, p]
+        t = self._trunk(coords)                                    # [Q, C*p] or [B, Q, C*p]
+        t = t.reshape(*t.shape[:-1], C, p)                         # [Q, C, p] or [B, Q, C, p]
         # 1/sqrt(p): the dot product of two p-dimensional vectors grows like sqrt(p), so
         # without this the output magnitude at initialization depends on p (measured 5.5x the
         # target at p=32 and 12.4x at p=128). Starting an operator O(10x) too large costs the
         # baseline real epochs, which would show up as a loss effect that it is not.
-        scale = self.p ** -0.5
-        if t.dim() == 2:
-            u = scale * (b @ t.transpose(0, 1)) + self.bias        # [B, Q]
+        scale = p ** -0.5
+        if t.dim() == 3:
+            u = scale * torch.einsum("bcp,qcp->bqc", b, t) + self.bias        # [B, Q, C]
         else:
-            u = scale * (b.unsqueeze(1) * t).sum(dim=-1) + self.bias   # [B, Q]
+            u = scale * (b.unsqueeze(1) * t).sum(dim=-1) + self.bias         # [B, Q, C]
         if self.mollify:
             x, y = coords[..., 0], coords[..., 1]
             m = torch.sin(math.pi * x) * torch.sin(math.pi * y)
@@ -170,15 +208,26 @@ class DeepONetModel(nn.Module):
             # edges. Snap the domain boundary to exactly zero. This is a measure-zero set, so
             # the autodiff Laplacian at interior collocation points is unaffected.
             on_bdry = (x <= 0) | (x >= 1) | (y <= 0) | (y >= 1)
-            u = u * torch.where(on_bdry, torch.zeros_like(m), m)
-        return u
+            m = torch.where(on_bdry, torch.zeros_like(m), m)
+            if m.dim() == 1:                                       # shared coords: [Q] -> [1, Q]
+                m = m.unsqueeze(0)
+            keep = torch.ones(C, device=u.device, dtype=u.dtype)
+            keep[list(self.bc_channels)] = 0.0
+            u = u * (keep + (1.0 - keep) * m.unsqueeze(-1))        # bc channels * m, others * 1
+        return u.squeeze(-1) if C == 1 else u
 
     def forward(self, f_grid: torch.Tensor) -> torch.Tensor:
-        """``[B, C, H, W]`` -> ``[B, 1, H, W]`` — the ``FNOModel``-compatible signature."""
+        """``[B, C_in, H, W]`` -> ``[B, C_out, H, W]`` — the ``FNOModel``-compatible signature."""
         squeeze = (f_grid.dim() == 3)
         if squeeze:
             f_grid = f_grid.unsqueeze(0)
         nx, ny = self.grid_size
-        u = self.forward_at(f_grid, self.grid_coords)               # [B, ny*nx]
-        u = u.reshape(-1, 1, ny, nx)
+        C = self.out_channels
+        u = self.forward_at(f_grid, self.grid_coords)               # [B, ny*nx] or [B, ny*nx, C]
+        u = u.reshape(-1, ny, nx, C).permute(0, 3, 1, 2)            # [B, C, ny, nx]
+        if self.zero_boundary:
+            keep = torch.ones(C, device=u.device, dtype=u.dtype)
+            keep[list(self.bc_channels)] = 0.0
+            mask = keep[:, None, None] + (1.0 - keep)[:, None, None] * self.boundary_mask
+            u = u * mask
         return u.squeeze(0) if squeeze else u

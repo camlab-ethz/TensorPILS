@@ -21,9 +21,9 @@ from .data import (create_datasets, create_scaling_datasets, PoissonDataset,
 from .models import FNOModel
 from .trainer import PoissonTrainer, WaveTrainer, ACTrainer, StokesTrainer
 from .baselines import (DeepONetModel, MollifiedModel, ZeroBoundaryModel,
-                        PINOPoissonTrainer, PINOACTrainer,
-                        PIDeepONetPoissonTrainer, PIDeepONetACTrainer,
-                        DeepONetPoissonTrainer, DeepONetACTrainer)
+                        PINOPoissonTrainer, PINOACTrainer, PINOStokesTrainer,
+                        PIDeepONetPoissonTrainer, PIDeepONetACTrainer, PIDeepONetStokesTrainer,
+                        DeepONetPoissonTrainer, DeepONetACTrainer, DeepONetStokesTrainer)
 
 
 def build_parser() -> ArgumentParser:
@@ -38,7 +38,7 @@ def build_parser() -> ArgumentParser:
                    default="galerkin",
                    help="poisson: data/data_l2/data_h1/galerkin/deepritz/pls. wave/ac: data or "
                         "galerkin (preset for the lambda_galerkin/lambda_data mix). "
-                        "BASELINES (poisson/ac only): 'pino' = strong-form residual by finite "
+                        "BASELINES (poisson/ac/stokes): 'pino' = strong-form residual by finite "
                         "differences (hard zero Dirichlet BC by zeroing the boundary nodes, as "
                         "our own arms do; see --pino_bc); 'pideeponet' = the same strong form by "
                         "autodiff through the trunk, and requires --model deeponet.")
@@ -270,6 +270,22 @@ def build_parser() -> ArgumentParser:
                         "residual. 'mollifier' multiplies by sin(pi x)sin(pi y), reproducing the "
                         "reference -- but that injects a decay profile close to this dataset's own "
                         "structure, which our arms never get.")
+    p.add_argument("--pideeponet_bc", choices=["mollifier", "zero"], default="mollifier",
+                   help="pideeponet only: how the zero Dirichlet BC enters. 'mollifier' (default) "
+                        "multiplies every query by sin(pi x)sin(pi y), as the reference does. "
+                        "'zero' is the counterpart of --pino_bc zero: the grid output's boundary "
+                        "nodes are set to 0 exactly as our arms do, and -- because the autodiff "
+                        "Laplacian at interior points cannot see that -- the residual gets the "
+                        "original PI-DeepONet soft boundary penalty, weighted by --pi_lambda_bc.")
+    p.add_argument("--pi_lambda_bc", type=float, default=1.0,
+                   help="pideeponet with --pideeponet_bc zero: weight of the boundary penalty. "
+                        "The penalty is expressed in the residual's own units (see "
+                        "PIDeepONetPoissonLoss), so 1 is a meaningful default.")
+    p.add_argument("--pi_div_weight", type=float, default=1.0,
+                   help="pino/pideeponet (stokes): weight of the continuity residual div(u) "
+                        "relative to the momentum residual in the stacked strong-form loss. "
+                        "The two equations have different units, so this is tuned on "
+                        "validation like a learning rate (see baselines.pino.stokes_reduce).")
     p.add_argument("--pi_n_colloc", type=int, default=0,
                    help="pideeponet: collocation points per step, drawn afresh from the grid "
                         "nodes each step. 0 (default) uses all nodes, which matches every "
@@ -372,8 +388,12 @@ def run_poisson(args, device):
     if args.loss == "pino":
         trainer = PINOPoissonTrainer(pino_reduction=args.pino_reduction, **common)
     elif args.loss == "pideeponet":
+        zero_bc = (args.pideeponet_bc == "zero")
         trainer = PIDeepONetPoissonTrainer(n_colloc=args.pi_n_colloc,
-                                           pi_reduction=args.pino_reduction, **common)
+                                           pi_reduction=args.pino_reduction,
+                                           pi_bc=args.pideeponet_bc,
+                                           lambda_bc_pi=(args.pi_lambda_bc if zero_bc else 0.0),
+                                           **common)
     elif args.model == "deeponet":
         # Same losses, other architecture. The arch-tagged prefix keeps these runs from
         # landing on (and overwriting) the identically-configured FNO run's files.
@@ -496,8 +516,9 @@ def run_ac(args, device):
 
 
 def run_stokes(args, device):
-    if args.loss not in ("data", "galerkin", "pls"):
-        raise SystemExit(f"--pde stokes supports --loss data|galerkin|pls, got {args.loss!r}")
+    if args.loss not in ("data", "galerkin", "pls", "pino", "pideeponet"):
+        raise SystemExit(f"--pde stokes supports --loss data|galerkin|pls|pino|pideeponet, "
+                         f"got {args.loss!r}")
     if args.grid_resolution % 2 == 0:
         raise SystemExit(
             f"--pde stokes needs an odd --grid_resolution (the Q2 velocity grid has "
@@ -513,6 +534,12 @@ def run_stokes(args, device):
                  else "preconditioned least squares ½ rᵀPr")
                 + (",  P = monolithic Stokes V-cycle ~ K^-1" if mono
                    else ",  P = diag(mg/mu, w*mu/diag(M_p))")),
+        "pino": (f"PINO baseline: strong-form momentum + continuity by central differences on "
+                 f"the velocity grid, interior nodes, {args.pino_reduction} reduction, "
+                 f"div weight {args.pi_div_weight:g}"),
+        "pideeponet": (f"PI-DeepONet baseline: strong-form momentum + continuity by autodiff "
+                       f"through the trunk, {args.pino_reduction} reduction, div weight "
+                       f"{args.pi_div_weight:g}, BC={args.pideeponet_bc}"),
     }[args.loss]
     print(f"loss        : {args.loss}  ({blurb})")
     print(f"stokes      : mu={args.stokes_mu}  force decay r={args.stokes_r}")
@@ -543,8 +570,10 @@ def run_stokes(args, device):
           f"velocity grid={train_ds.grid_size}, pressure grid={train_ds.pgrid_size}\n")
 
     # f = (f_x, f_y) in; (u_x, u_y, p) out — pressure is read on the [::2, ::2] subgrid.
+    # No train_ds here: StokesTrainer._predict already feeds every model f / f_scale, so a
+    # DeepONet's own branch scale must stay 1.
     model = _build_model(args, in_channels=2, out_channels=3)
-    trainer = StokesTrainer(
+    common = dict(
         model=model,
         train_dataset=train_ds, val_dataset=val_ds, test_dataset=test_ds,
         loss_type=args.loss,
@@ -559,6 +588,22 @@ def run_stokes(args, device):
         uzawa_pre=args.uzawa_pre, uzawa_post=args.uzawa_post,
         cheb_degree=args.cheb_degree, cheb_ratio=args.cheb_ratio,
     )
+    # The baseline trainers subclass StokesTrainer, so evaluation (both fields, projections,
+    # Q1 pressure subgrid) and model selection are the inherited ones for every arm.
+    if args.loss == "pino":
+        trainer = PINOStokesTrainer(pino_reduction=args.pino_reduction,
+                                    div_weight=args.pi_div_weight, **common)
+    elif args.loss == "pideeponet":
+        zero_bc = (args.pideeponet_bc == "zero")
+        trainer = PIDeepONetStokesTrainer(n_colloc=args.pi_n_colloc,
+                                          pi_reduction=args.pino_reduction,
+                                          pi_bc=args.pideeponet_bc,
+                                          lambda_bc_pi=(args.pi_lambda_bc if zero_bc else 0.0),
+                                          div_weight=args.pi_div_weight, **common)
+    elif args.model == "deeponet":
+        trainer = DeepONetStokesTrainer(**common)
+    else:
+        trainer = StokesTrainer(**common)
     _run(trainer, train_ds, test_ds, args)
 
 
@@ -580,21 +625,31 @@ def _build_model(args, in_channels: int, out_channels: int = 1, train_ds=None):
         f_scale = 1.0
         if train_ds is not None and getattr(train_ds, "fs", None):
             f_scale = float(torch.stack(list(train_ds.fs)).abs().mean().clamp_min(1e-8))
+        # --pideeponet_bc zero swaps the mollifier for the boundary-node zeroing our arms use
+        # (plus the soft penalty in the loss); see PIDeepONetPoissonLoss.
+        zero_bc = (args.loss == "pideeponet" and args.pideeponet_bc == "zero")
+        mollify_don = mollify and not zero_bc
+        # Stokes: the hard BC (either mechanism) acts on the velocity pair only; the pressure
+        # has a gauge, not a boundary condition, and the trainer fixes it by projection.
+        bc_channels = (0, 1) if args.pde == "stokes" else None
         cfg = dict(grid_size=(nx, ny), in_channels=in_channels, p=args.deeponet_p,
                    width=args.deeponet_width, depth=args.deeponet_depth,
                    trunk_fourier=args.trunk_fourier, fourier_scale=args.trunk_fourier_scale,
-                   f_scale=f_scale, mollify=mollify, out_channels=out_channels,
-                   seed=args.seed)
+                   f_scale=f_scale, mollify=mollify_don, zero_boundary=zero_bc,
+                   out_channels=out_channels, bc_channels=bc_channels, seed=args.seed)
         model = DeepONetModel(**cfg)
         print(f"  DeepONet  p={args.deeponet_p} width={args.deeponet_width} "
               f"depth={args.deeponet_depth} fourier={args.trunk_fourier}"
               f"(scale {args.trunk_fourier_scale})  f_scale={f_scale:.3g}"
-              f"{'  mollified' if mollify else ''}")
+              f"{'  mollified' if mollify_don else ''}"
+              f"{f'  zero-BC + boundary penalty (lambda={args.pi_lambda_bc:g})' if zero_bc else ''}")
     else:
         cfg = dict(n_modes=tuple(args.n_modes), hidden_channels=args.hidden_dim,
                    in_channels=in_channels, out_channels=out_channels, n_layers=args.num_layers)
         model = FNOModel(**cfg)
-        if mollify:
+        # Stokes PINO needs no wrapper: PINOStokesTrainer zeroes the velocity boundary ring
+        # itself (the pressure channel must stay free), exactly as _predict projects it.
+        if mollify and args.pde != "stokes":
             nx = ny = args.grid_resolution
             if args.pino_bc == "mollifier":
                 model = MollifiedModel(model, nx, ny)
@@ -664,18 +719,24 @@ def _report_test(result, pde: str = "poisson"):
 
 def _validate_baseline_args(args):
     """Fail fast and legibly on baseline flag combinations that cannot work."""
-    if _is_baseline_loss(args.loss) and args.pde not in ("poisson", "ac"):
-        raise SystemExit(f"--loss {args.loss} is implemented for --pde poisson|ac only "
+    if _is_baseline_loss(args.loss) and args.pde not in ("poisson", "ac", "stokes"):
+        raise SystemExit(f"--loss {args.loss} is implemented for --pde poisson|ac|stokes only "
                          f"(got {args.pde!r}); see experiments/baselines/README.md.")
     if args.loss == "pideeponet" and args.model != "deeponet":
         raise SystemExit("--loss pideeponet differentiates through the trunk's coordinate "
                          "input, so it needs --model deeponet.")
-    if args.model == "deeponet" and args.pde in ("wave", "stokes"):
-        raise SystemExit(f"--model deeponet is wired for --pde poisson|ac only "
-                         f"(got {args.pde!r}).")
-    if args.model == "deeponet" and args.mollify == "off" and args.loss == "pideeponet":
-        raise SystemExit("--loss pideeponet with --mollify off would need a boundary penalty "
-                         "weight; the baseline uses the hard BC, as PINO's reference does.")
+    if args.model == "deeponet" and args.pde == "wave":
+        raise SystemExit("--model deeponet is wired for --pde poisson|ac|stokes only (got 'wave').")
+    if (args.model == "deeponet" and args.mollify == "off" and args.loss == "pideeponet"
+            and args.pideeponet_bc != "zero"):
+        raise SystemExit("--loss pideeponet with --mollify off has no boundary condition at all "
+                         "(the autodiff residual cannot see the boundary). Use "
+                         "--pideeponet_bc zero (boundary nodes zeroed + soft penalty, the "
+                         "counterpart of --pino_bc zero) or keep the mollifier.")
+    if args.loss == "pideeponet" and args.pideeponet_bc == "zero" and args.pde not in ("poisson", "stokes"):
+        raise SystemExit("--pideeponet_bc zero is implemented for --pde poisson|stokes only; the "
+                         "Allen-Cahn rollout needs the residual and fed-back values to coincide "
+                         "on the boundary, which the mollifier guarantees.")
 
 
 def main():
