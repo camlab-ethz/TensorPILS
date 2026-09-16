@@ -19,7 +19,10 @@ import torch
 from .data import (create_datasets, create_scaling_datasets, PoissonDataset,
                    create_wave_datasets, create_ac_datasets, create_stokes_datasets)
 from .models import FNOModel
-from .trainer import PoissonTrainer, WaveTrainer, ACTrainer, StokesTrainer
+from .gaot import GAOTModel
+from .trainer import (PoissonTrainer, WaveTrainer, ACTrainer, StokesTrainer,
+                      GAOTPoissonTrainer, GAOTWaveTrainer, GAOTACTrainer,
+                      GAOTStokesTrainer)
 from .baselines import (DeepONetModel, MollifiedModel, ZeroBoundaryModel,
                         PINOPoissonTrainer, PINOACTrainer, PINOStokesTrainer,
                         PIDeepONetPoissonTrainer, PIDeepONetACTrainer, PIDeepONetStokesTrainer,
@@ -90,10 +93,14 @@ def build_parser() -> ArgumentParser:
                         "direction. Implies hard-BC.")
 
     # -------- Preconditioner selection (PLS, or preconditioned Deep Ritz) --------
-    p.add_argument("--precond_kind", choices=["multigrid", "blend", "power"],
+    p.add_argument("--precond_kind", choices=["multigrid", "amg", "blend", "power"],
                    default="multigrid",
                    help="Preconditioner P≈A^-1. 'multigrid' (default): geometric-multigrid "
-                        "V-cycle (computational path). 'blend': convex mix (1-t)I+tA^-1. "
+                        "V-cycle (computational path). 'amg': algebraic (AmgX) V-cycle — same "
+                        "contract, but its hierarchy comes from the matrix instead of the grid, "
+                        "so it is the path to unstructured meshes; CUDA-only, and it uses "
+                        "--mg_pre_smooth for both pre- and post-smoothing (they must be equal). "
+                        "'blend': convex mix (1-t)I+tA^-1. "
                         "'power': fractional power A^-s. blend/power are exact spectral "
                         "operators for illustrating the residual->supervised transition.")
     p.add_argument("--precond_strength", type=float, default=1.0,
@@ -240,11 +247,14 @@ def build_parser() -> ArgumentParser:
     p.add_argument("--grid_resolution", type=int, default=64)
 
     # -------- architecture / baselines (experiments/baselines/) --------
-    p.add_argument("--model", choices=["fno", "deeponet"], default="fno",
-                   help="Neural-operator architecture. 'deeponet' is a drop-in for the FNO "
-                        "(same [B,C,H,W] -> [B,1,H,W] signature), so it can be paired with ANY "
-                        "loss; it additionally exposes a coordinate query, which is what "
-                        "--loss pideeponet differentiates through.")
+    p.add_argument("--model", choices=["fno", "deeponet", "gaot"], default="fno",
+                   help="Neural-operator architecture. All three share the [B,C,H,W] -> "
+                        "[B,C_out,H,W] signature, so any of them can be paired with ANY loss. "
+                        "'deeponet' additionally exposes a coordinate query, which is what "
+                        "--loss pideeponet differentiates through. 'gaot' is the geometry-aware "
+                        "operator transformer: it works on a point cloud internally and is the "
+                        "arm that carries over to an unstructured mesh, where the FNO's FFT "
+                        "cannot go -- see tensorpils/gaot/.")
     p.add_argument("--deeponet_p", type=int, default=128,
                    help="DeepONet: number of basis functions (branch/trunk latent width).")
     p.add_argument("--deeponet_width", type=int, default=256,
@@ -257,6 +267,52 @@ def build_parser() -> ArgumentParser:
                         "multi-frequency data for reasons unrelated to the loss.")
     p.add_argument("--trunk_fourier_scale", type=float, default=2.0,
                    help="DeepONet: std of the random Fourier frequency matrix.")
+    # -------- GAOT (geometry-aware operator transformer, tensorpils/gaot/) --------
+    # Defaults reproduce GAOT's published Poisson-Gauss setting at 64^2: latent 64x64, patch 2,
+    # lifting 64, transformer 256 wide and 3 deep, and a radius of 0.033 (see --gaot_radius).
+    p.add_argument("--gaot_latent", type=int, nargs=2, default=[64, 64],
+                   help="GAOT: structured latent token grid (H W). Sets the transformer's cost, "
+                        "independently of how the physical points are arranged -- which is why "
+                        "the same processor serves a structured and an unstructured mesh.")
+    p.add_argument("--gaot_patch", type=int, default=2,
+                   help="GAOT: patch side on the latent grid; (H/P)*(W/P) transformer tokens. "
+                        "Raise it to cut attention cost quadratically.")
+    p.add_argument("--gaot_radius", type=float, default=None,
+                   help="GAOT: neighbour-ball radius in domain units for both MAGNO searches. "
+                        "Default (None) derives it as --gaot_radius_scale * max(h_phys, "
+                        "h_latent), so changing resolution keeps the neighbour count roughly "
+                        "fixed instead of emptying or exploding the graph.")
+    p.add_argument("--gaot_radius_scale", type=float, default=2.1,
+                   help="GAOT: multiplier in the derived radius (~13 neighbours per query on a "
+                        "uniform grid; 2.1 reproduces GAOT's 0.033 at 64^2 latent 64^2).")
+    p.add_argument("--gaot_scales", type=float, nargs="+", default=[1.0],
+                   help="GAOT: multiscale radii as multiples of the base radius; MAGNO averages "
+                        "the encodings over them.")
+    p.add_argument("--gaot_lifting", type=int, default=64,
+                   help="GAOT: channels per latent token (the width the transformer sees).")
+    p.add_argument("--gaot_magno_hidden", type=int, default=64,
+                   help="GAOT: hidden width of the AGNO kernel MLPs.")
+    p.add_argument("--gaot_mlp_layers", type=int, default=3,
+                   help="GAOT: depth of the AGNO kernel MLPs.")
+    p.add_argument("--gaot_hidden", type=int, default=256,
+                   help="GAOT: transformer hidden size.")
+    p.add_argument("--gaot_layers", type=int, default=3,
+                   help="GAOT: number of transformer blocks (UViT: half encoder, half decoder "
+                        "with long-range skips, plus a middle block when odd).")
+    p.add_argument("--gaot_heads", type=int, default=8,
+                   help="GAOT: attention heads.")
+    p.add_argument("--gaot_no_geoembed", action="store_true",
+                   help="GAOT: disable the geometric embedding of each neighbourhood. It encodes "
+                        "local point density, so it is close to inert on a uniform grid and "
+                        "earns its keep on an irregular one -- this flag is the ablation.")
+    p.add_argument("--gaot_attention", choices=["cosine", "dot_product"], default="cosine",
+                   help="GAOT: neighbour weighting inside the AGNO kernel integral.")
+    p.add_argument("--gaot_node_embedding", action="store_true",
+                   help="GAOT: sinusoidal encoding of coordinates before the kernel MLP.")
+    p.add_argument("--gaot_pos_embedding", choices=["absolute", "rope"], default="absolute",
+                   help="GAOT: transformer positional embedding ('rope' needs "
+                        "rotary-embedding-torch).")
+
     p.add_argument("--mollify", choices=["auto", "on", "off"], default="auto",
                    help="Impose the zero Dirichlet BC hard as part of the model. 'auto' turns it "
                         "on for the baseline losses (pino/pideeponet) and off otherwise so "
@@ -394,10 +450,11 @@ def run_poisson(args, device):
                                            pi_bc=args.pideeponet_bc,
                                            lambda_bc_pi=(args.pi_lambda_bc if zero_bc else 0.0),
                                            **common)
-    elif args.model == "deeponet":
+    elif args.model in ("deeponet", "gaot"):
         # Same losses, other architecture. The arch-tagged prefix keeps these runs from
         # landing on (and overwriting) the identically-configured FNO run's files.
-        trainer = DeepONetPoissonTrainer(**common)
+        trainer = (DeepONetPoissonTrainer if args.model == "deeponet"
+                   else GAOTPoissonTrainer)(**common)
     else:
         trainer = PoissonTrainer(**common)
     _run(trainer, train_ds, test_ds, args)
@@ -433,7 +490,7 @@ def run_wave(args, device):
           f"grid={train_ds.grid_size}, frames/sample={args.n_steps + 1}\n")
 
     model = _build_model(args, in_channels=2)
-    trainer = WaveTrainer(
+    trainer = (GAOTWaveTrainer if args.model == "gaot" else WaveTrainer)(
         model=model,
         train_dataset=train_ds, val_dataset=val_ds, test_dataset=test_ds,
         loss_type=args.loss,
@@ -509,8 +566,8 @@ def run_ac(args, device):
     )
     # Both baselines inherit ACTrainer's rollout evaluation, so their reported per-step /
     # space-time relative L2 is produced by exactly the same code as the FEM arms.
-    cls = {"pino": PINOACTrainer, "pideeponet": PIDeepONetACTrainer}.get(
-        args.loss, DeepONetACTrainer if args.model == "deeponet" else ACTrainer)
+    arch_cls = {"deeponet": DeepONetACTrainer, "gaot": GAOTACTrainer}.get(args.model, ACTrainer)
+    cls = {"pino": PINOACTrainer, "pideeponet": PIDeepONetACTrainer}.get(args.loss, arch_cls)
     trainer = cls(**common)
     _run(trainer, train_ds, test_ds, args)
 
@@ -600,8 +657,9 @@ def run_stokes(args, device):
                                           pi_bc=args.pideeponet_bc,
                                           lambda_bc_pi=(args.pi_lambda_bc if zero_bc else 0.0),
                                           div_weight=args.pi_div_weight, **common)
-    elif args.model == "deeponet":
-        trainer = DeepONetStokesTrainer(**common)
+    elif args.model in ("deeponet", "gaot"):
+        trainer = (DeepONetStokesTrainer if args.model == "deeponet"
+                   else GAOTStokesTrainer)(**common)
     else:
         trainer = StokesTrainer(**common)
     _run(trainer, train_ds, test_ds, args)
@@ -609,6 +667,22 @@ def run_stokes(args, device):
 
 def _is_baseline_loss(loss: str) -> bool:
     return loss in ("pino", "pideeponet")
+
+
+def _apply_hard_bc(model, args):
+    """Wrap a grid-valued model so its output satisfies the zero Dirichlet BC exactly.
+
+    Both wrappers act on the emitted ``[B, C, H, W]`` grid alone, so they apply unchanged to
+    any architecture wearing that signature -- FNO and GAOT alike.
+    """
+    nx = ny = args.grid_resolution
+    if args.pino_bc == "mollifier":
+        print("  mollified: output x sin(pi x)sin(pi y)  (hard zero Dirichlet BC)")
+        return MollifiedModel(model, nx, ny)
+    # Default. The same operation losses.py applies to our own arms, so the PINO
+    # comparison isolates the residual instead of also varying the BC treatment.
+    print("  zero-BC: boundary nodes set to 0  (hard zero Dirichlet BC, as our arms)")
+    return ZeroBoundaryModel(model, nx, ny)
 
 
 def _build_model(args, in_channels: int, out_channels: int = 1, train_ds=None):
@@ -643,6 +717,32 @@ def _build_model(args, in_channels: int, out_channels: int = 1, train_ds=None):
               f"(scale {args.trunk_fourier_scale})  f_scale={f_scale:.3g}"
               f"{'  mollified' if mollify_don else ''}"
               f"{f'  zero-BC + boundary penalty (lambda={args.pi_lambda_bc:g})' if zero_bc else ''}")
+    elif args.model == "gaot":
+        nx = ny = args.grid_resolution
+        # GAOT consumes a point cloud; GAOTModel wraps it in the FNO's grid signature and builds
+        # the node coordinates in the repo's row-major order, so grid_to_node on its output is
+        # the field the FEM losses expect. An unstructured mesh means passing coords= here
+        # instead and calling forward_nodes -- nothing downstream changes.
+        cfg = dict(grid_size=(nx, ny), in_channels=in_channels, out_channels=out_channels,
+                   latent_grid=tuple(args.gaot_latent), patch_size=args.gaot_patch,
+                   radius=args.gaot_radius, radius_scale=args.gaot_radius_scale,
+                   scales=tuple(args.gaot_scales), lifting_channels=args.gaot_lifting,
+                   magno_hidden=args.gaot_magno_hidden, mlp_layers=args.gaot_mlp_layers,
+                   transformer_hidden=args.gaot_hidden, transformer_layers=args.gaot_layers,
+                   num_heads=args.gaot_heads, use_geoembed=not args.gaot_no_geoembed,
+                   attention_type=args.gaot_attention,
+                   node_embedding=args.gaot_node_embedding,
+                   positional_embedding=args.gaot_pos_embedding)
+        model = GAOTModel(**cfg)
+        Hl, Wl = cfg["latent_grid"]
+        P = cfg["patch_size"]
+        print(f"  GAOT  latent={Hl}x{Wl} patch={P} -> {(Hl // P) * (Wl // P)} tokens  "
+              f"lifting={args.gaot_lifting}  transformer={args.gaot_hidden}x{args.gaot_layers}"
+              f"({args.gaot_heads} heads)  radius={model.radius:.4f}  "
+              f"scales={list(cfg['scales'])}  attn={args.gaot_attention}"
+              f"{'' if cfg['use_geoembed'] else '  (no geoembed)'}")
+        if mollify and args.pde != "stokes":
+            model = _apply_hard_bc(model, args)
     else:
         cfg = dict(n_modes=tuple(args.n_modes), hidden_channels=args.hidden_dim,
                    in_channels=in_channels, out_channels=out_channels, n_layers=args.num_layers)
@@ -650,15 +750,7 @@ def _build_model(args, in_channels: int, out_channels: int = 1, train_ds=None):
         # Stokes PINO needs no wrapper: PINOStokesTrainer zeroes the velocity boundary ring
         # itself (the pressure channel must stay free), exactly as _predict projects it.
         if mollify and args.pde != "stokes":
-            nx = ny = args.grid_resolution
-            if args.pino_bc == "mollifier":
-                model = MollifiedModel(model, nx, ny)
-                print("  mollified: output x sin(pi x)sin(pi y)  (hard zero Dirichlet BC)")
-            else:
-                # Default. The same operation losses.py applies to our own arms, so the PINO
-                # comparison isolates the residual instead of also varying the BC treatment.
-                model = ZeroBoundaryModel(model, nx, ny)
-                print("  zero-BC: boundary nodes set to 0  (hard zero Dirichlet BC, as our arms)")
+            model = _apply_hard_bc(model, args)
     # Stash the constructor config so a checkpoint can be reloaded without re-guessing it later
     # (e.g. the long_rollout analysis rebuilds the model from this).
     model.build_config = cfg
@@ -676,8 +768,16 @@ def _print_common(args, device):
     print(f"epochs/bs   : {args.epochs} / {args.batch_size}")
     print(f"lr          : {args.lr}  ->  {args.lr_min}")
     print(f"optimizer   : {args.optimizer}  (weight_decay={args.weight_decay})")
-    print(f"FNO modes   : {tuple(args.n_modes)}   hidden={args.hidden_dim}   "
-          f"layers={args.num_layers}   grid={args.grid_resolution}^2")
+    if args.model == "gaot":
+        print(f"GAOT        : latent={tuple(args.gaot_latent)} patch={args.gaot_patch}   "
+              f"lifting={args.gaot_lifting}   transformer={args.gaot_hidden}x{args.gaot_layers}"
+              f"   grid={args.grid_resolution}^2")
+    elif args.model == "deeponet":
+        print(f"DeepONet    : p={args.deeponet_p}   width={args.deeponet_width}   "
+              f"depth={args.deeponet_depth}   grid={args.grid_resolution}^2")
+    else:
+        print(f"FNO modes   : {tuple(args.n_modes)}   hidden={args.hidden_dim}   "
+              f"layers={args.num_layers}   grid={args.grid_resolution}^2")
     print(f"device      : {device}")
     print("=" * 60 + "\n")
 
@@ -751,7 +851,7 @@ def main():
     device = ("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else args.device
 
     print("=" * 60)
-    print(f"TensorPILS — FNO + {args.pde.capitalize()} 2D")
+    print(f"TensorPILS — {args.model.upper()} + {args.pde.capitalize()} 2D")
     print("=" * 60)
 
     if args.pde == "wave":

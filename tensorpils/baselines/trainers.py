@@ -18,7 +18,8 @@ from typing import Optional
 import torch
 
 from ..meshing import grid_to_node, node_to_grid
-from ..trainer import PoissonTrainer, ACTrainer, StokesTrainer
+from ..trainer import (PoissonTrainer, ACTrainer, StokesTrainer,
+                       arch_tag as _arch_tag, ArchPrefixMixin as _ArchPrefixMixin)
 from .pino import PINOPoissonLoss, PINOACLoss, PINOStokesLoss, boundary_mask_grid
 from .pi_deeponet import (PIDeepONetPoissonLoss, PIDeepONetACLoss, PIDeepONetStokesLoss,
                           autodiff_laplacian)
@@ -26,12 +27,6 @@ from .pi_deeponet import (PIDeepONetPoissonLoss, PIDeepONetACLoss, PIDeepONetSto
 __all__ = ["PINOPoissonTrainer", "PINOACTrainer", "PINOStokesTrainer",
            "PIDeepONetPoissonTrainer", "PIDeepONetACTrainer", "PIDeepONetStokesTrainer",
            "DeepONetPoissonTrainer", "DeepONetACTrainer", "DeepONetStokesTrainer"]
-
-
-def _arch_tag(model) -> str:
-    """``fno`` / ``deeponet`` for the run file name, seen through any wrapper."""
-    inner = getattr(model, "model", model)
-    return "deeponet" if type(inner).__name__ == "DeepONetModel" else "fno"
 
 
 def _detach_coupling(bptt_mode):
@@ -62,24 +57,6 @@ def _interior_colloc(model, interior_idx: torch.Tensor, n_colloc: int, batch_siz
     coords = model.grid_coords[idx]                                          # [Q, 2]
     c = coords.unsqueeze(0).expand(batch_size, -1, -1).clone().requires_grad_(True)
     return c, idx
-
-
-class _ArchPrefixMixin:
-    """Put the architecture in the run file name.
-
-    The production ``_file_prefix`` hard-codes ``fno_``, which was unambiguous while the FNO
-    was the only architecture. Now that any loss can be paired with a DeepONet, a
-    ``--model deeponet --loss data`` run would land on the *same* checkpoint / results path as
-    the FNO run of the same config and silently overwrite it. Rewriting the prefix here keeps
-    ``trainer.py`` untouched and leaves every existing FNO filename byte-identical.
-    """
-
-    def _file_prefix(self) -> str:
-        prefix = super()._file_prefix()
-        tag = _arch_tag(self.model)
-        if tag == "fno":
-            return prefix
-        return tag + prefix[3:] if prefix.startswith("fno") else f"{tag}_{prefix}"
 
 
 class DeepONetPoissonTrainer(_ArchPrefixMixin, PoissonTrainer):

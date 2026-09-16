@@ -34,7 +34,42 @@ from .optim import build_optimizer
 from . import viz
 
 __all__ = ["BaseTrainer", "Trainer", "PoissonTrainer", "RolloutTrainer",
-           "WaveTrainer", "ACTrainer", "StokesTrainer", "TrainingStats"]
+           "WaveTrainer", "ACTrainer", "StokesTrainer", "TrainingStats",
+           "arch_tag", "ArchPrefixMixin",
+           "GAOTPoissonTrainer", "GAOTWaveTrainer", "GAOTACTrainer", "GAOTStokesTrainer"]
+
+
+#: Model class name -> the tag that goes in a run's file names. ``fno`` is the default so that
+#: every filename written before a second architecture existed stays byte-identical.
+_ARCH_TAGS = {"DeepONetModel": "deeponet", "GAOTModel": "gaot"}
+
+
+def arch_tag(model) -> str:
+    """``fno`` / ``deeponet`` / ``gaot`` for the run file name, seen through any wrapper.
+
+    The hard-BC wrappers (``MollifiedModel``, ``ZeroBoundaryModel``) hold the real model in
+    ``.model``, so unwrap one level before looking at the type.
+    """
+    inner = getattr(model, "model", model)
+    return _ARCH_TAGS.get(type(inner).__name__, "fno")
+
+
+class ArchPrefixMixin:
+    """Put the architecture in the run file name.
+
+    ``PoissonTrainer._file_prefix`` and friends hard-code ``fno_``, which was unambiguous while
+    the FNO was the only architecture. Now that any loss can be paired with a DeepONet or with
+    GAOT, a ``--model gaot --loss data`` run would land on the *same* checkpoint / results path
+    as the FNO run of the same config and silently overwrite it. Rewriting the prefix here keeps
+    the base trainers untouched and leaves every existing FNO filename byte-identical.
+    """
+
+    def _file_prefix(self) -> str:
+        prefix = super()._file_prefix()
+        tag = arch_tag(self.model)
+        if tag == "fno":
+            return prefix
+        return tag + prefix[3:] if prefix.startswith("fno") else f"{tag}_{prefix}"
 
 
 @dataclass
@@ -159,7 +194,7 @@ class BaseTrainer:
             traceback.print_exc()
 
     def train(self) -> float:
-        print(f"Training FNO with {self.loss_type} loss  (device: {self.device})\n")
+        print(f"Training {arch_tag(self.model).upper()} with {self.loss_type} loss  (device: {self.device})\n")
         self._before_train()
 
         with tqdm(range(self.epochs), desc="Training", unit="epoch", colour="green") as bar:
@@ -445,7 +480,7 @@ class PoissonTrainer(BaseTrainer):
 
     # -------------------- training loop --------------------
     def train(self) -> float:
-        print(f"Training FNO with {self.loss_type} loss")
+        print(f"Training {arch_tag(self.model).upper()} with {self.loss_type} loss")
         ntr = (f"stream ({len(self.train_dataset)}/epoch)" if self.stream
                else len(self.train_dataset))
         print(f"  Train: {ntr}  Val: {len(self.val_dataset)}  "
@@ -540,6 +575,10 @@ class PoissonTrainer(BaseTrainer):
         if self.precond_kind == "multigrid":
             L, pre, post, _ = self.mg_settings
             return f"mg-L{L}-s{pre}{post}"
+        if self.precond_kind == "amg":
+            # No level count: AmgX picks its own hierarchy depth from the matrix.
+            _, pre, _, _ = self.mg_settings
+            return f"amg-s{pre}"
         return f"{self.precond_kind}-{self.precond_strength:.2f}"
 
     def _file_prefix(self) -> str:
@@ -1155,3 +1194,31 @@ class StokesTrainer(BaseTrainer):
     def _after_train_viz(self):
         self.visualize_sample(self.test_dataset, "test", 0)
         self.compute_error_distribution()
+
+
+# ================================================================= architecture variants
+# GAOT is a second *production* architecture, not a baseline: it runs the same losses, the same
+# validation and the same test metric as the FNO, and differs only in what maps f to u. These
+# subclasses exist solely so its runs get their own file prefix -- see ``ArchPrefixMixin``.
+
+
+class GAOTPoissonTrainer(ArchPrefixMixin, PoissonTrainer):
+    """``PoissonTrainer`` on a :class:`~tensorpils.gaot.GAOTModel`.
+
+    Nothing else changes, and that is the point of the wrapper's grid signature: the FEM losses
+    receive node values obtained from the model output by the same ``grid_to_node`` call as for
+    the FNO, so a GAOT-vs-FNO comparison isolates the architecture.
+    """
+
+
+class GAOTWaveTrainer(ArchPrefixMixin, WaveTrainer):
+    """``WaveTrainer`` counterpart (autoregressive wave time-stepper)."""
+
+
+class GAOTACTrainer(ArchPrefixMixin, ACTrainer):
+    """``ACTrainer`` counterpart of :class:`GAOTPoissonTrainer` (autoregressive Allen-Cahn)."""
+
+
+class GAOTStokesTrainer(ArchPrefixMixin, StokesTrainer):
+    """``StokesTrainer`` counterpart: GAOT emits the 3-channel ``(u_x, u_y, p)`` grid the
+    Taylor-Hood plumbing already expects, so ``_predict`` and the evaluation are inherited."""
