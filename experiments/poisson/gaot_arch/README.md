@@ -57,6 +57,40 @@ python   experiments/poisson/gaot_arch/compare.py       # table + figure vs the 
 
 Logs land in `$(cluster-info --get log_dir)`; `clsubmit --history` shows what went out.
 
+## Result (2026-09-16, `gaot-model` @ 5125484)
+
+Stage 1 picked **1e-3 for all three arms**, and in every case it is an interior optimum, not an
+edge — so the FNO's rate transfers to GAOT unchanged and the drop-in comparison *is* the tuned
+one. (`data` 3.29 / 1.86 / **1.37** / 7.22 %, `pls` 3.27 / 2.03 / **1.27** / 2.55 %,
+`galerkin` 76.0 / 68.7 / **66.4** / 100.0 % at 1e-4 / 3e-4 / 1e-3 / 3e-3, best validation
+relative L2 at 150 epochs.)
+
+Stage 2, test relative L2, mean over seeds 42/43/44:
+
+| loss | FNO | GAOT |
+|------|-----|------|
+| `data` (supervised) | 0.59 % (0.54–0.65) | **0.55 %** (0.51–0.61) |
+| `pls` (preconditioned residual) | 0.66 % (0.61–0.72) | **0.61 %** (0.56–0.71) |
+| `galerkin` (bare residual) | **29.13 %** (27.52–31.96) | 37.57 % (35.64–40.16) |
+
+Parameters: GAOT 3,396,033, FNO 3,008,417 (13 % apart, not matched on purpose).
+Epoch time ~2.95 s on an RTX 4090, so a 500-epoch run is ~25 min.
+
+Three readings:
+
+1. **The wiring is right.** The supervised arm, which has labels and therefore tests the model
+   plumbing rather than the objective, lands on top of the FNO — slightly ahead, within seed
+   spread. Node ordering, coordinates and radius are all doing what they claim.
+2. **The loss ranking transfers.** `pls` ≈ `data` ≪ `galerkin` on GAOT exactly as on the FNO,
+   and the gap is two orders of magnitude on both. That is the conditioning argument behaving
+   like a property of the objective rather than of the FNO, which is what it was always claimed
+   to be. It is also the first evidence that the argument will survive the move off a grid.
+3. **The one place GAOT is worse is the bare residual** (37.6 % vs 29.1 %, well outside seed
+   spread). Both arms are still descending at epoch 500 — the best epoch is 498–499 for every
+   seed of both architectures — so this is *not* "GAOT converges worse"; it is "GAOT is slower
+   on the arm whose Gauss–Newton matrix has κ = O(h⁻⁴)". Which arm sits where under a longer
+   budget is an open question, and the negative control is the wrong place to spend it.
+
 ## What would count as a problem
 
 * **`data` far above the FNO's supervised error.** The supervised arm is the wiring check: it

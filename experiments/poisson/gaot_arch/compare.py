@@ -8,9 +8,11 @@ seeds, so the only new architecture is GAOT and the comparison is a read.
 Two questions, two views:
 
 * **Does the loss ranking transfer?** The table groups by loss, so ``pls`` vs ``galerkin``
-  within GAOT is read off adjacent rows. That comparison is the claim being tested; the
-  architecture-to-architecture gap is a secondary number, because the two models were not
-  parameter-matched.
+  within GAOT is read off adjacent rows. That comparison is the claim being tested. The
+  architecture-to-architecture gap is readable too and is close to a fair one: at the CLI
+  defaults GAOT has 3,396,033 trainable parameters against the FNO's 3,008,417, a 13 %
+  difference — not matched on purpose, but near enough that a large gap could not be explained
+  by capacity alone.
 * **Did it converge, or just stop?** The left panel is validation relative L2 against epoch. On
   the FNO the bare-residual arm is still descending at 500 epochs, so "did not converge" and
   "converged worse" are different claims, and only the curve separates them.
