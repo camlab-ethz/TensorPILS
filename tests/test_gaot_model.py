@@ -282,3 +282,52 @@ def test_build_config_survives_a_checkpoint_roundtrip():
     f = torch.randn(2, 1, n, n)
     with torch.no_grad():
         assert torch.allclose(model(f), clone(f), atol=1e-6)
+
+
+# ----------------------------------------------------------------- the reason GAOT is here
+
+def test_label_free_losses_run_on_a_non_grid_node_set():
+    """The end-to-end unstructured path: real FEM operator, real loss, no grid anywhere.
+
+    This is the whole point of adding a second architecture, so it is checked against
+    ``PoissonProblem`` rather than a mock. The node set is the structured quad mesh with its
+    *interior* nodes jittered: the connectivity stays valid, TensorMesh assembles ``A`` and ``M``
+    on the moved nodes, and the points are no longer a grid — so ``GAOTModel`` must drop the grid
+    path and the losses must still work, because they were node-based all along. (Gmsh is not
+    importable in every environment here, which is why this is a jittered quad mesh rather than
+    a triangulation; it exercises the coordinate path, not a second element type.)
+    """
+    import meshio
+    import numpy as np
+    from tensormesh import Mesh
+    from tensorpils.losses import build_loss
+    from tensorpils.physics import PoissonProblem
+
+    torch.manual_seed(0)
+    rng = np.random.default_rng(0)
+    n = 17
+    base = structured_quad_mesh(nx=n, ny=n)
+    pts = base.points.cpu().numpy().astype(np.float64)
+    conn = base.cells["quad"].cpu().numpy().astype(np.int64)
+    bmask = PoissonProblem(base).boundary_mask.cpu().numpy().astype(bool)
+    # Interior only: moving a boundary node would change the domain, not just the mesh.
+    h = 1.0 / (n - 1)
+    pts[~bmask] += rng.uniform(-0.3 * h, 0.3 * h, size=(int((~bmask).sum()), 2))
+
+    mesh = Mesh(meshio.Mesh(points=pts, cells=[("quad", conn)],
+                            point_data={"boundary_mask": bmask}), reorder=False)
+    problem = PoissonProblem(mesh)
+    coords = torch.as_tensor(pts, dtype=torch.float32)
+    model = _small_model(n, coords=coords)
+    assert not model.structured
+
+    f = torch.randn(2, coords.shape[0]) * 0.1
+    for name in ("galerkin", "deepritz"):
+        model.zero_grad()
+        u = model.forward_nodes(f.unsqueeze(-1))[..., 0]                 # [B, N], node space
+        loss = build_loss(name, problem, lambda_bc=1.0, bc_mode="hard")(
+            u, f, torch.zeros_like(f))
+        assert torch.isfinite(loss)
+        loss.backward()
+        grad = sum(p.grad.abs().sum() for p in model.parameters() if p.grad is not None)
+        assert torch.isfinite(grad) and grad > 0, f"{name}: no gradient on the unstructured mesh"
