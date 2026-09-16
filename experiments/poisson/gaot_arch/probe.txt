@@ -10,6 +10,12 @@
 # Read from the log:  the tqdm rate (epoch/s) -> walltime for 500 epochs;
 #                     "torch.cuda.OutOfMemoryError" -> halve --batch_size or raise --gaot_patch.
 # Results go to a throwaway directory: 5 epochs is not a result.
+#
+# SUBMITTING FROM A COMPUTE NODE: `clsubmit` delegates to `clrun`, and `clrun` on a compute node
+# RUNS IN PLACE instead of submitting -- it will execute this whole sweep serially on the node
+# you are sitting on, and report "OK" with an empty job id. From a compute node use
+#     clrun --force-submit -p gpu1 -t 04:00:00 -n <name> -- <the command>
+# per line (clsubmit has no --force-submit pass-through), or submit from a login node.
 
 #!time 00:25:00
 #!profile gpu1

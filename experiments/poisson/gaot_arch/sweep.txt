@@ -18,10 +18,18 @@
 # and compare.py reads them from there.
 #
 # Run prefixes do not encode the seed, so each seed needs its own output directory.
-# Walltime: set from the probe (stage 0). 6 h assumes <= ~40 s/epoch; raise it if the probe says
-# otherwise, because a run that hits the wall loses everything -- there is no resume here.
+# Walltime: 4 h, from the stage-0 probe -- 5 epochs + dataset build + eval + plots took 26 s on
+# an RTX 4090 (shared with another job), so 500 epochs is ~30-40 min and this is ~6x margin.
+# It also lands in Euler's shortest time bucket, which schedules soonest. Do not trim it
+# further: a run that hits the wall loses everything, there is no resume here.
+#
+# SUBMITTING FROM A COMPUTE NODE: `clsubmit` delegates to `clrun`, and `clrun` on a compute node
+# RUNS IN PLACE instead of submitting -- it will execute this whole sweep serially on the node
+# you are sitting on, and report "OK" with an empty job id. From a compute node use
+#     clrun --force-submit -p gpu1 -t 04:00:00 -n <name> -- <the command>
+# per line (clsubmit has no --force-submit pass-through), or submit from a login node.
 
-#!time 06:00:00
+#!time 04:00:00
 #!profile gpu1
 
 # name                profile  command
