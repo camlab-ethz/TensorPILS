@@ -1,0 +1,23 @@
+# Drop-in algebraic-V-cycle arm: one line per seed, submitted with
+#     clsubmit experiments/poisson/amg_dropin/sweep.txt
+#
+# Identical to the `pls` row of experiments/baselines/poisson except --precond_kind amg, so the
+# existing GMG / data / galerkin arms are the comparison and are not re-run. Read the result with
+#     python experiments/poisson/amg_dropin/compare.py
+#
+# NOTE: AmgX is CUDA-only AND needs the system libstdc++ ahead of the module-loaded one. The
+# project env file loads gcc/8.5.0, whose libstdc++ has GLIBCXX <= 3.4.25, while the bundled
+# libamgxsh.so needs 3.4.29. Without the line below in
+# ~/cluster-kit/env/projects/TensorPILS.euler.sh the failure is SILENT -- `import torch_amgx`
+# still succeeds and only `is_available()` goes False -- so check it, do not assume it:
+#     export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}
+# A one-line check before burning a sweep on it:
+#     clrun -p gpu1 -t 5 -- python -c "import torch_amgx; print(torch_amgx.is_available())"
+
+#!time 02:00:00
+#!profile gpu1
+
+# name                profile  command
+amg-dropin-s42        -        python -m tensorpils.cli --pde poisson --model fno --loss pls --precond_kind amg --grid_resolution 64 --n_train 1024 --n_val 128 --n_test 256 -k 4 --epochs 500 --batch_size 32 --seed 42 --optimizer adam --lr 1e-3 --lr_min 1e-6 --device cuda --no_checkpoint --output_dir output/poisson/amg_dropin/seed42
+amg-dropin-s43        -        python -m tensorpils.cli --pde poisson --model fno --loss pls --precond_kind amg --grid_resolution 64 --n_train 1024 --n_val 128 --n_test 256 -k 4 --epochs 500 --batch_size 32 --seed 43 --optimizer adam --lr 1e-3 --lr_min 1e-6 --device cuda --no_checkpoint --output_dir output/poisson/amg_dropin/seed43
+amg-dropin-s44        -        python -m tensorpils.cli --pde poisson --model fno --loss pls --precond_kind amg --grid_resolution 64 --n_train 1024 --n_val 128 --n_test 256 -k 4 --epochs 500 --batch_size 32 --seed 44 --optimizer adam --lr 1e-3 --lr_min 1e-6 --device cuda --no_checkpoint --output_dir output/poisson/amg_dropin/seed44
