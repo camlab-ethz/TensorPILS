@@ -19,7 +19,7 @@ import torch
 from tensormesh import Mesh
 
 __all__ = ["structured_quad_mesh", "structured_quad9_mesh", "circle_mesh",
-           "node_to_grid", "grid_to_node"]
+           "obstacle_mesh", "node_to_grid", "grid_to_node"]
 
 
 def structured_quad_mesh(nx: int = 64, ny: int = 64,
@@ -207,3 +207,107 @@ def circle_mesh(chara_length: float = 0.015, cx: float = 0.5, cy: float = 0.5,
                 f"subshell, so the change to LD_LIBRARY_PATH is lost. Submitted jobs already "
                 f"get this from the project env file.") from e
         raise
+
+
+def obstacle_mesh(chara_length: float = 0.02, order: int = 2,
+                  xlims=(0.0, 1.0), ylims=(0.0, 1.0),
+                  obstacle: str = "circle", cx: float = 0.40, cy: float = 0.50,
+                  r: float = 0.14, half_w: float = 0.12, half_h: float = 0.12,
+                  cache_path=None) -> Mesh:
+    r"""Rectangle with a hole — the geometry an FNO cannot represent at all.
+
+    The canonical Stokes benchmark shape: a channel-like box obstructed by a body. Emitted as
+    ``triangle6`` (``order=2``) so it carries a **P2/P1 Taylor-Hood** pair, the unstructured
+    counterpart of the structured ``quad9`` Q2/Q1 mesh :func:`structured_quad9_mesh` builds.
+
+    Written here rather than taken from TensorMesh because ``Mesh.gen_hollow_rectangle`` and
+    ``Mesh.gen_hollow_circle`` are both broken as of this writing: they call
+    ``gmsh.model.occ.cut`` and then ask for ``getBoundary`` of the *inner* entity, which the
+    boolean has already consumed (``Exception: Unknown model face with tag 2``). The fix is to
+    take the boundary of the cut *result*, which is what this does.
+
+    Parameters
+    ----------
+    chara_length : float
+        Gmsh target edge length. ``0.02`` gives ~4000 P2 nodes on the default geometry.
+    order : int
+        2 for ``triangle6`` (Taylor-Hood velocity); 1 gives plain ``triangle``.
+    obstacle : {'circle', 'square'}
+        A curved hole is the interesting case — no structured grid resolves it — and it is the
+        default. ``'square'`` is the polygonal control.
+    cx, cy : float
+        Obstacle centre. Deliberately off-centre by default: a centred obstacle makes the
+        solution inherit the domain's symmetry, which is a weaker test.
+    r : float
+        Radius, for ``obstacle='circle'``.
+    half_w, half_h : float
+        Half-extents, for ``obstacle='square'``.
+    cache_path : str, optional
+        Write/read the generated mesh here so a sweep does not re-run Gmsh per job.
+
+    Notes
+    -----
+    The boundary mask is taken from the mesh's **boundary line cells**, not from coordinate
+    comparisons. TensorMesh's own generators test ``points[:, 0] == left`` and so on, which
+    cannot mark a curved obstacle at all — every node on the circle would be missed, the
+    Dirichlet condition would not be imposed there, and the "flow past a body" problem would
+    silently become "flow through a body".
+
+    Gmsh needs ``libGLU.so.1``; see :func:`circle_mesh` for the module to load.
+    """
+    import os
+
+    if obstacle not in ("circle", "square"):
+        raise ValueError(f"obstacle must be 'circle' or 'square', got {obstacle!r}")
+
+    if cache_path is None or not os.path.exists(cache_path):
+        import gmsh
+
+        x0, x1 = xlims
+        y0, y1 = ylims
+        gmsh.initialize()
+        gmsh.model.add("obstacle")
+        outer = gmsh.model.occ.addRectangle(x0, y0, 0, x1 - x0, y1 - y0)
+        if obstacle == "circle":
+            inner = gmsh.model.occ.addDisk(cx, cy, 0, r, r)
+        else:
+            inner = gmsh.model.occ.addRectangle(cx - half_w, cy - half_h, 0,
+                                                2 * half_w, 2 * half_h)
+        # The boolean CONSUMES both inputs and returns the new entities; everything after this
+        # must refer to `cut`, never to `outer`/`inner`. That is exactly the bug upstream.
+        cut, _ = gmsh.model.occ.cut([(2, outer)], [(2, inner)])
+        gmsh.model.occ.synchronize()
+
+        surfaces = [tag for dim, tag in cut if dim == 2]
+        boundary = gmsh.model.getBoundary([(2, s) for s in surfaces], oriented=False)
+        grp = gmsh.model.addPhysicalGroup(1, [tag for dim, tag in boundary if dim == 1])
+        gmsh.model.setPhysicalName(1, grp, "boundary")
+        gmsh.model.addPhysicalGroup(2, surfaces)
+
+        gmsh.option.setNumber("Mesh.ElementOrder", order)
+        gmsh.model.mesh.setSize(gmsh.model.getEntities(0), chara_length)
+        gmsh.model.mesh.generate(2)
+
+        path = cache_path or f"/tmp/tensorpils_obstacle_{os.getpid()}.msh"
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        gmsh.write(path)
+        gmsh.finalize()
+    else:
+        path = cache_path
+
+    # reorder=True is REQUIRED, not cosmetic: with the raw Gmsh numbering TensorMesh's mixed
+    # P2/P1 assembly is silently wrong -- measured, the constant pressure mode leaves a
+    # residual of 2.1e-1 on the free momentum rows (it must be 0, since B^T 1 = 0 is what makes
+    # the pressure gauge a gauge). With reorder=True it is 6.6e-15. Nothing raises either way.
+    mesh = Mesh.from_file(path, reorder=True)
+    # Boundary = every node carried by a boundary line cell. Exact for a curved hole, which a
+    # coordinate test cannot be.
+    line_key = "line3" if order == 2 else "line"
+    # `in` on TensorMesh's BufferDict indexes by position, not by key -- ask for the keys.
+    if line_key not in list(mesh.cells.keys()):
+        raise RuntimeError(f"mesh has no {line_key!r} cells; the boundary physical group was "
+                           f"not written, so the Dirichlet nodes cannot be identified")
+    bmask = torch.zeros(mesh.n_points, dtype=torch.bool)
+    bmask[torch.unique(mesh.cells[line_key].reshape(-1))] = True
+    mesh.register_point_data("is_boundary", bmask)
+    return mesh

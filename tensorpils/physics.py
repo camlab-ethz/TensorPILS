@@ -20,13 +20,14 @@ required by sparse mat–vec products. All public methods take/return node field
 import torch
 import torch.nn as nn
 
-from tensormesh import (Condenser, Field, LaplaceElementAssembler,
+import meshio
+from tensormesh import (Condenser, Field, LaplaceElementAssembler, Mesh,
                         MassElementAssembler, MixedElementAssembler)
 
 from .meshing import structured_quad_mesh, node_to_grid, grid_to_node
 
 __all__ = ["FEMOperator", "PoissonProblem", "WaveProblem", "ACProblem", "StokesProblem",
-           "apply_zero_boundary"]
+           "UnstructuredStokesProblem", "apply_zero_boundary"]
 
 
 def apply_zero_boundary(u: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -715,3 +716,112 @@ class StokesProblem(FEMOperator):
         r"""FE :math:`L^2` norm :math:`\sqrt{p^\top M_p p}` per sample — ``[B]``."""
         Mp = self._spmm(self.M_p, p_node)
         return (p_node * Mp).sum(dim=-1).clamp_min(0).sqrt()
+
+
+class UnstructuredStokesProblem(StokesProblem):
+    r"""Taylor-Hood **P2/P1 on triangles** — Stokes with no grid anywhere.
+
+    The unstructured counterpart of :class:`StokesProblem`. Every method of the parent is
+    inherited unchanged, because all of them (``pack``/``unpack``, ``residual``,
+    ``project_velocity_bc``, ``project_pressure_gauge``, ``velocity_l2``, ``pressure_l2``,
+    ``fem_reference``) were already pure linear algebra on the assembled ``K``, ``M`` and
+    ``M_p``. Only ``__init__`` and the two grid readers are replaced — which is the measure of
+    how little of the Stokes machinery was actually tied to the image.
+
+    Three things differ, and each is forced by the mesh rather than chosen:
+
+    * **The pressure space is read from the layout, not strided.** On the structured mesh the
+      Q1 nodes are the ``[::2, ::2]`` subgrid, so ``from_grid`` could slice. Here they are
+      ``layout.node_ids("p")`` — the triangle *corners*, an arbitrary subset of the P2 node
+      numbering — so :meth:`from_nodes` gathers instead. Same cost, no assumption.
+    * **``M_p`` is assembled on a P1 sub-mesh built here.** The parent builds a structured Q1
+      grid; the sub-mesh is the triangulation's corner nodes with the corner connectivity
+      (columns ``0:3`` of ``triangle6``, verified to be exactly the pressure node set),
+      re-indexed into pressure-DOF order.
+    * **``grid_size`` raises.** Nothing downstream may silently reshape this problem into an
+      image; :meth:`from_nodes` is the only reader.
+
+    The preconditioner has to change too, outside this class: the block ``P``'s velocity half
+    is a *geometric* V-cycle, which has no hierarchy here. Pass an algebraic one — see
+    :class:`~tensorpils.preconditioners.StokesBlockPreconditioner`'s ``velocity_precond``.
+
+    Parameters
+    ----------
+    mesh : tensormesh.Mesh
+        A ``triangle6`` mesh, e.g. from :func:`~tensorpils.meshing.obstacle_mesh`.
+    mu : float
+        Dynamic viscosity.
+    """
+
+    def __init__(self, mesh, mu: float = 1.0, quadrature_order: int = 5):
+        # Deliberately skips StokesProblem.__init__ (which asserts the structured grid) and
+        # goes straight to the shared FEM assembly. Everything the parent's methods read is
+        # set below, under the same names.
+        FEMOperator.__init__(self, mesh, quadrature_order=quadrature_order)
+        if "triangle6" not in list(mesh.cells.keys()):
+            raise ValueError(
+                "Taylor-Hood P2/P1 needs a 'triangle6' mesh (order=2); got cells "
+                f"{list(mesh.cells.keys())}. meshing.obstacle_mesh(order=2) builds one.")
+        self.mu = float(mu)
+        self.n_u = self.n_nodes
+
+        asm = _StokesBilinearForm.from_mesh(mesh, quadrature_order=quadrature_order, mu=mu)
+        layout = asm.layout
+        if layout.n_nodes("u") != self.n_u:
+            raise RuntimeError("velocity field is not the mesh node set")
+        self.n_p = int(layout.n_nodes("p"))
+        self.K = asm()
+        self.n_dofs = int(layout.n_dofs)
+        self.off_p = int(layout.offsets["p"])
+
+        self.register_buffer("dirichlet_mask", layout.dof_mask("u", self.boundary_mask))
+        p_ids = layout.node_ids("p")
+        self._pressure_pin = int(layout.dof_index("p", int(p_ids[0])))
+        # Which P2 nodes carry pressure. The model emits three channels on the P2 node set and
+        # the pressure one is gathered here, so the two spaces still need no scatter table.
+        self.register_buffer("p_node_ids", p_ids.long())
+
+        # --- P1 pressure mass, on a sub-mesh of the corners -----------------------
+        # node_ids("p") is sorted, so searchsorted maps a global node id to its pressure DOF
+        # index; the sub-mesh is therefore in pressure-DOF order and M_p needs no permutation.
+        corners = mesh.cells["triangle6"][:, :3].long()
+        local = torch.searchsorted(p_ids.long(), corners.reshape(-1)).reshape(corners.shape)
+        p_points = mesh.points[p_ids].detach().cpu().numpy()
+        p_mesh = Mesh(meshio.Mesh(points=p_points,
+                                  cells=[("triangle", local.detach().cpu().numpy())]),
+                      reorder=False)
+        self.M_p = MassElementAssembler.from_mesh(
+            p_mesh, quadrature_order=quadrature_order)(p_mesh.points)
+        self.register_buffer(
+            "m_p_lumped",
+            self._spmm(self.M_p, torch.ones(self.n_p, dtype=self.M_p.dtype)).float())
+
+    # ------------------------------------------------------------------ readers
+    @property
+    def grid_size(self):
+        raise AttributeError(
+            "an unstructured Stokes problem has no velocity grid; use from_nodes() and the "
+            "mesh's points. (This raises on purpose: a silent reshape here would apply the "
+            "FEM operator to a permuted field.)")
+
+    @property
+    def pgrid_size(self):
+        raise AttributeError("an unstructured Stokes problem has no pressure grid")
+
+    def from_nodes(self, out_nodes: torch.Tensor):
+        """Model output ``[B, n_u, 3]`` -> ``(u_node [B, n_u, 2], p_node [B, n_p])``.
+
+        Channels are ``(u_x, u_y, p)`` on the **P2 node set**, and pressure is gathered at the
+        corner nodes. The velocity is used everywhere; the pressure channel's values at the
+        edge-midpoint nodes are simply never read, which costs one third of one channel and
+        buys the model a single uniform output space.
+        """
+        u_node = out_nodes[..., :2]
+        p_node = out_nodes[..., self.p_node_ids, 2]
+        return u_node, p_node
+
+    def from_grid(self, out_grid: torch.Tensor):
+        raise AttributeError("unstructured Stokes has no grid; use from_nodes()")
+
+    def to_grid(self, u_node: torch.Tensor, p_node: torch.Tensor):
+        raise AttributeError("unstructured Stokes has no grid")
