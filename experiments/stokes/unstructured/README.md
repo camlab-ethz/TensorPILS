@@ -140,6 +140,22 @@ this mesh 256 is catastrophic: run at it, the three stage-2 seeds gave velocity 
 99.92 / 10.32 / 15.61 % (kept under `superseded/`). The optimum is a broad plateau over 4–16 and
 falls off hard on either side.
 
+The failure at 256 is not a training failure but a mis-weighted metric, and the sample panels
+show it directly (`output/stokes/unstructured/lr/pls_om256/visualization/`): the **pressure is
+nearly right** (3.96 % on sample 0) while the **velocity has lost the jets past the obstacle**
+(33.07 %), with the error concentrated in a wake-shaped region. `omega` is the weight of the
+pressure block in `P = diag(Â⁻¹/μ, ω μ/diag(M_p))`, so a large `omega` makes the norm the loss
+measures in 256x pressure-dominated and the optimiser serves pressure at velocity's expense.
+That is the same failure mode the structured Stokes dataset's field scaling exists to prevent
+(an unweighted supervised loss there is ~2500x pressure-dominated), reappearing through the
+preconditioner rather than through the loss.
+
+The error *texture* separates the three arms as cleanly as the numbers do, at the same colour
+scale (velocity error peak against a field range of 2.7): `pls` at `omega=16` is mesh-scale
+grain at 0.07 — converged to discretisation level; `galerkin` is smooth large-scale blobs at 0.5
+sitting on the velocity maxima — the low-frequency modes a `κ = O(h⁻⁴)` objective releases last;
+`pls` at `omega=256` is 0.9 in a wake around the obstacle.
+
 **16 is also the value this repo records as the *conditioning* optimum** for the block
 preconditioner used as a norm weight — the minimiser of `κ(KPK)`, measured h-independent. On the
 uniform grid the empirical optimum sat a factor of 16 away from the conditioning one; here the
