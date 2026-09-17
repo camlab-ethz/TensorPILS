@@ -46,7 +46,7 @@ LOSSES = [
      f"{_UN}/seed*/results/gaot_stokes_data_mu1_obstacle-n*_K10_*.json", "0.35"),
     ("$L_\\mathrm{PLS}$ (preconditioned)",
      f"{_SQ}/final/pls/lr1e-3_om256/seed*/results/fno_stokes_pls_*w256_mu1_gr65_K10_*.json",
-     f"{_UN}/seed*/results/gaot_stokes_pls_amg-*_mu1_obstacle-n*_K10_*.json", "tab:blue"),
+     f"{_UN}/seed*/results/gaot_stokes_pls_amg-*w16_mu1_obstacle-n*_K10_*.json", "tab:blue"),
     ("$L_\\mathrm{LS}$ (bare residual)",
      f"{_SQ}/diagnostics/galerkin/*/results/fno_stokes_galerkin_mu1_gr65_K10_*.json",
      f"{_UN}/seed*/results/gaot_stokes_galerkin_mu1_obstacle-n*_K10_*.json", "tab:orange"),
