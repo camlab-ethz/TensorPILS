@@ -240,10 +240,14 @@ def circle_mesh(chara_length: float = 0.015, cx: float = 0.5, cy: float = 0.5,
                 f"get this from the project env file.") from e
         raise
 
-    # REPLACE gen_circle's boundary mask. It is built from `radius == r`, which misses every node
-    # Gmsh places an ULP off the circle -- 37 of 210 at chara_length=0.015. See
-    # topological_boundary_mask for what that costs. Overwriting point_data is not allowed, so
-    # the mask goes on under the name PoissonProblem reads first.
+    # Pin the boundary mask to the topological one. This was a CORRECTION: gen_circle used to
+    # build `is_boundary` from `radius == r`, missing every node Gmsh placed an ULP off the
+    # circle -- 37 of 210 at chara_length=0.015 -- and unmarked means free, so the Dirichlet
+    # condition was never imposed there. Fixed upstream in TensorMesh#58 (merged a81defb), and
+    # verified 2026-09-17: on this mesh the generator's mask, ours, and the new
+    # `Mesh.topological_boundary_mask()` agree on all 4205 nodes, 0 disagreements. It is kept as
+    # a guard, not a fix, so results stay reproducible against an older tensormesh. Overwriting
+    # point_data is not allowed, so the mask goes on under the name PoissonProblem reads first.
     mesh.point_data["is_boundary"] = topological_boundary_mask(mesh)
     return mesh
 

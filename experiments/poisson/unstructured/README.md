@@ -146,7 +146,18 @@ corrected the diagnosis. What I had called an ordering-dependent *mixed P2/P1 as
 separate things, and the assembly itself is correct: (a) this mask bug, and (b) an order-2 mesh
 loaded with `reorder=False` has permuted edge nodes (Gmsh `[e01,e12,e20]` vs TensorMesh
 `[e12,e20,e01]`) and is wrong for **any** order-2 computation. Both are fixed in
-[camlab-ethz/TensorMesh#58](https://github.com/camlab-ethz/TensorMesh/pull/58).
+[camlab-ethz/TensorMesh#58](https://github.com/camlab-ethz/TensorMesh/pull/58), **merged as
+`a81defb`**.
+
+**The numbers below therefore stand.** Re-checked against the merged fix on 2026-09-17: the
+generator's own `is_boundary`, `meshing.topological_boundary_mask` and the new upstream
+`Mesh.topological_boundary_mask()` agree on **all 4205 disc nodes and all 11312 obstacle nodes,
+0 disagreements**, and all 210 nodes within 1e-12 of the radius are now marked (0 missed, against
+37 before). `Mesh.check_node_ordering()` reports 0 errors on the order-2 obstacle mesh. The mask
+replacement in `circle_mesh` is now redundant and is kept only as a guard against an older
+`tensormesh`. Note the environment moved with the merge: the venv's editable install resolves
+`import tensormesh` to `projects/tensormesh/code/TensorMesh`, and the old
+`TensorGalerkin/private/TensorMesh` checkout has been deleted.
 
 ## Result (2026-09-17, corrected mask)
 
