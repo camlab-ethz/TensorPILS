@@ -182,8 +182,8 @@ Two readings that the numbers support and one that they do not:
    zero *is* that discrete solution. With a good enough `P` the two objectives have the same
    minimiser, and here they land on it equally well — which is precisely the argument for
    preferring the one that needs no labels.
-2. **The bare residual degrades more than everything else** (37.6 % → 73.6 %) and its seed
-   spread explodes (57.7–94.4 % against 35.6–40.2 %). Consistent with conditioning: `κ(A)` is
+2. **The bare residual degrades more than everything else** (37.6 % → 78.9 %) and its seed
+   spread explodes (56.6–92.3 % against 35.6–40.2 %). Consistent with conditioning: `κ(A)` is
    1.75× the square's here, so `κ(AᵀA)` is ~3×, and that arm is the only one exposed to it. It
    is also still descending at epoch 500 on both domains, so this is a rate, not a floor.
 3. **What the numbers do NOT say is that GAOT degrades on an unstructured mesh.** See the
