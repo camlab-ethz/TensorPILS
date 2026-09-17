@@ -264,8 +264,9 @@ class GAOTModel(nn.Module):
         ``[N, 2]`` physical node coordinates. Defaults to the uniform ``grid_size`` grid in the
         repo's node order. **Pass a mesh's own ``points`` here to go unstructured** — then use
         :meth:`forward_nodes`, since there is no grid to reshape to.
-    domain : ((x0, x1), (y0, y1))
-        Extent used for the latent grid and for the default radius.
+    domain : ((x0, x1), (y0, y1)), optional
+        Extent of the latent grid and of the default radius. ``None`` (default) takes the
+        bounding box of ``coords``, or the unit square when the nodes are the uniform grid.
     """
 
     def __init__(self, grid_size: Tuple[int, int] = (64, 64),
@@ -279,9 +280,20 @@ class GAOTModel(nn.Module):
                  attention_type: str = "cosine", node_embedding: bool = False,
                  positional_embedding: str = "absolute",
                  coords: Optional[torch.Tensor] = None,
-                 domain: Tuple[Tuple[float, float], Tuple[float, float]] = ((0.0, 1.0), (0.0, 1.0))):
+                 domain: Optional[Tuple[Tuple[float, float], Tuple[float, float]]] = None):
         super().__init__()
         nx, ny = grid_size
+        if domain is None:
+            # Derived from the points, so the latent grid covers the geometry it is meant to
+            # encode. A hard-coded unit square would put most of the latent grid outside a
+            # domain that does not happen to live there -- silently, since an empty
+            # neighbourhood is a zero encoding, not an error.
+            if coords is None:
+                domain = ((0.0, 1.0), (0.0, 1.0))
+            else:
+                c = torch.as_tensor(coords, dtype=torch.float32)
+                domain = ((float(c[:, 0].min()), float(c[:, 0].max())),
+                          (float(c[:, 1].min()), float(c[:, 1].max())))
         (x0, x1), (y0, y1) = domain
         self.grid_size = (nx, ny)
         self.in_channels = in_channels

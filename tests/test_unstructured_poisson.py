@@ -1,0 +1,228 @@
+"""Tests for the unstructured (disc) Poisson path — ``--mesh circle``.
+
+The load-bearing test is :func:`test_analytic_solution_is_invalid_on_the_disc`. The whole
+dataset hinges on one fact that nothing in the code would otherwise announce:
+``PoissonMultiFrequency`` is a sum of ``sin(i pi x) sin(j pi y)``, which is zero on the boundary
+of the unit *square* and emphatically not on the boundary of the inscribed disc. Labelling with
+the closed form there raises nothing — it just trains the model against a field that does not
+solve the problem. The CLI refuses ``--dataset_solution analytic`` for that reason, and this
+pins the magnitude behind the refusal.
+
+The rest guard the pieces that had to be rewritten because they assumed an image: the node-form
+collate/forward/eval, the boundary projection off the frame, the file prefix not colliding with
+a structured run, and — the other half of going unstructured — that the geometric V-cycle really
+cannot serve this mesh while the algebraic one can.
+"""
+
+import numpy as np
+import pytest
+import torch
+
+from tensorpils.gaot import GAOTModel, ops
+from tensorpils.losses import NodeDataLoss, build_loss
+from tensorpils.physics import PoissonProblem
+
+try:
+    from tensorpils.meshing import circle_mesh
+    _MESH = circle_mesh(chara_length=0.09)
+except Exception as exc:  # pragma: no cover - gmsh needs libGLU; see circle_mesh's docstring
+    _MESH, _WHY = None, str(exc)[:120]
+
+pytestmark = pytest.mark.skipif(_MESH is None,
+                                reason=f"gmsh unavailable: {locals().get('_WHY', '')}")
+
+
+@pytest.fixture(scope="module")
+def mesh():
+    return _MESH
+
+
+@pytest.fixture(scope="module")
+def problem(mesh):
+    return PoissonProblem(mesh)
+
+
+def _model(mesh, **kw):
+    torch.manual_seed(0)
+    cfg = dict(grid_size=(32, 32), coords=mesh.points.float(), latent_grid=(8, 8),
+               patch_size=2, lifting_channels=12, magno_hidden=12, mlp_layers=2,
+               transformer_hidden=24, transformer_layers=2, num_heads=4)
+    cfg.update(kw)
+    return GAOTModel(**cfg)
+
+
+# ----------------------------------------------------------------- the label trap
+
+def test_analytic_solution_is_invalid_on_the_disc(mesh, problem):
+    """The closed form is large on the disc's boundary, so it cannot be a label here.
+
+    ``sin(i pi x) sin(j pi y)`` vanishes on the square's edges; the disc's boundary runs through
+    the interior of the square, where the field is at full amplitude. Measured, the boundary
+    value is a substantial fraction of the interior peak — nowhere near the ``0`` the problem
+    imposes.
+    """
+    from tensormesh.dataset import PoissonMultiFrequency
+
+    torch.manual_seed(0)
+    a = torch.rand(4, 4, 4) * 2 - 1
+    u = PoissonMultiFrequency(a=a, r=-0.5).solution(mesh.points).float()
+    bnd = problem.boundary_mask.bool()
+    boundary_peak = u[:, bnd].abs().max()
+    interior_peak = u[:, ~bnd].abs().max()
+    assert boundary_peak > 0.25 * interior_peak, (
+        "the closed form happens to be small on this boundary — re-check the claim in "
+        "meshing.circle_mesh before relying on it")
+
+
+def test_fem_labels_satisfy_the_boundary_condition_and_zero_the_residual(mesh, problem):
+    """The FEM solve is the label, and it is the *discrete* solution the residual losses target."""
+    from tensormesh.dataset import PoissonMultiFrequency
+    from tensorpils.data import FEMPoissonSolver
+
+    torch.manual_seed(0)
+    a = torch.rand(3, 4, 4) * 2 - 1
+    f = PoissonMultiFrequency(a=a, r=-0.5).source_term(mesh.points, domain="rectangle").float()
+    u = FEMPoissonSolver(problem)(f)
+
+    bnd = problem.boundary_mask.bool()
+    assert torch.all(u[:, bnd] == 0), "FEM labels must be exactly zero on the boundary"
+    # The same residual the galerkin loss minimises, evaluated at the label.
+    assert problem.residual(u, f).norm(dim=1).max() < 1e-5
+
+
+# ----------------------------------------------------------------- dataset
+
+def test_dataset_items_are_node_vectors_with_no_grid():
+    from tensorpils.data import create_unstructured_datasets
+
+    tr, va, te = create_unstructured_datasets(n_train=4, n_val=2, n_test=2, K=4,
+                                              chara_length=0.09, seed=0)
+    assert (len(tr), len(va), len(te)) == (4, 2, 2)
+    assert tr.grid_size is None, "an unstructured dataset must not advertise a grid"
+    f, u = tr[0]
+    assert f.shape == u.shape == (tr.n_nodes,)
+    # One mesh, one problem, one pool across the splits.
+    assert tr.mesh is va.mesh is te.mesh and tr.problem is va.problem
+    # The splits must be disjoint samples, not the same pool re-indexed.
+    assert not torch.allclose(tr[0][0], te[0][0])
+
+
+# ----------------------------------------------------------------- losses off the grid
+
+def test_node_data_loss_equals_grid_data_loss_on_a_uniform_grid():
+    """The unstructured ``data`` arm must be the same number as the structured one.
+
+    On a uniform grid the two differ only in shape, so if this drifted the two tables would stop
+    being comparable while still both looking plausible.
+    """
+    from tensorpils.losses import DataLoss
+    from tensorpils.meshing import structured_quad_mesh, node_to_grid
+
+    n = 9
+    sq = PoissonProblem(structured_quad_mesh(nx=n, ny=n))
+    torch.manual_seed(0)
+    pred, true = torch.randn(3, n * n), torch.randn(3, n * n)
+    grid = DataLoss(bc_mode="penalty")(node_to_grid(pred, n, n), node_to_grid(true, n, n))
+    node = NodeDataLoss(sq, bc_mode="penalty")(pred, true)
+    assert torch.allclose(grid, node, atol=1e-6)
+
+    grid_h = DataLoss(bc_mode="hard")(node_to_grid(pred, n, n), node_to_grid(true, n, n))
+    node_h = NodeDataLoss(sq, bc_mode="hard")(pred, true)
+    assert torch.allclose(grid_h, node_h, atol=1e-6)
+
+
+@pytest.mark.parametrize("loss_type", ["galerkin", "deepritz", "data", "data_l2", "data_h1"])
+def test_losses_train_on_the_disc(mesh, problem, loss_type):
+    """Every mesh-agnostic loss computes and backpropagates through ``forward_nodes``."""
+    model = _model(mesh)
+    N = mesh.points.shape[0]
+    torch.manual_seed(0)
+    f = torch.randn(2, N) * 0.1
+    u_true = torch.randn(2, N) * 0.01
+
+    crit = build_loss(loss_type, problem, lambda_bc=1.0, bc_mode="hard", node_form=True)
+    u = model.forward_nodes(f.unsqueeze(-1))[..., 0]
+    loss = crit(u, f, u_true) if loss_type != "data" else crit(u, u_true)
+    assert torch.isfinite(loss)
+    loss.backward()
+    g = sum(p.grad.abs().sum() for p in model.parameters() if p.grad is not None)
+    assert torch.isfinite(g) and g > 0
+
+
+# ----------------------------------------------------------------- the preconditioner half
+
+def test_geometric_multigrid_cannot_serve_the_disc(problem):
+    """GMG builds without complaint and dies at the first apply — worth pinning, since the CLI
+    guard is the only thing that turns that into a legible message."""
+    from tensorpils.preconditioners import build_preconditioner
+
+    P = build_preconditioner("multigrid", problem, grid_size=(64, 64))
+    with pytest.raises(RuntimeError):
+        P(torch.randn(2, problem.A.shape[0]))
+
+
+# ----------------------------------------------------------------- GAOT on this geometry
+
+def test_latent_grid_follows_the_point_cloud(mesh):
+    """The latent grid must cover the geometry, not a hard-coded unit square."""
+    pts = mesh.points.float()
+    shifted = pts + torch.tensor([10.0, -5.0])
+    m = _model(mesh, coords=shifted)
+    lat = m.latent_tokens_coord
+    assert lat[:, 0].min() == pytest.approx(float(shifted[:, 0].min()), abs=1e-4)
+    assert lat[:, 1].max() == pytest.approx(float(shifted[:, 1].max()), abs=1e-4)
+
+
+def test_every_mesh_node_can_be_decoded(mesh):
+    """Latent tokens outside the disc are expected (and harmless — an empty neighbourhood is a
+    zero encoding). A *query* node with no latent token in range is not: its decoded value would
+    be zero before the projection, for reasons unrelated to the network."""
+    m = _model(mesh, latent_grid=(16, 16))
+    dec = ops.NeighborSearch(method="native")(m.latent_tokens_coord, m.coords, m.radius)
+    counts = dec["neighbors_row_splits"][1:] - dec["neighbors_row_splits"][:-1]
+    assert int(counts.min()) > 0
+
+
+# ----------------------------------------------------------------- trainer wiring
+
+def test_trainer_runs_an_epoch_and_tags_its_files():
+    from tensorpils.data import create_unstructured_datasets
+    from tensorpils.trainer import GAOTUnstructuredPoissonTrainer
+
+    tr, va, te = create_unstructured_datasets(n_train=4, n_val=2, n_test=2, K=4,
+                                              chara_length=0.09, seed=0)
+    model = _model(tr.mesh)
+    trainer = GAOTUnstructuredPoissonTrainer(
+        model=model, train_dataset=tr, val_dataset=va, test_dataset=te,
+        loss_type="galerkin", batch_size=2, epochs=1, device="cpu",
+        output_dir="/tmp/tensorpils_unstructured_test")
+    trainer.save_checkpoints = False
+    loss = trainer.train_epoch()
+    assert np.isfinite(loss)
+    mse, l2, rl2 = trainer.validate()
+    assert all(np.isfinite(v) for v in (mse, l2, rl2))
+
+    prefix = trainer._file_prefix()
+    assert prefix.startswith("gaot_"), "architecture must be in the prefix"
+    assert f"circle-n{tr.n_nodes}" in prefix, (
+        "an unstructured run must not be able to land on a structured run's checkpoint")
+
+
+def test_eval_projects_the_boundary_to_zero():
+    """``eval_project_bc`` is inherited from PoissonTrainer and must act on the mesh's boundary
+    mask, not on an outer frame that does not exist here."""
+    from tensorpils.data import create_unstructured_datasets
+    from tensorpils.trainer import GAOTUnstructuredPoissonTrainer
+
+    tr, va, te = create_unstructured_datasets(n_train=2, n_val=2, n_test=2, K=4,
+                                              chara_length=0.09, seed=0)
+    trainer = GAOTUnstructuredPoissonTrainer(
+        model=_model(tr.mesh), train_dataset=tr, val_dataset=va, test_dataset=te,
+        loss_type="galerkin", batch_size=2, epochs=1, device="cpu",
+        output_dir="/tmp/tensorpils_unstructured_test")
+    assert trainer.eval_project_bc is True
+    u = torch.randn(2, tr.n_nodes)
+    projected = trainer._apply_eval_bc(u)
+    bnd = trainer.problem.boundary_mask.bool()
+    assert torch.all(projected[:, bnd] == 0)
+    assert torch.allclose(projected[:, ~bnd], u[:, ~bnd])

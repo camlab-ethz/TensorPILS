@@ -18,7 +18,8 @@ import torch
 
 from tensormesh import Mesh
 
-__all__ = ["structured_quad_mesh", "structured_quad9_mesh", "node_to_grid", "grid_to_node"]
+__all__ = ["structured_quad_mesh", "structured_quad9_mesh", "circle_mesh",
+           "node_to_grid", "grid_to_node"]
 
 
 def structured_quad_mesh(nx: int = 64, ny: int = 64,
@@ -154,3 +155,55 @@ def node_to_grid(f: torch.Tensor, nx: int, ny: int) -> torch.Tensor:
 def grid_to_node(g: torch.Tensor, nx: int, ny: int) -> torch.Tensor:
     """Image grid ``[..., ny, nx]`` → flat node vector ``[..., nx*ny]`` (inverse of :func:`node_to_grid`)."""
     return g.reshape(*g.shape[:-2], ny * nx)
+
+
+def circle_mesh(chara_length: float = 0.015, cx: float = 0.5, cy: float = 0.5,
+                r: float = 0.5, cache_path=None) -> Mesh:
+    r"""Unstructured triangular mesh of a disc — the first domain the FNO cannot serve.
+
+    Everything above this function builds a *structured* mesh because the FNO needs an image.
+    This one does the opposite on purpose: it is TensorMesh's Gmsh generator, so the node
+    numbering is whatever Gmsh produced and there is no ``node_to_grid``. Only the point-cloud
+    architectures (:class:`~tensorpils.gaot.GAOTModel`) and the matrix-based preconditioners
+    (``--precond_kind amg``) can consume it; the geometric V-cycle and the FFT cannot.
+
+    Parameters
+    ----------
+    chara_length : float
+        Gmsh target edge length. ``0.015`` gives ~4200 nodes on the unit disc, which is the
+        node budget of the ``64^2`` structured grid (4096) — the point of that default is that
+        a GAOT run here is comparable to the structured one in problem size.
+    cx, cy, r : float
+        Centre and radius. The default disc is inscribed in the unit square, so the *same*
+        ``PoissonMultiFrequency`` source fields are in range (it asserts points lie in
+        :math:`[0,1]^2`).
+    cache_path : str, optional
+        Write/read the generated mesh here, so a sweep does not re-run Gmsh per job.
+
+    Notes
+    -----
+    Importing ``gmsh`` needs ``libGLU.so.1``: the PyPI wheel's ``libgmsh.so`` links the GUI
+    code path even though meshing never calls it, and Ubuntu 22.04 does not ship GLU. On Euler
+    that is the ``mesa-glu`` module, which ``~/cluster-kit/env/projects/TensorPILS.euler.sh``
+    already loads — so jobs are fine and only a bare interactive shell trips over it.
+
+    **The analytical solution does not survive the change of domain.** ``PoissonMultiFrequency``
+    is a sum of ``sin(i pi x) sin(j pi y)``, which vanishes on the boundary of the *square*,
+    not of the disc: measured on this mesh the closed form reaches 2.4e-2 on the circle against
+    an interior peak of 2.6e-2, i.e. ~90 % of the peak. So labels here must come from the FEM
+    solve (:class:`~tensorpils.data.FEMPoissonSolver`, which factorises the assembled ``A`` and
+    is already mesh-agnostic), exactly as for Allen–Cahn. Passing ``solution="analytic"`` on a
+    non-rectangular domain is silently wrong, and :mod:`tensorpils.cli` refuses it.
+    """
+    try:
+        return Mesh.gen_circle(chara_length=chara_length, element_type="tri",
+                               cx=cx, cy=cy, r=r, cache_path=cache_path)
+    except OSError as e:                                        # pragma: no cover
+        if "libGLU" in str(e):
+            raise OSError(
+                f"{e}\n\nGmsh's shared library needs libGLU.so.1 (it links the GUI path it "
+                f"never calls). On Euler:  module load stack/.2024-04-silent gcc/8.5.0 "
+                f"mesa-glu/9.0.2  -- and note `module load` inside a PIPELINE runs in a "
+                f"subshell, so the change to LD_LIBRARY_PATH is lost. Submitted jobs already "
+                f"get this from the project env file.") from e
+        raise

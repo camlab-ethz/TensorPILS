@@ -15,7 +15,8 @@ import torch
 __all__ = ["plot_loss_curve", "visualize_sample", "compute_error_distribution",
            "visualize_rollout_sample", "compute_rollout_error_distribution",
            "visualize_data_trajectory",
-           "visualize_stokes_sample", "compute_stokes_error_distribution"]
+           "visualize_stokes_sample", "compute_stokes_error_distribution",
+           "visualize_unstructured_sample", "compute_unstructured_error_distribution"]
 
 
 def _log_yscale(ax, values):
@@ -460,3 +461,95 @@ def compute_stokes_error_distribution(predict, dataset, problem, device,
     print(f"  saved -> {save_path}")
     print("=" * 50 + "\n")
     return med_u, med_p
+
+
+# ==================== unstructured mesh (no image to imshow) ====================
+
+def _triangulation(dataset):
+    """``matplotlib.tri.Triangulation`` from the mesh's own points and triangles.
+
+    Plotting the real triangulation rather than interpolating to a grid is the honest picture:
+    an interpolated image would hide exactly what this experiment is about, namely that the
+    nodes are not on a grid.
+    """
+    import matplotlib.tri as mtri
+    pts = dataset.mesh.points.cpu().numpy()
+    tris = dataset.mesh.cells["triangle"].cpu().numpy()
+    return mtri.Triangulation(pts[:, 0], pts[:, 1], tris)
+
+
+@torch.no_grad()
+def visualize_unstructured_sample(predict, dataset, device, apply_eval_bc, sample_idx: int,
+                                  save_path: str):
+    """Four-panel figure on the mesh: source, FEM label, prediction, absolute error."""
+    tri = _triangulation(dataset)
+    f_node, u_true = dataset[sample_idx]
+    u_pred = apply_eval_bc(predict(f_node.unsqueeze(0).to(device)))[0]
+    u_pred = u_pred.cpu().numpy()
+    f_np, u_np = f_node.cpu().numpy(), u_true.cpu().numpy()
+
+    vmin = float(min(u_np.min(), u_pred.min()))
+    vmax = float(max(u_np.max(), u_pred.max()))
+    err = np.abs(u_pred - u_np)
+    rel_l2 = np.sqrt((err ** 2).sum() / (u_np ** 2).sum()) * 100.0
+
+    fig, ax = plt.subplots(2, 2, figsize=(11, 10))
+    panels = [(ax[0, 0], f_np, "Source $f$", "RdBu_r", None, None),
+              (ax[0, 1], u_np, "FEM reference $u$", "RdBu_r", vmin, vmax),
+              (ax[1, 0], u_pred, "Predicted $u$", "RdBu_r", vmin, vmax),
+              (ax[1, 1], err, f"|err|  (rel $L^2$ = {rel_l2:.2f}%)", "hot", None, None)]
+    for a, v, title, cmap, lo, hi in panels:
+        tpc = a.tripcolor(tri, v, shading="gouraud", cmap=cmap, vmin=lo, vmax=hi)
+        fig.colorbar(tpc, ax=a, fraction=0.046)
+        a.set_title(title)
+        a.set_aspect("equal")
+        a.set_xticks([]); a.set_yticks([])
+    plt.suptitle(f"unstructured mesh, {dataset.n_nodes} nodes  (K={dataset.K}), "
+                 f"sample #{sample_idx}")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200, bbox_inches="tight"); plt.close()
+    print(f"Visualization -> {save_path}")
+
+
+@torch.no_grad()
+def compute_unstructured_error_distribution(predict, test_dataset, problem, device,
+                                            apply_eval_bc, save_path: str, batch_size: int = 32):
+    """Per-sample **FEM** relative L2 over the test set. Returns ``(median, errs)``.
+
+    Mass-weighted, not a plain node ratio: on a non-uniform mesh the nodes do not carry equal
+    volume, so an unweighted ratio would be a different quantity from the structured runs'.
+    """
+    errs = []
+    for start in range(0, len(test_dataset), batch_size):
+        items = [test_dataset[i] for i in range(start, min(start + batch_size,
+                                                           len(test_dataset)))]
+        fs = torch.stack([it[0] for it in items]).to(device)
+        us = torch.stack([it[1] for it in items]).to(device)
+        u_pred = apply_eval_bc(predict(fs))
+        e = u_pred - us
+        Me = problem._spmm(problem.M, e)
+        Mu = problem._spmm(problem.M, us)
+        num = (e * Me).sum(dim=1).clamp(min=0).sqrt()
+        den = (us * Mu).sum(dim=1).clamp(min=0).sqrt().clamp(min=1e-12)
+        errs.extend((num / den * 100.0).cpu().tolist())
+    errs = np.array(errs)
+    median, mean, std = np.median(errs), np.mean(errs), np.std(errs)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.hist(errs, bins=30, color="#3498db", edgecolor="white", alpha=0.85)
+    ax.axvline(median, color="#e74c3c", linestyle="--", linewidth=2, label=f"median {median:.2f}%")
+    ax.axvline(mean, color="#2ecc71", linestyle="-.", linewidth=2, label=f"mean {mean:.2f}%")
+    ax.set_xlabel("FEM relative $L^2$ error (%)"); ax.set_ylabel("Count")
+    ax.set_title("Unstructured-mesh test error distribution")
+    ax.legend(); ax.grid(alpha=0.3)
+    plt.tight_layout(); plt.savefig(save_path, dpi=200, bbox_inches="tight"); plt.close()
+
+    print("\n" + "=" * 50)
+    print("Test set error distribution (unstructured, FEM relative L2)")
+    print(f"  n     : {len(errs)}")
+    print(f"  median: {median:.4f}%")
+    print(f"  mean  : {mean:.4f}%   std: {std:.4f}%")
+    print(f"  min   : {errs.min():.4f}%   max: {errs.max():.4f}%")
+    print(f"  saved -> {save_path}")
+    print("=" * 50 + "\n")
+    return median, errs

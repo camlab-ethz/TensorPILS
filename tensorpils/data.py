@@ -20,10 +20,12 @@ from torch.utils.data import Dataset, IterableDataset
 
 from tensormesh.dataset import PoissonMultiFrequency, WaveMultiFrequency
 
-from .meshing import structured_quad_mesh, structured_quad9_mesh, node_to_grid
+from .meshing import (structured_quad_mesh, structured_quad9_mesh, circle_mesh,
+                      node_to_grid)
 from .physics import PoissonProblem, WaveProblem, ACProblem, StokesProblem
 
 __all__ = ["FEMPoissonSolver", "PoissonDataset", "StreamingPoissonDataset", "create_datasets",
+           "UnstructuredPoissonDataset", "create_unstructured_datasets",
            "create_scaling_datasets", "WaveDataset", "create_wave_datasets",
            "ACDataset", "create_ac_datasets",
            "StokesDataset", "create_stokes_datasets", "stokes_body_force"]
@@ -177,6 +179,131 @@ def create_datasets(n_train: int, n_val: int, n_test: int,
             mesh=mesh, problem=problem, all_data=all_data, indices=indices,
             solution=solution,
         )
+    return _make(train_idx), _make(val_idx), _make(test_idx)
+
+
+class UnstructuredPoissonDataset(Dataset):
+    r"""Poisson on an **unstructured** mesh — the same operator, no grid.
+
+    Items are node vectors only: ``(f_node [N], u_node [N])``. There is no image form, which is
+    the point — this is the dataset the FNO cannot consume and
+    :class:`~tensorpils.gaot.GAOTModel` can, via ``forward_nodes``.
+
+    Two things change relative to :class:`PoissonDataset`, and both are forced by the geometry
+    rather than chosen:
+
+    **Labels must be the FEM solution.** ``PoissonMultiFrequency`` is a sum of
+    ``sin(i pi x) sin(j pi y)``; it vanishes on the boundary of the unit *square*, and on any
+    other domain it does not. On the inscribed disc the closed form reaches ~90 % of its
+    interior peak *on the boundary*, so it is not a solution of the problem being posed and
+    labelling with it would be silently wrong. :class:`FEMPoissonSolver` already factorises the
+    assembled ``A`` and never looked at the grid, so it carries over untouched — and the label
+    it returns is exactly the discrete solution the residual losses target, which removes the
+    discretisation floor as well.
+
+    **The source is still evaluated from the closed form.** ``source_term`` is a pointwise
+    formula, so it is defined wherever the nodes are; it only needs the points to lie in
+    ``[0,1]^2``, which the default inscribed disc satisfies. Keeping ``K`` and ``r=-0.5``
+    identical to the structured dataset is what makes the two runs comparable: same source
+    distribution, same operator, different domain and different mesh.
+
+    Parameters
+    ----------
+    num_samples, K, seed : as :class:`PoissonDataset`.
+    chara_length : float
+        Gmsh target edge length (``0.015`` -> ~4200 nodes, the ``64^2`` node budget).
+    mesh, problem, all_data, indices :
+        Shared-resource plumbing, so train/val/test reuse one mesh, one
+        :class:`~tensorpils.physics.PoissonProblem` and one generated pool.
+    """
+
+    def __init__(
+        self,
+        num_samples: int = 1000,
+        K: int = 4,
+        seed: int = 42,
+        chara_length: float = 0.015,
+        cx: float = 0.5,
+        cy: float = 0.5,
+        radius: float = 0.5,
+        mesh=None,
+        problem: Optional[PoissonProblem] = None,
+        all_data: Optional[dict] = None,
+        indices: Optional[List[int]] = None,
+        cache_path: Optional[str] = None,
+    ):
+        super().__init__()
+        self.K = K
+        self.chara_length = chara_length
+        self.solution = "fem"          # the only valid choice here; see the class docstring
+
+        if all_data is not None:
+            self.mesh = mesh
+            self.problem = problem
+            if indices is not None:
+                self.fs = [all_data["fs"][i] for i in indices]
+                self.us = [all_data["us"][i] for i in indices]
+                self.l_a = all_data["l_a"][indices]
+            else:
+                self.fs, self.us, self.l_a = all_data["fs"], all_data["us"], all_data["l_a"]
+            self._all_data = all_data
+        else:
+            torch.manual_seed(seed)
+            self.mesh = mesh if mesh is not None else circle_mesh(
+                chara_length=chara_length, cx=cx, cy=cy, r=radius, cache_path=cache_path)
+            self.problem = problem if problem is not None else PoissonProblem(self.mesh)
+
+            self.l_a = (torch.rand(num_samples, K, K) * 2 - 1)
+            equation = PoissonMultiFrequency(a=self.l_a, r=-0.5)
+            points = self.mesh.points                                   # [N, 2], float64
+            all_fs = equation.source_term(points, domain="rectangle").float()
+            all_us = FEMPoissonSolver(self.problem)(all_fs)             # the only valid label
+            self.fs = [all_fs[i] for i in range(num_samples)]
+            self.us = [all_us[i] for i in range(num_samples)]
+            self._all_data = {"fs": self.fs, "us": self.us, "l_a": self.l_a}
+
+        self.n_nodes = self.mesh.points.shape[0]
+        # ``grid_size`` is what the trainers key their file names and eval metric off. There is
+        # no grid, so it is None -- and anything that silently assumed a grid now raises.
+        self.grid_size = None
+
+    def __len__(self):
+        return len(self.fs)
+
+    def __getitem__(self, idx):
+        return self.fs[idx], self.us[idx]
+
+    def get_shared_resources(self):
+        return self.mesh, self.problem, self._all_data
+
+
+def create_unstructured_datasets(n_train: int, n_val: int, n_test: int,
+                                 K: int, chara_length: float = 0.015, seed: int = 42,
+                                 cx: float = 0.5, cy: float = 0.5, radius: float = 0.5,
+                                 cache_path: Optional[str] = None):
+    """Train/val/test splits over one mesh, one problem and one generated pool.
+
+    The FEM solve is done once for the whole pool (one sparse factorisation, many right-hand
+    sides), so the extra cost over the structured analytic dataset is a single LU.
+    """
+    total = n_train + (n_val if n_val > 0 else 0) + (n_test if n_test > 0 else 0)
+    base = UnstructuredPoissonDataset(num_samples=total, K=K, seed=seed,
+                                      chara_length=chara_length, cx=cx, cy=cy, radius=radius,
+                                      cache_path=cache_path)
+    mesh, problem, all_data = base.get_shared_resources()
+
+    train_idx = list(range(n_train))
+    val_idx = list(range(n_train, n_train + n_val)) if n_val > 0 else train_idx
+    if n_test > 0:
+        start = n_train + (n_val if n_val > 0 else 0)
+        test_idx = list(range(start, start + n_test))
+    else:
+        test_idx = train_idx
+
+    def _make(indices):
+        return UnstructuredPoissonDataset(
+            num_samples=total, K=K, seed=seed, chara_length=chara_length,
+            mesh=mesh, problem=problem, all_data=all_data, indices=indices)
     return _make(train_idx), _make(val_idx), _make(test_idx)
 
 

@@ -22,7 +22,7 @@ from .physics import (PoissonProblem, WaveProblem, ACProblem, StokesProblem,
 from .preconditioners import Preconditioner
 
 __all__ = [
-    "DataLoss", "DataL2Loss", "DataH1Loss", "GalerkinLoss", "DeepRitzLoss",
+    "DataLoss", "NodeDataLoss", "DataL2Loss", "DataH1Loss", "GalerkinLoss", "DeepRitzLoss",
     "PreconditionedLSLoss", "PreconditionedDeepRitzLoss", "build_loss",
     "WaveGalerkinLoss", "build_wave_loss",
     "ACGalerkinLoss", "build_ac_loss",
@@ -49,6 +49,35 @@ class DataLoss(nn.Module):
         if self.bc_mode == "hard":
             return ((u_pred[..., 1:-1, 1:-1] - u_true[..., 1:-1, 1:-1]) ** 2).mean(dim=0).sum()
         return ((u_pred - u_true) ** 2).mean(dim=0).sum()
+
+
+class NodeDataLoss(nn.Module):
+    """Supervised MSE on node values ``[B, N]`` — :class:`DataLoss` off the grid.
+
+    On a uniform grid this is *numerically identical* to ``DataLoss``: both average over the
+    batch and sum over spatial points, and the grid nodes carry equal weight. That is what makes
+    an unstructured ``data`` arm comparable to the structured one. On a non-uniform mesh the
+    equal weighting is no longer an integral — ``DataL2Loss`` (mass-weighted) is the principled
+    norm there, and this stays the plain analogue of the grid MSE.
+
+    ``bc_mode='hard'`` drops the boundary nodes, which is what ``DataLoss`` does by slicing the
+    outer frame; off the grid the frame is the mesh's ``boundary_mask``.
+    """
+
+    def __init__(self, problem: PoissonProblem, bc_mode: str = "penalty"):
+        super().__init__()
+        if bc_mode not in ("penalty", "hard"):
+            raise ValueError(f"bc_mode must be 'penalty' or 'hard', got {bc_mode!r}")
+        self.problem = problem
+        self.bc_mode = bc_mode
+
+    def forward(self, u_pred_node: torch.Tensor, u_true_node: torch.Tensor,
+                f_node: torch.Tensor = None) -> torch.Tensor:
+        e2 = (u_pred_node - u_true_node) ** 2
+        if self.bc_mode == "hard":
+            interior = ~self.problem.boundary_mask.to(e2.device).bool()
+            e2 = e2[..., interior]
+        return e2.mean(dim=0).sum()
 
 
 class DataL2Loss(nn.Module):
@@ -187,10 +216,15 @@ class PreconditionedDeepRitzLoss(nn.Module):
 def build_loss(loss_type: str, problem: PoissonProblem,
                lambda_bc: float, bc_mode: str = "penalty",
                precond: Optional[Preconditioner] = None,
-               precondition: bool = False):
-    """Factory for the Poisson loss criterion. Add a branch here to register a new loss."""
+               precondition: bool = False, node_form: bool = False):
+    """Factory for the Poisson loss criterion. Add a branch here to register a new loss.
+
+    ``node_form=True`` is the unstructured-mesh path: every other loss here already operates on
+    node vectors ``[B, N]`` and is mesh-agnostic, so only ``data`` — the one loss defined on the
+    image — needs a substitute (:class:`NodeDataLoss`).
+    """
     if loss_type == "data":
-        return DataLoss(bc_mode=bc_mode)
+        return NodeDataLoss(problem, bc_mode=bc_mode) if node_form else DataLoss(bc_mode=bc_mode)
     if loss_type == "data_l2":
         return DataL2Loss(problem)
     if loss_type == "data_h1":

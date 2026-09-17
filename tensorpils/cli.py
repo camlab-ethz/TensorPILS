@@ -17,12 +17,14 @@ import numpy as np
 import torch
 
 from .data import (create_datasets, create_scaling_datasets, PoissonDataset,
-                   create_wave_datasets, create_ac_datasets, create_stokes_datasets)
+                   create_wave_datasets, create_ac_datasets, create_stokes_datasets,
+                   create_unstructured_datasets)
 from .models import FNOModel
 from .gaot import GAOTModel
 from .trainer import (PoissonTrainer, WaveTrainer, ACTrainer, StokesTrainer,
                       GAOTPoissonTrainer, GAOTWaveTrainer, GAOTACTrainer,
-                      GAOTStokesTrainer)
+                      GAOTStokesTrainer, UnstructuredPoissonTrainer,
+                      GAOTUnstructuredPoissonTrainer)
 from .baselines import (DeepONetModel, MollifiedModel, ZeroBoundaryModel,
                         PINOPoissonTrainer, PINOACTrainer, PINOStokesTrainer,
                         PIDeepONetPoissonTrainer, PIDeepONetACTrainer, PIDeepONetStokesTrainer,
@@ -246,6 +248,21 @@ def build_parser() -> ArgumentParser:
     p.add_argument("--n_modes", type=int, nargs=2, default=[16, 16])
     p.add_argument("--grid_resolution", type=int, default=64)
 
+    # -------- domain / mesh (Poisson only) --------
+    p.add_argument("--mesh", choices=["square", "circle"], default="square",
+                   help="Computational domain. 'square' is the structured grid every result so "
+                        "far used. 'circle' is an UNSTRUCTURED Gmsh triangulation of the "
+                        "inscribed disc: no image, so it needs --model gaot, and no grid "
+                        "hierarchy, so a preconditioned loss needs --precond_kind amg. Labels "
+                        "are forced to the FEM solve -- the closed form is only zero on the "
+                        "square's boundary.")
+    p.add_argument("--mesh_h", type=float, default=0.015,
+                   help="Gmsh target edge length for --mesh circle. 0.015 gives ~4200 nodes, "
+                        "the node budget of the 64^2 structured grid, so the two are "
+                        "comparable in problem size.")
+    p.add_argument("--mesh_cache", type=str, default=None,
+                   help="Cache the generated mesh here so a sweep does not re-run Gmsh per job.")
+
     # -------- architecture / baselines (experiments/baselines/) --------
     p.add_argument("--model", choices=["fno", "deeponet", "gaot"], default="fno",
                    help="Neural-operator architecture. All three share the [B,C,H,W] -> "
@@ -367,6 +384,8 @@ def build_parser() -> ArgumentParser:
 
 
 def run_poisson(args, device):
+    if args.mesh == "circle":
+        return _run_poisson_unstructured(args, device)
     print(f"loss        : {args.loss}"
           + ("  (preconditioned)" if (args.loss == "deepritz" and args.precondition) else ""))
     if args.loss == "deepritz" and not args.precondition:
@@ -665,6 +684,57 @@ def run_stokes(args, device):
     _run(trainer, train_ds, test_ds, args)
 
 
+def _run_poisson_unstructured(args, device):
+    """``--pde poisson --mesh circle``: the same operator and the same losses, off the grid.
+
+    Deliberately a separate function rather than a branch inside ``run_poisson``: the streaming
+    dataset, the OOD eval sets and the grid-shaped baselines all assume an image, and none of
+    them applies here. What *is* shared is everything that matters for comparability -- the
+    source distribution (same ``K``, same ``r=-0.5``), the operator, the losses, the optimizer
+    and the evaluation -- because those never looked at the grid.
+    """
+    print(f"loss        : {args.loss}")
+    print(f"domain      : disc (unstructured Gmsh triangulation), chara_length={args.mesh_h}")
+    print(f"labels      : fem  (the closed form is NOT zero on this boundary -- see "
+          f"meshing.circle_mesh)")
+    if args.loss == "pls":
+        print(f"precond     : amg  (algebraic V-cycle from the matrix; the geometric one has "
+              f"no grid here)")
+    _print_common(args, device)
+
+    print("Building datasets (Gmsh mesh + one sparse factorisation for the labels)...")
+    train_ds, val_ds, test_ds = create_unstructured_datasets(
+        n_train=args.n_train, n_val=args.n_val, n_test=args.n_test,
+        K=args.k, chara_length=args.mesh_h, seed=args.seed, cache_path=args.mesh_cache,
+    )
+    n_nodes = train_ds.n_nodes
+    print(f"  train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}, "
+          f"nodes={n_nodes} (structured reference: {args.grid_resolution}^2 = "
+          f"{args.grid_resolution ** 2})\n")
+
+    # The model is built on the mesh's own points; there is no grid to reshape to, so
+    # GAOTModel drops its image path and only forward_nodes works.
+    model = _build_model(args, in_channels=1, coords=train_ds.mesh.points.float())
+    trainer_cls = (GAOTUnstructuredPoissonTrainer if args.model == "gaot"
+                   else UnstructuredPoissonTrainer)
+    trainer = trainer_cls(
+        model=model,
+        train_dataset=train_ds, val_dataset=val_ds, test_dataset=test_ds,
+        loss_type=args.loss,
+        optimizer_name=args.optimizer,
+        lr=args.lr, lr_min=args.lr_min, weight_decay=args.weight_decay,
+        batch_size=args.batch_size, epochs=args.epochs,
+        device=device, output_dir=args.output_dir,
+        lambda_bc=args.lambda_bc, bc_mode=args.bc_mode, precondition=args.precondition,
+        precond_kind=args.precond_kind, precond_strength=args.precond_strength,
+        precond_method=args.precond_method,
+        mg_levels=args.mg_levels, mg_pre_smooth=args.mg_pre_smooth,
+        mg_post_smooth=args.mg_post_smooth, mg_omega=args.mg_omega,
+        patience=args.patience,
+    )
+    _run(trainer, train_ds, test_ds, args)
+
+
 def _is_baseline_loss(loss: str) -> bool:
     return loss in ("pino", "pideeponet")
 
@@ -685,7 +755,8 @@ def _apply_hard_bc(model, args):
     return ZeroBoundaryModel(model, nx, ny)
 
 
-def _build_model(args, in_channels: int, out_channels: int = 1, train_ds=None):
+def _build_model(args, in_channels: int, out_channels: int = 1, train_ds=None,
+                 coords=None):
     print("Building model...")
     # Hard zero-Dirichlet BC as part of the model. On by default for the baselines only: it
     # removes a boundary-penalty weight from their hyperparameters rather than adding one.
@@ -732,7 +803,8 @@ def _build_model(args, in_channels: int, out_channels: int = 1, train_ds=None):
                    num_heads=args.gaot_heads, use_geoembed=not args.gaot_no_geoembed,
                    attention_type=args.gaot_attention,
                    node_embedding=args.gaot_node_embedding,
-                   positional_embedding=args.gaot_pos_embedding)
+                   positional_embedding=args.gaot_pos_embedding,
+                   coords=coords)
         model = GAOTModel(**cfg)
         Hl, Wl = cfg["latent_grid"]
         P = cfg["patch_size"]
@@ -817,6 +889,48 @@ def _report_test(result, pde: str = "poisson"):
         print(f"  final test     : rollout MSE {result:.2e}")
 
 
+def _validate_mesh_args(args):
+    """Refuse the unstructured combinations that cannot work, before the queue wait.
+
+    Each of these fails anyway, but late and unhelpfully: the FNO would die inside the FFT, the
+    geometric V-cycle builds without complaint and then dies on a shape mismatch at its first
+    apply, and analytic labels would not fail at all -- they would just be wrong.
+    """
+    if args.mesh != "circle":
+        return
+    if args.pde != "poisson":
+        raise SystemExit(f"--mesh circle is implemented for --pde poisson only (got "
+                         f"{args.pde!r}).")
+    if args.model != "gaot":
+        raise SystemExit(
+            f"--mesh circle has no grid, so the model must consume a point cloud: use "
+            f"--model gaot (got {args.model!r}). The FNO is tied to the FFT and the DeepONet's "
+            f"branch is a fixed sensor grid.")
+    if args.loss not in ("data", "data_l2", "data_h1", "galerkin", "deepritz", "pls"):
+        raise SystemExit(f"--mesh circle supports --loss data|data_l2|data_h1|galerkin|"
+                         f"deepritz|pls (got {args.loss!r}); the PINO / PI-DeepONet baselines "
+                         f"take finite differences on an image.")
+    needs_p = (args.loss == "pls") or (args.loss == "deepritz" and args.precondition)
+    if needs_p and args.precond_kind != "amg":
+        raise SystemExit(
+            f"--mesh circle with a preconditioned loss needs --precond_kind amg (got "
+            f"{args.precond_kind!r}). The geometric V-cycle re-discretises a structured "
+            f"hierarchy and the spectral preconditioners eigendecompose a grid operator; only "
+            f"the algebraic V-cycle is built from the matrix.")
+    if args.dataset_solution != "fem":
+        raise SystemExit(
+            "--mesh circle must use --dataset_solution fem. The analytical solution is a sum "
+            "of sin(i pi x) sin(j pi y): it vanishes on the boundary of the SQUARE, and on the "
+            "disc it reaches ~90% of its interior peak there, so it is not a solution of this "
+            "problem. Nothing would raise -- the labels would simply be wrong.")
+    if args.stream or args.fixed_eval or args.steps_per_epoch:
+        raise SystemExit("--mesh circle has no streaming dataset: every label costs a sparse "
+                         "solve, so samples are generated once as a pool.")
+    if args.ood_k:
+        raise SystemExit("--mesh circle does not support --ood_k yet (the OOD eval sets are "
+                         "built as grid PoissonDatasets).")
+
+
 def _validate_baseline_args(args):
     """Fail fast and legibly on baseline flag combinations that cannot work."""
     if _is_baseline_loss(args.loss) and args.pde not in ("poisson", "ac", "stokes"):
@@ -842,6 +956,7 @@ def _validate_baseline_args(args):
 def main():
     args = build_parser().parse_args()
     _validate_baseline_args(args)
+    _validate_mesh_args(args)
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)

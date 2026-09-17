@@ -36,7 +36,8 @@ from . import viz
 __all__ = ["BaseTrainer", "Trainer", "PoissonTrainer", "RolloutTrainer",
            "WaveTrainer", "ACTrainer", "StokesTrainer", "TrainingStats",
            "arch_tag", "ArchPrefixMixin",
-           "GAOTPoissonTrainer", "GAOTWaveTrainer", "GAOTACTrainer", "GAOTStokesTrainer"]
+           "GAOTPoissonTrainer", "GAOTWaveTrainer", "GAOTACTrainer", "GAOTStokesTrainer",
+           "UnstructuredPoissonTrainer", "GAOTUnstructuredPoissonTrainer"]
 
 
 #: Model class name -> the tag that goes in a run's file names. ``fno`` is the default so that
@@ -1222,3 +1223,121 @@ class GAOTACTrainer(ArchPrefixMixin, ACTrainer):
 class GAOTStokesTrainer(ArchPrefixMixin, StokesTrainer):
     """``StokesTrainer`` counterpart: GAOT emits the 3-channel ``(u_x, u_y, p)`` grid the
     Taylor-Hood plumbing already expects, so ``_predict`` and the evaluation are inherited."""
+
+
+# ============================================================== unstructured (no grid at all)
+
+
+class UnstructuredPoissonTrainer(PoissonTrainer):
+    r"""Poisson on an unstructured mesh: everything in node space, no image anywhere.
+
+    Subclasses :class:`PoissonTrainer` rather than replacing it, so the optimizer, the cosine
+    schedule, model selection, checkpointing, early stopping and the results JSON are the
+    *same code* as the structured runs — an unstructured number is therefore produced by the
+    same evaluation as a structured one, and the two are comparable.
+
+    Four things are overridden, and each is exactly the place the grid was assumed:
+
+    * ``_collate`` / ``train_epoch`` / ``_forward`` — items are ``(f_node, u_node)`` and the
+      model is called through ``forward_nodes``; there is no ``[B, C, H, W]`` to build.
+    * ``_project_zero_bc`` — the boundary is the mesh's ``boundary_mask``, not an outer frame.
+    * ``_eval_loader`` — model selection is node MSE, which on a uniform grid is *numerically*
+      the grid MSE the structured runs select on. The FEM L2 (``sqrt(e^T M e)``) and relative
+      L2 alongside it were already mesh-agnostic and are untouched.
+    * ``_file_prefix`` — carries a mesh tag, so an unstructured run cannot land on a structured
+      run's checkpoint.
+
+    The preconditioner is the other half of this. ``GeometricMultigrid`` re-discretises a
+    structured hierarchy and has no grid to do it on here — it builds without complaint and
+    then dies on a shape mismatch at the first apply — so the ``pls`` arm needs
+    ``--precond_kind amg``, which is assembled from the matrix. :mod:`tensorpils.cli` enforces
+    that rather than letting the job discover it after the queue wait.
+    """
+
+    #: Tag that goes in the run file name, so structured/unstructured runs never collide.
+    mesh_tag = "circle"
+
+    def __init__(self, *args, mesh_tag: Optional[str] = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        if mesh_tag is not None:
+            self.mesh_tag = mesh_tag
+        self.n_nodes = self.train_dataset.n_nodes
+        # PoissonTrainer builds the criterion from build_loss(); `data` is the one loss defined
+        # on the image, so swap in its node counterpart.
+        if self.loss_type == "data":
+            self.criterion = build_loss(self.loss_type, self.problem, lambda_bc=0.0,
+                                        bc_mode=self.bc_mode, node_form=True)
+
+    # -------------------- node-space plumbing --------------------
+    @staticmethod
+    def _collate(batch):
+        fs = torch.stack([item[0] for item in batch], dim=0)        # [B, N]
+        us = torch.stack([item[1] for item in batch], dim=0)        # [B, N]
+        return fs, us
+
+    def _project_zero_bc(self, u_node: torch.Tensor) -> torch.Tensor:
+        """Zero the mesh's boundary nodes. ``[B, N]`` in, ``[B, N]`` out."""
+        return apply_zero_boundary(u_node, self.problem.boundary_mask.to(u_node.device))
+
+    def _predict(self, fs_node: torch.Tensor) -> torch.Tensor:
+        """``[B, N]`` source -> ``[B, N]`` prediction, through the point-cloud entry point."""
+        return self.model.forward_nodes(fs_node.unsqueeze(-1))[..., 0]
+
+    def _forward(self, fs_node, us_node):
+        u_pred = self._predict(fs_node)
+        if self.loss_type == "data":
+            return self.criterion(u_pred, us_node)
+        return self.criterion(u_pred, fs_node, us_node)
+
+    def train_epoch(self) -> float:
+        self.model.train()
+        total, nb = 0.0, 0
+        for fs, us in self.train_loader:
+            self.optimizer.zero_grad()
+            fs, us = fs.to(self.device), us.to(self.device)
+            loss = self._forward(fs, us)
+            loss.backward()
+            self.optimizer.step()
+            total += loss.item()
+            nb += 1
+        return total / nb
+
+    @torch.no_grad()
+    def _eval_loader(self, loader):
+        """``(node MSE, FEM L2, relative L2)`` — the structured tuple, read off nodes."""
+        self.model.eval()
+        total_mse, total_l2, total_rel_l2, n = 0.0, 0.0, 0.0, 0
+        for fs, us in loader:
+            fs, us = fs.to(self.device), us.to(self.device)
+            u_pred = self._apply_eval_bc(self._predict(fs))
+            b = fs.shape[0]
+            total_mse += ((u_pred - us) ** 2).mean().item() * b
+            e = u_pred - us
+            Me = self.problem._spmm(self.problem.M, e)
+            l2 = (e * Me).sum(dim=1).clamp(min=0).sqrt()
+            total_l2 += l2.sum().item()
+            Mu = self.problem._spmm(self.problem.M, us)
+            u_norm = (us * Mu).sum(dim=1).clamp(min=0).sqrt()
+            total_rel_l2 += (l2 / u_norm.clamp(min=1e-12)).sum().item()
+            n += b
+        return total_mse / n, total_l2 / n, total_rel_l2 / n
+
+    # -------------------- bookkeeping --------------------
+    def _file_prefix(self) -> str:
+        return f"{super()._file_prefix()}_{self.mesh_tag}-n{self.n_nodes}"
+
+    def visualize_sample(self, dataset, split: str, sample_idx: int = 0):
+        suffix = "" if sample_idx == 0 else f"{sample_idx}"
+        viz.visualize_unstructured_sample(
+            self._predict, dataset, self.device, self._apply_eval_bc, sample_idx,
+            save_path=f"{self.output_dir}/visualization/{self._file_prefix()}_{split}{suffix}.png")
+
+    def compute_error_distribution(self):
+        return viz.compute_unstructured_error_distribution(
+            self._predict, self.test_dataset, self.problem, self.device, self._apply_eval_bc,
+            save_path=f"{self.output_dir}/error/{self._file_prefix()}_error_dist.png")
+
+
+class GAOTUnstructuredPoissonTrainer(ArchPrefixMixin, UnstructuredPoissonTrainer):
+    """The unstructured arm as it is actually run: GAOT is the only architecture here that can
+    consume a point cloud, but the prefix tag is kept general so a future one drops in."""
