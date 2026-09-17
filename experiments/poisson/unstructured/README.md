@@ -25,10 +25,28 @@ The question is not "is GAOT good" — that was answered on the structured grid
 
 ## Setup
 
-Inscribed disc, centre `(0.5, 0.5)`, radius `0.5`. `chara_length=0.015` gives **4205 nodes**
-against the structured runs' `64² = 4096` — deliberately, so the two are comparable in problem
-size. `K=4` and `r=-0.5` are the structured dataset's, so the source distribution is unchanged;
-only the domain and the mesh differ.
+Inscribed disc, centre `(0.5, 0.5)`, radius `0.5`. `K=4` and `r=-0.5` are the structured
+dataset's, so the source distribution is unchanged; only the domain and the mesh differ.
+
+The mesh is sized to **match the structured runs' node count**, which is what fixes the model
+cost and the dimension of the discrete problem:
+
+| mesh | nodes | interior DOFs | `h = sqrt(area/N)` | `κ(A_int)` |
+|------|------:|--------------:|-------------------:|-----------:|
+| structured square `64²` | 4096 | 3844 | 0.01562 | 804 |
+| **disc `chara_length=0.015`** | **4205** | **4032** | 0.01367 | 1409 |
+| disc `chara_length=0.0175` | 3103 | 2956 | 0.01591 | 1003 |
+
+The two matchings disagree, and the choice is on the record: at equal node count the disc mesh
+is 13 % finer in spacing and `κ(A)` is 1.75× the square's; at equal spacing it has 24 % fewer
+nodes. Node count wins here because the effect being measured — `pls` against `galerkin` — is
+two orders of magnitude, so a 1.75× difference in `κ(A)` (or 3× in `κ(AᵀA)`, which is what the
+bare-residual arm actually sees) cannot account for anything in the table. Note also that even
+at *matched* spacing the disc is worse conditioned than the square (1003 vs 804): that is the
+geometry and the element type, not the refinement.
+
+Anything coarser than this is a smoke test, not a result — `tests/test_unstructured_poisson.py`
+runs at `chara_length=0.09` (~300 nodes) on purpose, and those numbers mean nothing.
 
 **Labels must come from the FEM solve, and this is not a convenience.**
 `PoissonMultiFrequency` is a sum of `sin(iπx) sin(jπy)`. That vanishes on the boundary of the
