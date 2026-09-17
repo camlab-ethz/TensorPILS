@@ -239,6 +239,15 @@ def build_parser() -> ArgumentParser:
                    help="Stokes monolithic: Chebyshev targets [lambda_max/ratio, lambda_max] of "
                         "D^-1 A — a smoother damps the top of the spectrum and leaves the rest to "
                         "the coarse grid.")
+    p.add_argument("--stokes_div_weight", type=float, default=1.0,
+                   help="Weight on the CONTINUITY rows of the FEM least-squares Stokes loss: "
+                        "0.5*||(r_mom, w*r_cont)||^2. The counterpart of the strong-form "
+                        "baseline's --pi_div_weight, which is tuned on validation and is worth "
+                        "~27x to it (46.05 pct velocity at w=1, 1.73 pct at w=100). w=1 is the "
+                        "bare control. As a norm weight this is diag(I, w^2 I), i.e. the pls "
+                        "preconditioner with the velocity block's A^-1 replaced by the identity "
+                        "-- sweeping it separates a two-block rescaling from what the velocity "
+                        "preconditioner adds.")
     p.add_argument("--stokes_precond_strength", type=float, default=1.0,
                    help="Stokes pls: blend strength t in [0,1] for P_t = (1-t)*alpha*I + "
                         "t*P_block. t=1 (default) is the block preconditioner; t=0 reproduces the "
@@ -676,6 +685,7 @@ def run_stokes(args, device):
         mg_post_smooth=args.mg_post_smooth, mg_omega=args.mg_omega,
         schur_omega=args.schur_omega, precond_strength=args.stokes_precond_strength,
         precond_kind=args.stokes_precond, pls_form=args.stokes_pls_form,
+        stokes_div_weight=args.stokes_div_weight,
         uzawa_pre=args.uzawa_pre, uzawa_post=args.uzawa_post,
         cheb_degree=args.cheb_degree, cheb_ratio=args.cheb_ratio,
     )
@@ -756,6 +766,7 @@ def _run_stokes_unstructured(args, device):
         mg_post_smooth=args.mg_post_smooth, mg_omega=args.mg_omega,
         schur_omega=args.schur_omega, precond_strength=args.stokes_precond_strength,
         precond_kind=args.stokes_precond, pls_form=args.stokes_pls_form,
+        stokes_div_weight=args.stokes_div_weight,
         uzawa_pre=args.uzawa_pre, uzawa_post=args.uzawa_post,
         cheb_degree=args.cheb_degree, cheb_ratio=args.cheb_ratio,
         **extra,

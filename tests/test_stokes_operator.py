@@ -598,3 +598,38 @@ def test_monolithic_P_is_indefinite_so_it_cannot_be_a_norm(problem, monolithic):
     # ...and the block preconditioner is SPD, so it can be (and only be) a norm weight.
     Pb = StokesBlockPreconditioner(problem, mg_levels=3).double()(eye)
     assert torch.linalg.eigvalsh(Z.T @ (0.5 * (Pb + Pb.T)) @ Z).min() > 0
+
+
+def test_galerkin_continuity_weight_scales_only_the_continuity_rows():
+    """``½‖(r_mom, w·r_cont)‖²`` — the FEM counterpart of the strong-form ``--pi_div_weight``.
+
+    The strong-form baseline tunes that weight on validation and it is worth ~27x to it on the
+    structured benchmark (46.05 % velocity at ``w=1``, 1.73 % at ``w=100``), so an *unweighted*
+    FEM control is not the comparison a weighted PINO should be read against. Measured, the two
+    objectives are nearly the same function at ``w=1`` (gradient cosine 0.993) and diverge as
+    ``w`` grows (0.83 at ``w=300``): the weight, not the residual's form, is what separates them.
+    """
+    import torch
+    from tensorpils.losses import StokesGalerkinLoss
+    from tensorpils.meshing import structured_quad9_mesh
+    from tensorpils.physics import StokesProblem
+
+    n_p = 9
+    prob = StokesProblem(structured_quad9_mesh(nx=n_p, ny=n_p), nx_p=n_p, ny_p=n_p, mu=1.0)
+    torch.manual_seed(0)
+    u = torch.randn(3, prob.n_u, 2) * 0.01
+    p = torch.randn(3, prob.n_p) * 0.01
+    f = torch.randn(3, prob.n_u, 2)
+
+    r = prob.residual(u, p, f)
+    off = prob.off_p
+    mom = 0.5 * (r[..., :off] ** 2).sum(-1).mean()
+    con = 0.5 * (r[..., off:] ** 2).sum(-1).mean()
+
+    for w in (1.0, 10.0, 300.0):
+        got = StokesGalerkinLoss(prob, div_weight=w)(u, p, f)
+        assert torch.allclose(got, mom + (w ** 2) * con, rtol=1e-5), f"w={w}"
+
+    # w=1 must reproduce the bare control byte for byte, so existing runs are unaffected.
+    assert torch.equal(StokesGalerkinLoss(prob)(u, p, f),
+                       StokesGalerkinLoss(prob, div_weight=1.0)(u, p, f))

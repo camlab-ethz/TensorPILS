@@ -411,22 +411,44 @@ def build_ac_loss(problem: ACProblem, a: float, eps: float, dt: float, discount:
 # ============================== Stokes losses ==============================
 
 class StokesGalerkinLoss(nn.Module):
-    r"""Bare least-squares saddle-point residual ``½‖K c − b‖²`` (no labels).
+    r"""Least-squares saddle-point residual ``½‖(r_mom, w·r_cont)‖²`` (no labels).
 
-    The **negative control**. For the indefinite Stokes operator :math:`\mathcal K` the
-    Gauss--Newton matrix is :math:`J^\top\mathcal K^2 J`, and since :math:`\mathcal K` is
-    symmetric its squared eigenvalues give conditioning :math:`\kappa = O(h^{-4})`. This
-    loss is therefore expected *not* to train — exactly as the bare ``galerkin`` loss
-    stalls for Poisson. It exists so the preconditioned loss has something to beat.
+    The **negative control**, and with ``div_weight`` also the *fair* control for a weighted
+    strong-form baseline.
+
+    With ``div_weight=1`` this is the bare ``½‖Kc − b‖²``. For the indefinite Stokes operator
+    :math:`\mathcal K` the Gauss--Newton matrix is :math:`J^\top\mathcal K^2 J`, and since
+    :math:`\mathcal K` is symmetric its squared eigenvalues give :math:`\kappa = O(h^{-4})`, so
+    it is expected *not* to train — exactly as the bare ``galerkin`` loss stalls for Poisson.
+
+    **Why the weight exists.** The strong-form baseline (:func:`~tensorpils.baselines.pino.
+    stokes_reduce`) carries a continuity weight ``--pi_div_weight`` and tunes it on validation,
+    because momentum and continuity have different units (``div u ~ k u`` against
+    ``f ~ mu k^2 u``). That knob is worth a factor of ~27 to it on the structured benchmark
+    (46.05 % velocity at ``w=1``, 1.73 % at ``w=100``), and an unweighted FEM control is
+    therefore not the comparison a weighted PINO should be read against. Measured here, the two
+    objectives are very nearly the *same function* at ``w=1`` (gradient cosine 0.993 on an
+    untrained FNO) and diverge as ``w`` grows (0.83 at ``w=300``) — so the weight, not the
+    residual's form, is what separates them.
+
+    Note what this weight is: ``½ r^T W r`` with ``W = diag(I, w^2 I)``, a block-diagonal norm
+    weight. It is :class:`StokesPLSLoss`'s ``P`` with the velocity block's ``A^-1`` replaced by
+    the identity and the pressure block's ``diag(M_p)^-1`` by a constant. Sweeping ``w`` here
+    therefore separates what a two-block rescaling buys from what the velocity preconditioner
+    adds on top.
     """
 
-    def __init__(self, problem: StokesProblem):
+    def __init__(self, problem: StokesProblem, div_weight: float = 1.0):
         super().__init__()
         self.problem = problem
+        self.div_weight = float(div_weight)
 
     def forward(self, u_node: torch.Tensor, p_node: torch.Tensor,
                 f_node: torch.Tensor) -> torch.Tensor:
         r = self.problem.residual(u_node, p_node, f_node)
+        if self.div_weight != 1.0:
+            off = self.problem.off_p
+            r = torch.cat([r[..., :off], self.div_weight * r[..., off:]], dim=-1)
         return 0.5 * (r ** 2).sum(dim=-1).mean()          # sum dofs, mean batch
 
 
@@ -520,10 +542,11 @@ class StokesAppliedPLSLoss(nn.Module):
 
 def build_stokes_loss(loss_type: str, problem: StokesProblem,
                       precond: Optional[Preconditioner] = None,
-                      form: str = "weighted", u_scale: float = 1.0, p_scale: float = 1.0):
+                      form: str = "weighted", u_scale: float = 1.0, p_scale: float = 1.0,
+                      div_weight: float = 1.0):
     """Factory for the label-free Stokes criterion.
 
-    ``galerkin`` → bare ``½‖r‖²``. ``pls`` needs a ``precond`` and comes in three forms:
+    ``galerkin`` → ``½‖(r_mom, w·r_cont)‖²`` with ``w = div_weight`` (1 = the bare control). ``pls`` needs a ``precond`` and comes in three forms:
 
     * ``'weighted'`` → ``½ rᵀPr``, for a norm-equivalent block ``P`` (requires ``P`` SPD);
     * ``'applied'`` → ``½‖Pr‖²`` in nodal units, for a monolithic ``P ≈ K⁻¹``;
@@ -535,7 +558,7 @@ def build_stokes_loss(loss_type: str, problem: StokesProblem,
     here.
     """
     if loss_type == "galerkin":
-        return StokesGalerkinLoss(problem)
+        return StokesGalerkinLoss(problem, div_weight=div_weight)
     if loss_type == "pls":
         if precond is None:
             raise ValueError("Stokes loss_type='pls' requires a preconditioner")

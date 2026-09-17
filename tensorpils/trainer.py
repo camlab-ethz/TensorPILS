@@ -974,6 +974,7 @@ class StokesTrainer(BaseTrainer):
         precond_strength: float = 1.0,
         precond_kind: str = "block",
         pls_form: str = "auto",
+        stokes_div_weight: float = 1.0,
         uzawa_pre: int = 4,
         uzawa_post: int = 4,
         cheb_degree: int = 8,
@@ -1031,10 +1032,15 @@ class StokesTrainer(BaseTrainer):
         # pressure-dominated for this dataset (see StokesAppliedPLSLoss).
         self.pls_form = (("applied_fe" if precond_kind == "monolithic" else "weighted")
                          if pls_form == "auto" else pls_form)
+        # The continuity-block weight of the FEM least-squares arm -- the counterpart of the
+        # strong-form baseline's --pi_div_weight, so the two controls can be read against each
+        # other instead of one carrying a tuned knob the other lacks.
+        self.stokes_div_weight = float(stokes_div_weight)
         self.criterion = (None if loss_type == "data"
                           else build_stokes_loss(loss_type, self.problem, precond=self.precond,
                                                  form=self.pls_form,
-                                                 u_scale=self.u_l2_scale, p_scale=self.p_l2_scale))
+                                                 u_scale=self.u_l2_scale, p_scale=self.p_l2_scale,
+                                                 div_weight=self.stokes_div_weight))
         os.makedirs(f"{self.output_dir}/results", exist_ok=True)
 
     def _velocity_precond(self, sweeps: int, device: str):
@@ -1184,6 +1190,8 @@ class StokesTrainer(BaseTrainer):
                 tag += f"-t{self.precond_strength:g}"
             if self.pls_form != "weighted":
                 tag += f"-{self.pls_form}"
+        elif self.loss_type == "galerkin" and self.stokes_div_weight != 1.0:
+            tag = f"_dw{self.stokes_div_weight:g}"
         else:
             tag = ""
         nx, _ = self.grid_size
@@ -1458,6 +1466,8 @@ class UnstructuredStokesTrainer(StokesTrainer):
     # -------------------- bookkeeping --------------------
     def _file_prefix(self) -> str:
         tag = ""
+        if self.loss_type == "galerkin" and self.stokes_div_weight != 1.0:
+            tag = f"_dw{self.stokes_div_weight:g}"
         if self.loss_type == "pls":
             _, pre, _, _ = self.mg_settings
             tag = f"_amg-s{pre}-w{self.schur_omega:g}"
