@@ -61,6 +61,35 @@ A side effect is welcome: the label is now the *discrete* solution the residual 
 so the discretisation floor that separates `data` from `galerkin`/`pls` on analytic labels is
 gone here, exactly as in the `--dataset_solution fem` structured runs.
 
+## How to read the disc-vs-square gap — the square task is 16-dimensional
+
+Measured here, and it reframes the whole table:
+
+| domain | FEM solution outside the span of the `K²=16` sine modes |
+|--------|--------------------------------------------------------:|
+| square `64²` | **0.0000 %** |
+| disc 4205 | **9.65 %** (max 18.0 %) |
+
+On a uniform grid the discrete sines are exact eigenvectors of the `Q1` stiffness **and** mass
+matrices, so `A u = M f` with `f` in the 16-mode span returns `u` in the same span — exactly.
+Fitting the coefficient map directly confirms it is not merely low-dimensional but *diagonal*:
+`‖offdiag‖/‖diag‖ = 1.5e-7` and the linear fit's residual is `1.9e-7`.
+
+So the structured Poisson benchmark is, in the right basis, **a diagonal linear map on 16
+numbers**. A model only has to realise the nodal→spectral transform and back — which is what an
+FNO does natively, and is a large part of why it reaches 0.59 % there. Nothing is wrong with
+that benchmark, but it bounds what it can demonstrate.
+
+On the disc that structure is gone: the sine modes do not satisfy the boundary condition, are
+not eigenvectors of anything, and the solution genuinely leaves their span by ~10 %. The target
+is a richer function class, not a rescaled one.
+
+**Consequence for the table: a disc number is not a degraded square number.** The `data` arm
+going 0.55 % → 1.66 % is mostly the task changing, not the architecture failing — the solution
+norms are within 1.2× of each other (7.4e-3 vs 6.1e-3), so it is not a normalisation artifact
+either. Compare *within* a column. The claim under test is the ordering of the losses, and that
+is exactly the comparison the change of domain leaves intact.
+
 Learning rate is `1e-3` for all three arms, not swept again. Justification, not laziness: the
 structured GAOT lr sweep (`experiments/poisson/gaot_arch/lr_sweep.txt`) found `1e-3` to be an
 **interior** optimum for `data`, `pls` *and* `galerkin` — same architecture, same problem size,

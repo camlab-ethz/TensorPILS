@@ -226,3 +226,47 @@ def test_eval_projects_the_boundary_to_zero():
     bnd = trainer.problem.boundary_mask.bool()
     assert torch.all(projected[:, bnd] == 0)
     assert torch.allclose(projected[:, ~bnd], u[:, ~bnd])
+
+
+# ----------------------------------------------------------------- how to read the two tables
+
+def test_square_target_is_sixteen_dimensional_and_the_disc_target_is_not(mesh, problem):
+    """The structured task is a diagonal linear map on ``K²`` coefficients; the disc task is not.
+
+    This is not a detail — it is how the two tables have to be read. On a uniform grid the
+    discrete sines are exact eigenvectors of both the ``Q1`` stiffness and mass matrices, so a
+    source in the 16-mode span gives a solution in the *same* span, and the whole dataset
+    collapses to 16 scalars. A disc number is therefore not a degraded square number: the
+    function class changed.
+    """
+    import numpy as np
+    from tensormesh.dataset import PoissonMultiFrequency
+    from tensorpils.data import FEMPoissonSolver
+    from tensorpils.meshing import structured_quad_mesh
+
+    K = 4
+    torch.manual_seed(0)
+    a = torch.rand(16, K, K) * 2 - 1
+    eq = PoissonMultiFrequency(a=a, r=-0.5)
+
+    def outside_span(m, prob):
+        pts = m.points
+        f = eq.source_term(pts, domain="rectangle").float()
+        u = FEMPoissonSolver(prob)(f)
+        x, y = pts[:, 0].float(), pts[:, 1].float()
+        modes = torch.stack([torch.sin(np.pi * (i + 1) * x) * torch.sin(np.pi * (j + 1) * y)
+                             for i in range(K) for j in range(K)], dim=1)
+        Mm = prob._spmm(prob.M, modes.T.contiguous()).T
+        G = (modes.T @ Mm).double()
+        c = torch.linalg.solve(G, (Mm.T @ u.T).double()).float()
+        r = u - (modes @ c).T
+        Mr, Mu = prob._spmm(prob.M, r), prob._spmm(prob.M, u)
+        return ((r * Mr).sum(1).clamp(min=0).sqrt()
+                / (u * Mu).sum(1).clamp(min=0).sqrt()).mean().item()
+
+    sq = structured_quad_mesh(nx=32, ny=32)
+    assert outside_span(sq, PoissonProblem(sq)) < 1e-5, (
+        "the square's FEM solution must lie in the 16-mode span exactly")
+    assert outside_span(mesh, problem) > 0.02, (
+        "the disc's FEM solution must leave that span — otherwise the unstructured case tests "
+        "nothing the structured one did not")
