@@ -37,7 +37,8 @@ __all__ = ["BaseTrainer", "Trainer", "PoissonTrainer", "RolloutTrainer",
            "WaveTrainer", "ACTrainer", "StokesTrainer", "TrainingStats",
            "arch_tag", "ArchPrefixMixin",
            "GAOTPoissonTrainer", "GAOTWaveTrainer", "GAOTACTrainer", "GAOTStokesTrainer",
-           "UnstructuredPoissonTrainer", "GAOTUnstructuredPoissonTrainer"]
+           "UnstructuredPoissonTrainer", "GAOTUnstructuredPoissonTrainer",
+           "UnstructuredStokesTrainer", "GAOTUnstructuredStokesTrainer"]
 
 
 #: Model class name -> the tag that goes in a run's file names. ``fno`` is the default so that
@@ -1014,7 +1015,8 @@ class StokesTrainer(BaseTrainer):
                 base = StokesBlockPreconditioner(
                     self.problem, mg_levels=mg_levels, mg_pre_smooth=mg_pre_smooth,
                     mg_post_smooth=mg_post_smooth, mg_omega=mg_omega,
-                    schur_omega=schur_omega).to(device)
+                    schur_omega=schur_omega,
+                    velocity_precond=self._velocity_precond(mg_pre_smooth, device)).to(device)
                 # strength < 1 blends toward the identity: P_t = (1-t)*alpha*I + t*P_block, so t=0
                 # reproduces the bare least-squares loss and t=1 the block preconditioner.
                 self.precond = (base if self.precond_strength >= 1.0
@@ -1034,6 +1036,15 @@ class StokesTrainer(BaseTrainer):
                                                  form=self.pls_form,
                                                  u_scale=self.u_l2_scale, p_scale=self.p_l2_scale))
         os.makedirs(f"{self.output_dir}/results", exist_ok=True)
+
+    def _velocity_precond(self, sweeps: int, device: str):
+        """Operator for the block preconditioner's velocity half.
+
+        ``None`` means "build the geometric V-cycle from the grid", which is the structured
+        case. The unstructured subclass returns an algebraic V-cycle instead — that one
+        substitution is the only part of the block preconditioner that was ever tied to a grid.
+        """
+        return None
 
     # -------------------- prediction --------------------
     def _predict(self, f_grid: torch.Tensor):
@@ -1136,8 +1147,12 @@ class StokesTrainer(BaseTrainer):
             "mu": self.mu,
             "schur_omega": self.schur_omega,
             "K": self.K,
-            "grid": list(self.grid_size),
-            "pgrid": list(self.problem.pgrid_size),
+            # None on an unstructured mesh; the node counts below are what identify it.
+            "grid": list(self.grid_size) if self.grid_size else None,
+            "pgrid": (list(self.problem.pgrid_size)
+                      if self.problem.pgrid_size else None),
+            "n_u": self.problem.n_u, "n_p": self.problem.n_p,
+            "mesh": getattr(self, "mesh_tag", "structured"),
             "n_train": len(self.train_dataset),
             "epochs": self.epochs,
             "precond_strength": self.precond_strength if self.loss_type == "pls" else None,
@@ -1341,3 +1356,129 @@ class UnstructuredPoissonTrainer(PoissonTrainer):
 class GAOTUnstructuredPoissonTrainer(ArchPrefixMixin, UnstructuredPoissonTrainer):
     """The unstructured arm as it is actually run: GAOT is the only architecture here that can
     consume a point cloud, but the prefix tag is kept general so a future one drops in."""
+
+
+class UnstructuredStokesTrainer(StokesTrainer):
+    r"""Taylor-Hood Stokes on an unstructured mesh — no image on either side.
+
+    Subclasses :class:`StokesTrainer` for the same reason the Poisson one does: the optimizer,
+    the schedule, model selection, checkpointing, the results JSON and — decisively — the
+    **evaluation** (per-field relative FE ``L²``, selected on their mean) are the same code as
+    the structured runs, so an unstructured Stokes number is produced by exactly the evaluation
+    that produced the structured table.
+
+    What had to change is small and all of it was grid:
+
+    * ``_predict`` — the model is called through ``forward_nodes`` on the P2 node set and emits
+      three channels there; pressure is gathered at the corner nodes by
+      :meth:`~tensorpils.physics.UnstructuredStokesProblem.from_nodes` instead of read off the
+      ``[::2, ::2]`` subgrid. The two scalings and the two projections are untouched.
+    * ``_velocity_precond`` — an **algebraic** V-cycle on the P2 scalar stiffness replaces the
+      geometric one. This is the only part of the block preconditioner
+      ``P = diag(Â⁻¹/μ, ω μ/diag(M_p))`` that was ever tied to a grid: the pressure half is a
+      lumped diagonal and was always mesh-agnostic.
+    * the loaders' item is ``(f, u, p)`` rather than ``(f_grid, f, u, p)``.
+
+    ``--stokes_precond monolithic`` is **not** available here. That preconditioner's transfer
+    operators are geometric (nested grids for both fields simultaneously), and an algebraic
+    monolithic saddle-point preconditioner is a research question rather than a port. The block
+    form is the arm the structured table's label-free number came from, and it is the one that
+    carries over.
+    """
+
+    mesh_tag = "obstacle"
+
+    def __init__(self, *args, mesh_tag: Optional[str] = None, **kwargs):
+        if kwargs.get("precond_kind") == "monolithic":
+            raise SystemExit(
+                "--stokes_precond monolithic has no unstructured form: its transfer operators "
+                "are geometric (both fields nesting by two on a grid). Use --stokes_precond "
+                "block, whose velocity half becomes an algebraic V-cycle.")
+        super().__init__(*args, **kwargs)
+        if mesh_tag is not None:
+            self.mesh_tag = mesh_tag
+        self.n_nodes = self.problem.n_u
+
+    def _velocity_precond(self, sweeps: int, device: str):
+        """Algebraic V-cycle on the P2 scalar stiffness — the velocity block up to ``mu``."""
+        from .preconditioners import AMGXPreconditioner
+        return AMGXPreconditioner(self.problem.A, self.problem.boundary_mask,
+                                  sweeps=sweeps, device=(device or "cuda:0"))
+
+    # -------------------- prediction --------------------
+    def _predict(self, f_node: torch.Tensor):
+        """``[B, n_u, 2]`` body force → physical ``(u_node [B, n_u, 2], p_node [B, n_p])``.
+
+        The same four fixed steps as the structured trainer — input scaling, pressure scaling,
+        the velocity boundary projection and the pressure gauge — with the grid reshape
+        replaced by a gather. Nothing here is trainable.
+        """
+        out = self.model.forward_nodes(f_node / self.f_scale)          # [B, n_u, 3]
+        u_node, p_node = self.problem.from_nodes(out)
+        return (self.problem.project_velocity_bc(u_node),
+                self.problem.project_pressure_gauge(p_node * self.p_scale))
+
+    # -------------------- train / eval --------------------
+    def train_epoch(self) -> float:
+        self.model.train()
+        total, nb = 0.0, 0
+        for f_node, u_true, p_true in self.train_loader:
+            f_node = f_node.to(self.device)
+            u_true, p_true = u_true.to(self.device), p_true.to(self.device)
+            u_pred, p_pred = self._predict(f_node)
+            loss = (self._data_loss(u_pred, p_pred, u_true, p_true) if self.loss_type == "data"
+                    else self.criterion(u_pred, p_pred, f_node))
+            self.optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            self.optimizer.step()
+            total += loss.item()
+            nb += 1
+        return total / nb
+
+    @torch.no_grad()
+    def _eval_loader(self, loader):
+        """``(sq_err, rel_l2_u, rel_l2_p)`` — the structured tuple, read off nodes."""
+        self.model.eval()
+        sq, n = 0.0, 0
+        nu = du = np_ = dp = 0.0
+        for f_node, u_true, p_true in loader:
+            f_node = f_node.to(self.device)
+            u_true, p_true = u_true.to(self.device), p_true.to(self.device)
+            u_pred, p_pred = self._predict(f_node)
+            eu = self.problem.velocity_l2(u_pred - u_true) ** 2
+            ep = self.problem.pressure_l2(p_pred - p_true) ** 2
+            sq += (eu + ep).sum().item()
+            nu += eu.sum().item()
+            du += (self.problem.velocity_l2(u_true) ** 2).sum().item()
+            np_ += ep.sum().item()
+            dp += (self.problem.pressure_l2(p_true) ** 2).sum().item()
+            n += f_node.shape[0]
+        return (sq / n, math.sqrt(nu / max(du, 1e-30)), math.sqrt(np_ / max(dp, 1e-30)))
+
+    # -------------------- bookkeeping --------------------
+    def _file_prefix(self) -> str:
+        tag = ""
+        if self.loss_type == "pls":
+            _, pre, _, _ = self.mg_settings
+            tag = f"_amg-s{pre}-w{self.schur_omega:g}"
+            if self.pls_form != "weighted":
+                tag += f"-{self.pls_form}"
+        return (f"fno_stokes_{self.loss_type}{tag}_mu{self.mu:g}_"
+                f"{self.mesh_tag}-n{self.n_nodes}_K{self.K}_"
+                f"samples-{len(self.train_dataset)}-{len(self.val_dataset)}-{len(self.test_dataset)}")
+
+    def visualize_sample(self, dataset, split: str, sample_idx: int = 0):
+        suffix = "" if sample_idx == 0 else f"{sample_idx}"
+        viz.visualize_unstructured_stokes_sample(
+            self._predict, dataset, self.problem, self.device, sample_idx,
+            save_path=f"{self.output_dir}/visualization/{self._file_prefix()}_{split}{suffix}.png")
+
+    def compute_error_distribution(self):
+        return viz.compute_unstructured_stokes_error_distribution(
+            self._predict, self.test_dataset, self.problem, self.device,
+            save_path=f"{self.output_dir}/error/{self._file_prefix()}_error_dist.png")
+
+
+class GAOTUnstructuredStokesTrainer(ArchPrefixMixin, UnstructuredStokesTrainer):
+    """The unstructured Stokes arm as it is run: GAOT is the only architecture here that can
+    consume a point cloud and emit three fields on it."""

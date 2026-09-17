@@ -1,0 +1,31 @@
+# Stage 2 -- the unstructured Stokes table. 3 arms x 3 seeds.
+#
+#     clsubmit experiments/stokes/unstructured/sweep.txt
+#     python   experiments/stokes/unstructured/compare.py
+#
+# Identical to experiments/stokes/stokes_paper/stokes_benchmark except for the domain, the mesh
+# and the preconditioner's velocity half: K=10, 1024/128/256, 500 epochs, batch 32, Adam.
+# Learning rates are the structured study's picks (data 3e-4, pls 1e-3) and omega is its pick
+# (256) -- UPDATE THEM from stage 1 before reading anything into the table.
+#
+# The two baselines of the structured table are absent by construction, not by choice: PINO
+# takes finite differences on an image and PI-DeepONet's branch is a fixed sensor grid. That
+# absence is the result, and the structured comparison is what makes it one -- keep both tables.
+#
+# SUBMITTING FROM A COMPUTE NODE: see lr_sweep.txt.
+
+#!time 04:00:00
+#!profile gpu1
+
+# name                  profile  command
+uns-st-data-s42       -        python -m tensorpils.cli --pde stokes --mesh obstacle --mesh_h 0.035 --mesh_cache /cluster/scratch/shiwen/TensorPILS_cache/meshes/obst_h0.035.msh --model gaot -k 10 --n_train 1024 --n_val 128 --n_test 256 --epochs 500 --batch_size 32 --optimizer adam --lr_min 1e-6 --device cuda --no_checkpoint --loss data --lr 3e-4 --seed 42 --output_dir output/stokes/unstructured/seed42
+uns-st-data-s43       -        python -m tensorpils.cli --pde stokes --mesh obstacle --mesh_h 0.035 --mesh_cache /cluster/scratch/shiwen/TensorPILS_cache/meshes/obst_h0.035.msh --model gaot -k 10 --n_train 1024 --n_val 128 --n_test 256 --epochs 500 --batch_size 32 --optimizer adam --lr_min 1e-6 --device cuda --no_checkpoint --loss data --lr 3e-4 --seed 43 --output_dir output/stokes/unstructured/seed43
+uns-st-data-s44       -        python -m tensorpils.cli --pde stokes --mesh obstacle --mesh_h 0.035 --mesh_cache /cluster/scratch/shiwen/TensorPILS_cache/meshes/obst_h0.035.msh --model gaot -k 10 --n_train 1024 --n_val 128 --n_test 256 --epochs 500 --batch_size 32 --optimizer adam --lr_min 1e-6 --device cuda --no_checkpoint --loss data --lr 3e-4 --seed 44 --output_dir output/stokes/unstructured/seed44
+
+uns-st-pls-s42        -        python -m tensorpils.cli --pde stokes --mesh obstacle --mesh_h 0.035 --mesh_cache /cluster/scratch/shiwen/TensorPILS_cache/meshes/obst_h0.035.msh --model gaot -k 10 --n_train 1024 --n_val 128 --n_test 256 --epochs 500 --batch_size 32 --optimizer adam --lr_min 1e-6 --device cuda --no_checkpoint --loss pls --stokes_precond block --schur_omega 256 --lr 1e-3 --seed 42 --output_dir output/stokes/unstructured/seed42
+uns-st-pls-s43        -        python -m tensorpils.cli --pde stokes --mesh obstacle --mesh_h 0.035 --mesh_cache /cluster/scratch/shiwen/TensorPILS_cache/meshes/obst_h0.035.msh --model gaot -k 10 --n_train 1024 --n_val 128 --n_test 256 --epochs 500 --batch_size 32 --optimizer adam --lr_min 1e-6 --device cuda --no_checkpoint --loss pls --stokes_precond block --schur_omega 256 --lr 1e-3 --seed 43 --output_dir output/stokes/unstructured/seed43
+uns-st-pls-s44        -        python -m tensorpils.cli --pde stokes --mesh obstacle --mesh_h 0.035 --mesh_cache /cluster/scratch/shiwen/TensorPILS_cache/meshes/obst_h0.035.msh --model gaot -k 10 --n_train 1024 --n_val 128 --n_test 256 --epochs 500 --batch_size 32 --optimizer adam --lr_min 1e-6 --device cuda --no_checkpoint --loss pls --stokes_precond block --schur_omega 256 --lr 1e-3 --seed 44 --output_dir output/stokes/unstructured/seed44
+
+uns-st-galerkin-s42   -        python -m tensorpils.cli --pde stokes --mesh obstacle --mesh_h 0.035 --mesh_cache /cluster/scratch/shiwen/TensorPILS_cache/meshes/obst_h0.035.msh --model gaot -k 10 --n_train 1024 --n_val 128 --n_test 256 --epochs 500 --batch_size 32 --optimizer adam --lr_min 1e-6 --device cuda --no_checkpoint --loss galerkin --lr 1e-3 --seed 42 --output_dir output/stokes/unstructured/seed42
+uns-st-galerkin-s43   -        python -m tensorpils.cli --pde stokes --mesh obstacle --mesh_h 0.035 --mesh_cache /cluster/scratch/shiwen/TensorPILS_cache/meshes/obst_h0.035.msh --model gaot -k 10 --n_train 1024 --n_val 128 --n_test 256 --epochs 500 --batch_size 32 --optimizer adam --lr_min 1e-6 --device cuda --no_checkpoint --loss galerkin --lr 1e-3 --seed 43 --output_dir output/stokes/unstructured/seed43
+uns-st-galerkin-s44   -        python -m tensorpils.cli --pde stokes --mesh obstacle --mesh_h 0.035 --mesh_cache /cluster/scratch/shiwen/TensorPILS_cache/meshes/obst_h0.035.msh --model gaot -k 10 --n_train 1024 --n_val 128 --n_test 256 --epochs 500 --batch_size 32 --optimizer adam --lr_min 1e-6 --device cuda --no_checkpoint --loss galerkin --lr 1e-3 --seed 44 --output_dir output/stokes/unstructured/seed44

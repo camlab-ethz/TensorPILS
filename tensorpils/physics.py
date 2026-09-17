@@ -799,14 +799,18 @@ class UnstructuredStokesProblem(StokesProblem):
     # ------------------------------------------------------------------ readers
     @property
     def grid_size(self):
-        raise AttributeError(
-            "an unstructured Stokes problem has no velocity grid; use from_nodes() and the "
-            "mesh's points. (This raises on purpose: a silent reshape here would apply the "
-            "FEM operator to a permuted field.)")
+        """``None`` — there is no velocity grid. Use :meth:`from_nodes`.
+
+        ``None`` rather than a raise so the shared trainer ``__init__`` still runs, and
+        ``None`` rather than a plausible pair so that anything which *did* try to reshape
+        fails immediately instead of silently applying the FEM operator to a permuted field.
+        """
+        return None
 
     @property
     def pgrid_size(self):
-        raise AttributeError("an unstructured Stokes problem has no pressure grid")
+        """``None`` — there is no pressure grid."""
+        return None
 
     def from_nodes(self, out_nodes: torch.Tensor):
         """Model output ``[B, n_u, 3]`` -> ``(u_node [B, n_u, 2], p_node [B, n_p])``.

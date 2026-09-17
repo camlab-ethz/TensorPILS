@@ -16,7 +16,9 @@ __all__ = ["plot_loss_curve", "visualize_sample", "compute_error_distribution",
            "visualize_rollout_sample", "compute_rollout_error_distribution",
            "visualize_data_trajectory",
            "visualize_stokes_sample", "compute_stokes_error_distribution",
-           "visualize_unstructured_sample", "compute_unstructured_error_distribution"]
+           "visualize_unstructured_sample", "compute_unstructured_error_distribution",
+           "visualize_unstructured_stokes_sample",
+           "compute_unstructured_stokes_error_distribution"]
 
 
 def _log_yscale(ax, values):
@@ -553,3 +555,106 @@ def compute_unstructured_error_distribution(predict, test_dataset, problem, devi
     print(f"  saved -> {save_path}")
     print("=" * 50 + "\n")
     return median, errs
+
+
+def _tri_from_mesh(mesh, node_ids=None):
+    """Triangulation of a ``triangle6`` mesh, optionally restricted to its corner (P1) nodes."""
+    import matplotlib.tri as mtri
+    import numpy as np
+    pts = mesh.points.cpu().numpy()
+    conn = mesh.cells["triangle6"].cpu().numpy()[:, :3]        # corners carry the P1 space
+    if node_ids is None:
+        return mtri.Triangulation(pts[:, 0], pts[:, 1], conn)
+    ids = node_ids.cpu().numpy()
+    local = np.searchsorted(ids, conn)
+    return mtri.Triangulation(pts[ids, 0], pts[ids, 1], local)
+
+
+@torch.no_grad()
+def visualize_unstructured_stokes_sample(predict, dataset, problem, device, sample_idx: int,
+                                         save_path: str):
+    """Six panels on the mesh: velocity magnitude (reference / predicted / error) and pressure.
+
+    Drawn on the real triangulation, so the obstacle is a hole in the picture rather than a
+    region of small values — which is the difference this experiment exists to show. The
+    velocity panels use the P2 triangulation and the pressure ones the P1 corner sub-mesh,
+    because those are the spaces the two fields actually live in.
+    """
+    import numpy as np
+
+    f_node, u_true, p_true = dataset[sample_idx]
+    u_pred, p_pred = predict(f_node.unsqueeze(0).to(device))
+    u_pred, p_pred = u_pred[0].cpu().numpy(), p_pred[0].cpu().numpy()
+    u_true, p_true = u_true.cpu().numpy(), p_true.cpu().numpy()
+
+    tri_u = _tri_from_mesh(dataset.mesh)
+    tri_p = _tri_from_mesh(dataset.mesh, problem.p_node_ids)
+
+    mag = lambda v: np.hypot(v[..., 0], v[..., 1])
+    mu_t, mu_p = mag(u_true), mag(u_pred)
+    eu, ep = np.abs(mu_p - mu_t), np.abs(p_pred - p_true)
+    ru = np.linalg.norm(u_pred - u_true) / np.linalg.norm(u_true) * 100
+    rp = np.linalg.norm(p_pred - p_true) / np.linalg.norm(p_true) * 100
+    vlo, vhi = float(min(mu_t.min(), mu_p.min())), float(max(mu_t.max(), mu_p.max()))
+    plo, phi = float(min(p_true.min(), p_pred.min())), float(max(p_true.max(), p_pred.max()))
+
+    fig, ax = plt.subplots(2, 3, figsize=(16, 9))
+    panels = [
+        (ax[0, 0], tri_u, mu_t, "reference $|u|$", "viridis", vlo, vhi),
+        (ax[0, 1], tri_u, mu_p, "predicted $|u|$", "viridis", vlo, vhi),
+        (ax[0, 2], tri_u, eu, f"$||u|-|u^\\star||$   (rel $L^2$ = {ru:.2f}%)", "hot", None, None),
+        (ax[1, 0], tri_p, p_true, "reference $p$", "RdBu_r", plo, phi),
+        (ax[1, 1], tri_p, p_pred, "predicted $p$", "RdBu_r", plo, phi),
+        (ax[1, 2], tri_p, ep, f"$|p-p^\\star|$   (rel $L^2$ = {rp:.2f}%)", "hot", None, None),
+    ]
+    for a, tri, v, title, cmap, lo, hi in panels:
+        tpc = a.tripcolor(tri, v, shading="gouraud", cmap=cmap, vmin=lo, vmax=hi)
+        fig.colorbar(tpc, ax=a, fraction=0.046)
+        a.set_title(title, fontsize=11)
+        a.set_aspect("equal")
+        a.set_xticks([]); a.set_yticks([])
+    plt.suptitle(f"Stokes on an unstructured mesh with an obstacle — "
+                 f"{problem.n_u} P2 / {problem.n_p} P1 nodes, sample #{sample_idx}")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200, bbox_inches="tight"); plt.close()
+    print(f"Visualization -> {save_path}")
+
+
+@torch.no_grad()
+def compute_unstructured_stokes_error_distribution(predict, test_dataset, problem, device,
+                                                   save_path: str, batch_size: int = 32):
+    """Per-sample relative FE ``L²`` for both fields. Returns ``(median_u, errs_u, errs_p)``."""
+    import numpy as np
+    eu, ep = [], []
+    for start in range(0, len(test_dataset), batch_size):
+        items = [test_dataset[i] for i in range(start, min(start + batch_size,
+                                                           len(test_dataset)))]
+        f = torch.stack([it[0] for it in items]).to(device)
+        ut = torch.stack([it[1] for it in items]).to(device)
+        pt = torch.stack([it[2] for it in items]).to(device)
+        up, pp = predict(f)
+        eu.extend((problem.velocity_l2(up - ut)
+                   / problem.velocity_l2(ut).clamp_min(1e-30) * 100).cpu().tolist())
+        ep.extend((problem.pressure_l2(pp - pt)
+                   / problem.pressure_l2(pt).clamp_min(1e-30) * 100).cpu().tolist())
+    eu, ep = np.array(eu), np.array(ep)
+
+    fig, ax = plt.subplots(1, 2, figsize=(12, 4.5))
+    for a, e, name, color in ((ax[0], eu, "velocity", "#3498db"),
+                              (ax[1], ep, "pressure", "#9b59b6")):
+        a.hist(e, bins=30, color=color, edgecolor="white", alpha=0.85)
+        a.axvline(np.median(e), color="#e74c3c", ls="--", lw=2,
+                  label=f"median {np.median(e):.2f}%")
+        a.axvline(e.mean(), color="#2ecc71", ls="-.", lw=2, label=f"mean {e.mean():.2f}%")
+        a.set_xlabel(f"{name} relative FE $L^2$ (%)"); a.set_ylabel("count")
+        a.set_title(f"{name} error distribution"); a.legend(); a.grid(alpha=0.3)
+    plt.tight_layout(); plt.savefig(save_path, dpi=200, bbox_inches="tight"); plt.close()
+
+    print("\n" + "=" * 50)
+    print("Test set error distribution (unstructured Stokes, relative FE L2)")
+    print(f"  n        : {len(eu)}")
+    print(f"  velocity : median {np.median(eu):.4f}%   mean {eu.mean():.4f}% +- {eu.std():.4f}")
+    print(f"  pressure : median {np.median(ep):.4f}%   mean {ep.mean():.4f}% +- {ep.std():.4f}")
+    print(f"  saved -> {save_path}")
+    print("=" * 50 + "\n")
+    return float(np.median(eu)), eu, ep

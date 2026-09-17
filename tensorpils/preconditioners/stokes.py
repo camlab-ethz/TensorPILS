@@ -57,13 +57,24 @@ class StokesBlockPreconditioner(Preconditioner):
 
     def __init__(self, problem, mg_levels: int = 4, mg_pre_smooth: int = 2,
                  mg_post_smooth: int = 2, mg_omega: float = 2.0 / 3.0,
-                 schur_omega: float = 0.5):
+                 schur_omega: float = 0.5, velocity_precond=None):
+        """``velocity_precond`` replaces the geometric V-cycle for the velocity block.
+
+        The block preconditioner is mesh-agnostic *except* for that one operator: everything
+        else here is ``mu``, the DOF offsets and a lumped diagonal. On an unstructured mesh
+        there is no grid hierarchy to build, so the caller passes an algebraic V-cycle
+        (:class:`~tensorpils.preconditioners.AMGXPreconditioner` on the scalar velocity
+        stiffness) and the rest of the block structure is unchanged. Anything implementing
+        ``[B, n_u] -> [B, n_u]`` works; it must be SPD, since ``P`` is used as a *norm*.
+        """
         super().__init__()
-        nx, ny = problem.grid_size
-        self.mg = GeometricMultigrid(
-            nx_fine=nx, ny_fine=ny, n_levels=mg_levels,
-            pre_smooth=mg_pre_smooth, post_smooth=mg_post_smooth, omega=mg_omega,
-        )
+        if velocity_precond is None:
+            nx, ny = problem.grid_size
+            velocity_precond = GeometricMultigrid(
+                nx_fine=nx, ny_fine=ny, n_levels=mg_levels,
+                pre_smooth=mg_pre_smooth, post_smooth=mg_post_smooth, omega=mg_omega,
+            )
+        self.mg = velocity_precond
         self.mu = float(problem.mu)
         self.schur_omega = float(schur_omega)
         self.n_u = problem.n_u
@@ -89,9 +100,14 @@ class StokesBlockPreconditioner(Preconditioner):
         return out.squeeze(0) if squeeze else out
 
     def report(self) -> None:
-        print(f"[stokes block precond] P = diag(mg/mu, {self.schur_omega:g}*mu/diag(M_p))  "
-              f"mu={self.mu:g}  n_levels={self.mg.n_levels}  "
-              f"pre/post={self.mg.pre_smooth}/{self.mg.post_smooth}  dims={self.mg.dims}")
+        kind = type(self.mg).__name__
+        detail = (f"n_levels={self.mg.n_levels}  "
+                  f"pre/post={self.mg.pre_smooth}/{self.mg.post_smooth}  dims={self.mg.dims}"
+                  if isinstance(self.mg, GeometricMultigrid) else f"velocity block: {kind}")
+        print(f"[stokes block precond] P = diag(A^-1/mu, {self.schur_omega:g}*mu/diag(M_p))  "
+              f"mu={self.mu:g}  {detail}")
+        if not isinstance(self.mg, GeometricMultigrid) and hasattr(self.mg, "report"):
+            self.mg.report()
 
 
 class StokesBlendPreconditioner(Preconditioner):

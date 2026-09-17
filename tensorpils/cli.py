@@ -18,13 +18,15 @@ import torch
 
 from .data import (create_datasets, create_scaling_datasets, PoissonDataset,
                    create_wave_datasets, create_ac_datasets, create_stokes_datasets,
-                   create_unstructured_datasets)
+                   create_unstructured_datasets,
+                   create_unstructured_stokes_datasets)
 from .models import FNOModel
 from .gaot import GAOTModel
 from .trainer import (PoissonTrainer, WaveTrainer, ACTrainer, StokesTrainer,
                       GAOTPoissonTrainer, GAOTWaveTrainer, GAOTACTrainer,
                       GAOTStokesTrainer, UnstructuredPoissonTrainer,
-                      GAOTUnstructuredPoissonTrainer)
+                      GAOTUnstructuredPoissonTrainer, UnstructuredStokesTrainer,
+                      GAOTUnstructuredStokesTrainer)
 from .baselines import (DeepONetModel, MollifiedModel, ZeroBoundaryModel,
                         PINOPoissonTrainer, PINOACTrainer, PINOStokesTrainer,
                         PIDeepONetPoissonTrainer, PIDeepONetACTrainer, PIDeepONetStokesTrainer,
@@ -249,17 +251,27 @@ def build_parser() -> ArgumentParser:
     p.add_argument("--grid_resolution", type=int, default=64)
 
     # -------- domain / mesh (Poisson only) --------
-    p.add_argument("--mesh", choices=["square", "circle"], default="square",
+    p.add_argument("--mesh", choices=["square", "circle", "obstacle"], default="square",
                    help="Computational domain. 'square' is the structured grid every result so "
                         "far used. 'circle' is an UNSTRUCTURED Gmsh triangulation of the "
                         "inscribed disc: no image, so it needs --model gaot, and no grid "
                         "hierarchy, so a preconditioned loss needs --precond_kind amg. Labels "
                         "are forced to the FEM solve -- the closed form is only zero on the "
-                        "square's boundary.")
+                        "square's boundary. 'obstacle' is the Stokes counterpart: a rectangle "
+                        "with a circular hole, meshed P2/P1 Taylor-Hood on triangles -- the "
+                        "canonical benchmark shape, and a curved boundary no grid resolves.")
     p.add_argument("--mesh_h", type=float, default=0.015,
                    help="Gmsh target edge length for --mesh circle. 0.015 gives ~4200 nodes, "
                         "the node budget of the 64^2 structured grid, so the two are "
                         "comparable in problem size.")
+    p.add_argument("--obstacle", choices=["circle", "square"], default="circle",
+                   help="--mesh obstacle: hole shape. A curved hole is the interesting case; "
+                        "'square' is the polygonal control.")
+    p.add_argument("--obstacle_center", type=float, nargs=2, default=[0.40, 0.50],
+                   help="--mesh obstacle: hole centre. Off-centre by default -- a centred hole "
+                        "makes the solution inherit the domain's symmetry.")
+    p.add_argument("--obstacle_radius", type=float, default=0.14,
+                   help="--mesh obstacle: hole radius (or half-width for the square).")
     p.add_argument("--mesh_cache", type=str, default=None,
                    help="Cache the generated mesh here so a sweep does not re-run Gmsh per job.")
 
@@ -592,6 +604,8 @@ def run_ac(args, device):
 
 
 def run_stokes(args, device):
+    if args.mesh == "obstacle":
+        return _run_stokes_unstructured(args, device)
     if args.loss not in ("data", "galerkin", "pls", "pino", "pideeponet"):
         raise SystemExit(f"--pde stokes supports --loss data|galerkin|pls|pino|pideeponet, "
                          f"got {args.loss!r}")
@@ -681,6 +695,63 @@ def run_stokes(args, device):
                    else GAOTStokesTrainer)(**common)
     else:
         trainer = StokesTrainer(**common)
+    _run(trainer, train_ds, test_ds, args)
+
+
+def _run_stokes_unstructured(args, device):
+    """``--pde stokes --mesh obstacle``: Taylor-Hood P2/P1 on a triangulation with a hole.
+
+    Separate from ``run_stokes`` for the same reason the Poisson one is separate: the grid
+    diagnostics, the monolithic preconditioner and the two strong-form baselines all assume an
+    image and none of them applies. What is shared is everything that decides comparability --
+    the source distribution, the operator, the losses, the optimizer and the per-field
+    evaluation -- because none of those looked at the grid.
+    """
+    print(f"loss        : {args.loss}")
+    print(f"domain      : rectangle with a {args.obstacle} hole at "
+          f"({args.obstacle_center[0]:g}, {args.obstacle_center[1]:g}) r={args.obstacle_radius:g}; "
+          f"unstructured P2/P1, chara_length={args.mesh_h}")
+    if args.loss == "pls":
+        print(f"precond     : block, velocity half = ALGEBRAIC V-cycle  "
+              f"(schur_omega={args.schur_omega:g})")
+    print("reference   : discrete Taylor-Hood solve of K c = (M_u f, 0) (batched sparse, float64)")
+    _print_common(args, device)
+
+    print("Building datasets (Gmsh P2 mesh + one sparse factorisation for the references)...")
+    train_ds, val_ds, test_ds = create_unstructured_stokes_datasets(
+        n_train=args.n_train, n_val=args.n_val, n_test=args.n_test, K=args.k,
+        chara_length=args.mesh_h, mu=args.stokes_mu, r=args.stokes_r,
+        ref_chunk=args.stokes_ref_chunk, normalize=not args.stokes_no_normalize,
+        obstacle=args.obstacle, cx=args.obstacle_center[0], cy=args.obstacle_center[1],
+        radius=args.obstacle_radius, seed=args.seed, cache_path=args.mesh_cache,
+    )
+    print(f"  train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}, "
+          f"velocity(P2) nodes={train_ds.n_u}, pressure(P1) nodes={train_ds.n_p}  "
+          f"(structured reference: {args.grid_resolution}^2 = {args.grid_resolution ** 2} / "
+          f"{((args.grid_resolution + 1) // 2) ** 2})\n")
+
+    # f = (f_x, f_y) in, (u_x, u_y, p) out -- all three on the P2 node set; the pressure
+    # channel is gathered at the corner nodes, which is the unstructured analogue of the
+    # structured [::2, ::2] read.
+    model = _build_model(args, in_channels=2, out_channels=3,
+                         coords=train_ds.mesh.points.float())
+    trainer_cls = (GAOTUnstructuredStokesTrainer if args.model == "gaot"
+                   else UnstructuredStokesTrainer)
+    trainer = trainer_cls(
+        model=model,
+        train_dataset=train_ds, val_dataset=val_ds, test_dataset=test_ds,
+        loss_type=args.loss,
+        optimizer_name=args.optimizer,
+        lr=args.lr, lr_min=args.lr_min, weight_decay=args.weight_decay,
+        batch_size=args.batch_size, epochs=args.epochs,
+        device=device, output_dir=args.output_dir,
+        mg_levels=args.mg_levels, mg_pre_smooth=args.mg_pre_smooth,
+        mg_post_smooth=args.mg_post_smooth, mg_omega=args.mg_omega,
+        schur_omega=args.schur_omega, precond_strength=args.stokes_precond_strength,
+        precond_kind=args.stokes_precond, pls_form=args.stokes_pls_form,
+        uzawa_pre=args.uzawa_pre, uzawa_post=args.uzawa_post,
+        cheb_degree=args.cheb_degree, cheb_ratio=args.cheb_ratio,
+    )
     _run(trainer, train_ds, test_ds, args)
 
 
@@ -896,6 +967,25 @@ def _validate_mesh_args(args):
     geometric V-cycle builds without complaint and then dies on a shape mismatch at its first
     apply, and analytic labels would not fail at all -- they would just be wrong.
     """
+    if args.mesh == "obstacle":
+        if args.pde != "stokes":
+            raise SystemExit(f"--mesh obstacle is the Stokes domain; use --pde stokes "
+                             f"(got {args.pde!r}). For unstructured Poisson use --mesh circle.")
+        if args.model != "gaot":
+            raise SystemExit(
+                f"--mesh obstacle has no grid, so the model must consume a point cloud: use "
+                f"--model gaot (got {args.model!r}).")
+        if args.loss not in ("data", "galerkin", "pls"):
+            raise SystemExit(f"--mesh obstacle supports --loss data|galerkin|pls (got "
+                             f"{args.loss!r}); the PINO / PI-DeepONet baselines take finite "
+                             f"differences on an image, which is the point.")
+        if args.loss == "pls" and args.stokes_precond != "block":
+            raise SystemExit(
+                f"--mesh obstacle needs --stokes_precond block (got {args.stokes_precond!r}). "
+                f"The monolithic V-cycle's transfer operators are geometric -- both fields "
+                f"nesting by two on a grid -- and have no unstructured form. The block "
+                f"preconditioner's velocity half becomes an algebraic V-cycle instead.")
+        return
     if args.mesh != "circle":
         return
     if args.pde != "poisson":

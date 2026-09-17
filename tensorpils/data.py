@@ -21,14 +21,16 @@ from torch.utils.data import Dataset, IterableDataset
 from tensormesh.dataset import PoissonMultiFrequency, WaveMultiFrequency
 
 from .meshing import (structured_quad_mesh, structured_quad9_mesh, circle_mesh,
-                      node_to_grid)
-from .physics import PoissonProblem, WaveProblem, ACProblem, StokesProblem
+                      obstacle_mesh, node_to_grid)
+from .physics import (PoissonProblem, WaveProblem, ACProblem, StokesProblem,
+                      UnstructuredStokesProblem)
 
 __all__ = ["FEMPoissonSolver", "PoissonDataset", "StreamingPoissonDataset", "create_datasets",
            "UnstructuredPoissonDataset", "create_unstructured_datasets",
            "create_scaling_datasets", "WaveDataset", "create_wave_datasets",
            "ACDataset", "create_ac_datasets",
-           "StokesDataset", "create_stokes_datasets", "stokes_body_force"]
+           "StokesDataset", "create_stokes_datasets", "stokes_body_force",
+           "UnstructuredStokesDataset", "create_unstructured_stokes_datasets"]
 
 
 SOLUTION_MODES = ("analytic", "fem")
@@ -846,4 +848,150 @@ def create_stokes_datasets(n_train: int, n_val: int, n_test: int,
             num_samples=total, K=K, seed=seed, grid_resolution=grid_resolution,
             mu=mu, r=r, mesh=mesh, problem=problem, all_data=all_data, indices=indices,
         )
+    return _make(train_idx), _make(val_idx), _make(test_idx)
+
+
+class UnstructuredStokesDataset(Dataset):
+    r"""Taylor-Hood Stokes on an **unstructured** mesh — the same problem, no image.
+
+    Item: ``(f_node [n_u, 2], u_node [n_u, 2], p_node [n_p])``. The grid form
+    :class:`StokesDataset` also carries is simply absent, which is the point: this is the
+    dataset an FNO cannot consume and :class:`~tensorpils.gaot.GAOTModel` can.
+
+    Everything that made the structured dataset work is reused verbatim, because none of it
+    looked at the grid:
+
+    * the source, :func:`stokes_body_force` — a pointwise sine series, defined wherever the
+      nodes are, needing only that they lie in :math:`[0,1]^2`;
+    * the reference, :meth:`~tensorpils.physics.StokesProblem.fem_reference` — a batched sparse
+      float64 solve of the assembled ``K``, which zeroes exactly the training residual
+      (measured 4.4e-06 relative on this mesh, against 6.7e-06 structured);
+    * the three scalings — per-sample normalisation to unit velocity FE-``L²``, plus the
+      network-facing ``f_scale`` / ``p_scale`` constants. Stokes is linear, so one constant per
+      sample is exact, and the physics still fixes the other two magnitudes.
+
+    There was never a manufactured solution here, so unlike the Poisson disc nothing has to be
+    given up: the structured Stokes labels were already the discrete solve.
+
+    Parameters
+    ----------
+    num_samples, K, seed, mu, r, ref_chunk, normalize : as :class:`StokesDataset`.
+    chara_length : float
+        Gmsh target edge length. ``0.035`` gives ~4000 P2 / ~1035 P1 nodes on the default
+        obstacle geometry, against the structured benchmark's ``65² = 4225`` / ``33² = 1089``.
+    obstacle, cx, cy, radius : geometry, see :func:`~tensorpils.meshing.obstacle_mesh`.
+    """
+
+    def __init__(
+        self,
+        num_samples: int = 512,
+        K: int = 10,
+        seed: int = 42,
+        chara_length: float = 0.035,
+        mu: float = 1.0,
+        r: float = -0.5,
+        ref_chunk: int = 64,
+        normalize: bool = True,
+        obstacle: str = "circle",
+        cx: float = 0.40,
+        cy: float = 0.50,
+        radius: float = 0.14,
+        mesh=None,
+        problem: Optional[UnstructuredStokesProblem] = None,
+        all_data: Optional[dict] = None,
+        indices: Optional[List[int]] = None,
+        cache_path: Optional[str] = None,
+    ):
+        super().__init__()
+        self.K = K
+        self.mu = mu
+        self.r = r
+        self.chara_length = chara_length
+        # No grid, and nothing downstream may pretend otherwise.
+        self.grid_size = None
+        self.pgrid_size = None
+
+        if all_data is not None:
+            self.mesh = mesh
+            self.problem = problem
+            sel = list(indices) if indices is not None else list(range(len(all_data["u"])))
+            self.f = all_data["f"][sel]
+            self.u = all_data["u"][sel]
+            self.p = all_data["p"][sel]
+            self._all_data = all_data
+        else:
+            torch.manual_seed(seed)
+            self.mesh = mesh if mesh is not None else obstacle_mesh(
+                chara_length=chara_length, order=2, obstacle=obstacle,
+                cx=cx, cy=cy, r=radius, cache_path=cache_path)
+            self.problem = problem if problem is not None else \
+                UnstructuredStokesProblem(self.mesh, mu=mu)
+
+            coeffs = torch.rand(num_samples, 2, K, K) * 2 - 1
+            f = stokes_body_force(coeffs, self.mesh.points, r=r).float()   # [num, n_u, 2]
+
+            solve_dev = "cuda" if torch.cuda.is_available() else "cpu"
+            prob = self.problem.to(solve_dev)
+            u, p = prob.fem_reference(f.to(solve_dev), chunk=ref_chunk)
+            self.problem = prob.to("cpu")
+            f, u, p = f.cpu(), u.cpu(), p.cpu()
+
+            if normalize:
+                scale = self.problem.velocity_l2(u).clamp_min(1e-30)
+                f = f / scale[:, None, None]
+                u = u / scale[:, None, None]
+                p = p / scale[:, None]
+
+            self.f, self.u, self.p = f, u, p
+            self._all_data = {
+                "f": f, "u": u, "p": p, "coeffs": coeffs,
+                "f_scale": _rms(f), "p_scale": _rms(p),
+                "u_l2_scale": float(self.problem.velocity_l2(u).pow(2).mean().sqrt()),
+                "p_l2_scale": float(self.problem.pressure_l2(p).pow(2).mean().sqrt()),
+            }
+
+        self.f_scale = float(self._all_data["f_scale"])
+        self.p_scale = float(self._all_data["p_scale"])
+        self.u_l2_scale = float(self._all_data["u_l2_scale"])
+        self.p_l2_scale = float(self._all_data["p_l2_scale"])
+        self.n_u = self.problem.n_u
+        self.n_p = self.problem.n_p
+
+    def __len__(self):
+        return len(self.f)
+
+    def __getitem__(self, idx):
+        return self.f[idx], self.u[idx], self.p[idx]
+
+    def get_shared_resources(self):
+        return self.mesh, self.problem, self._all_data
+
+
+def create_unstructured_stokes_datasets(n_train: int, n_val: int, n_test: int,
+                                        K: int = 10, chara_length: float = 0.035,
+                                        mu: float = 1.0, r: float = -0.5,
+                                        ref_chunk: int = 64, normalize: bool = True,
+                                        obstacle: str = "circle", cx: float = 0.40,
+                                        cy: float = 0.50, radius: float = 0.14,
+                                        seed: int = 42, cache_path: Optional[str] = None):
+    """Train/val/test over one mesh, one problem and one pool (one factorisation for all)."""
+    total = n_train + (n_val if n_val > 0 else 0) + (n_test if n_test > 0 else 0)
+    base = UnstructuredStokesDataset(
+        num_samples=total, K=K, seed=seed, chara_length=chara_length, mu=mu, r=r,
+        ref_chunk=ref_chunk, normalize=normalize, obstacle=obstacle, cx=cx, cy=cy,
+        radius=radius, cache_path=cache_path)
+    mesh, problem, all_data = base.get_shared_resources()
+
+    train_idx = list(range(n_train))
+    val_idx = list(range(n_train, n_train + n_val)) if n_val > 0 else train_idx
+    if n_test > 0:
+        start = n_train + (n_val if n_val > 0 else 0)
+        test_idx = list(range(start, start + n_test))
+    else:
+        test_idx = train_idx
+
+    def _make(indices):
+        return UnstructuredStokesDataset(
+            num_samples=total, K=K, seed=seed, chara_length=chara_length, mu=mu, r=r,
+            mesh=mesh, problem=problem, all_data=all_data, indices=indices)
     return _make(train_idx), _make(val_idx), _make(test_idx)
