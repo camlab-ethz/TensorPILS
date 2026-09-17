@@ -85,7 +85,7 @@ not eigenvectors of anything, and the solution genuinely leaves their span by ~1
 is a richer function class, not a rescaled one.
 
 **Consequence for the table: a disc number is not a degraded square number.** The `data` arm
-going 0.55 % → 1.66 % is mostly the task changing, not the architecture failing — the solution
+going 0.55 % → 1.61 % is mostly the task changing, not the architecture failing — the solution
 norms are within 1.2× of each other (7.4e-3 vs 6.1e-3), so it is not a normalisation artifact
 either. Compare *within* a column. The claim under test is the ordering of the losses, and that
 is exactly the comparison the change of domain leaves intact.
@@ -124,18 +124,42 @@ python   experiments/poisson/unstructured/compare.py    # table + figure, vs the
 From a compute node `clsubmit` runs the sweep **in place** instead of submitting (see the note
 in the sweep file).
 
-## Result (2026-09-17, `gaot-model` @ 5006f9f)
+## Correction, 2026-09-17
+
+The numbers first recorded here were computed against a **broken boundary mask** and have been
+withdrawn. `Mesh.gen_circle` builds `is_boundary` from the exact float comparison `radius == r`,
+which misses every node Gmsh places an ULP off the circle: **37 of 210** on this mesh, sitting
+5.6e-17 to 1.1e-16 off the radius. Unmarked means *free*, so the Dirichlet condition was never
+imposed there and the reference solved a different problem — correcting the mask moves the FEM
+labels by **2.76 % mean / 6.38 % max** in FEM relative L2, and the old labels reached
+`|u| = 5.2e-3` on those nodes against an interior peak of `3.1e-2`, i.e. 17 % of the peak where
+the boundary condition says 0. The label error was larger than the 1.65 % those runs reported,
+so none of them stood. They are kept under `output/poisson/unstructured/superseded/`.
+
+`meshing.circle_mesh` now replaces the generator's mask with `meshing.topological_boundary_mask`
+(boundary facet cells), and `test_boundary_mask_is_topological_not_coordinate_based` keeps it
+replaced. The Stokes obstacle mesh was never affected — `obstacle_mesh` built its mask this way
+from the start (verified against facet incidence: 284 nodes, 0 missed, 0 extra).
+
+Found by the `TensorMesh-fix` session while fixing the upstream bugs reported from here; it also
+corrected the diagnosis. What I had called an ordering-dependent *mixed P2/P1 assembly* is two
+separate things, and the assembly itself is correct: (a) this mask bug, and (b) an order-2 mesh
+loaded with `reorder=False` has permuted edge nodes (Gmsh `[e01,e12,e20]` vs TensorMesh
+`[e12,e20,e01]`) and is wrong for **any** order-2 computation. Both are fixed in
+[camlab-ethz/TensorMesh#58](https://github.com/camlab-ethz/TensorMesh/pull/58).
+
+## Result (2026-09-17, corrected mask)
 
 Test relative L2 (FEM norm), mean over seeds 42/43/44, GAOT throughout:
 
 | loss | square `64²` | disc 4205 |
 |------|-------------:|----------:|
-| `data` (supervised) | 0.55 % (0.51–0.61) | 1.66 % (1.61–1.68) |
-| `pls` (preconditioned residual) | 0.61 % (0.56–0.71) | **1.65 %** (1.61–1.71) |
-| `galerkin` (bare residual) | 37.57 % (35.64–40.16) | 73.59 % (57.71–94.37) |
+| `data` (supervised) | 0.55 % (0.51–0.61) | 1.61 % (1.59–1.65) |
+| `pls` (preconditioned residual) | 0.61 % (0.56–0.71) | **1.58 %** (1.53–1.62) |
+| `galerkin` (bare residual) | 37.57 % (35.64–40.16) | 78.88 % (56.60–92.28) |
 
 **The ranking transfers, and on the disc the label-free arm is not merely competitive — it ties
-the supervised one.** `pls` 1.65 % against `data` 1.66 %, with overlapping seed ranges, while
+the supervised one.** `pls` 1.58 % against `data` 1.61 %, with overlapping seed ranges, while
 the bare residual is 45× worse. That is the claim this repo is about, now demonstrated on a
 domain with no grid, a mesh with no structure and a preconditioner built from nothing but the
 matrix.
