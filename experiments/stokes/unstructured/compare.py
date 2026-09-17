@@ -50,6 +50,13 @@ LOSSES = [
     ("$L_\\mathrm{LS}$ (bare residual)",
      f"{_SQ}/diagnostics/galerkin/*/results/fno_stokes_galerkin_mu1_gr65_K10_*.json",
      f"{_UN}/seed*/results/gaot_stokes_galerkin_mu1_obstacle-n*_K10_*.json", "tab:orange"),
+    # The physics-informed baseline that CAN follow off the grid: its residual is autodiff
+    # through a coordinate trunk, not a finite-difference stencil. PINO has no unstructured
+    # row at all, which is the point -- but an absent competitor proves nothing, so this one
+    # is what makes the unstructured column a comparison.
+    ("PI-DeepONet (strong form, autodiff)",
+     f"{_SQ}/final/pideeponet/*/seed*/results/deeponet_stokes_pi-*_mu1_gr65_K10_*.json",
+     f"{_UN}/seed*/results/deeponet_stokes_pi-*_mu1_obstacle-n*_K10_*.json", "tab:purple"),
 ]
 MESHES = [("square", 1, dict(ls="--", lw=1.4)), ("obstacle", 2, dict(ls="-", lw=1.8))]
 LR_GLOB = "output/stokes/unstructured/lr/*/results/gaot_stokes_*.json"

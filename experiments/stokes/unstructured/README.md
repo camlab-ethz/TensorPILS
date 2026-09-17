@@ -106,8 +106,36 @@ Test relative FE-``L²``, mean ± sd over seeds 42/43/44. GAOT on the obstacle, 
 | `data` (supervised) | 2.85 ± 0.21 / 2.81 ± 0.21 % | 3.27 ± 0.13 / 1.79 ± 0.15 % |
 | `pls` (preconditioned) | 2.38 ± 0.27 / 1.69 ± 0.23 % | **1.55 ± 0.17 / 0.85 ± 0.04 %** |
 | `galerkin` (bare residual) | 31.27 ± 9.64 / 10.92 ± 2.30 % | 30.56 ± 1.28 / 11.40 ± 0.83 % |
+| PI-DeepONet (strong form, autodiff) | 32.99 ± 1.09 / 34.25 ± 1.37 % | 44.44 ± 4.02 / 35.09 ± 1.08 % |
+| PINO (strong form, finite differences) | 2.09 ± 0.26 / 1.50 ± 0.24 % | **not applicable** |
 
-(PINO, for the square where it exists: 2.09 ± 0.26 / 1.50 ± 0.24 %.)
+**The unstructured column has a physics-informed competitor, and that is deliberate.** PINO's
+residual is a finite-difference stencil and does not exist on this mesh, but "the baseline
+cannot run here" proves nothing on its own — it invites the reading that the venue was chosen to
+exclude it. PI-DeepONet differentiates the same strong form by autodiff through a coordinate
+trunk, so it *can* follow, and it is 29× behind the label-free FEM arm (44.4 % against 1.55 %).
+That is the capability claim with a competitor in it rather than an empty chair.
+
+Its knobs did transfer, unlike `pls`'s: stage 1 on this mesh re-picked the structured study's
+own choice (lr 1e-4, continuity weight 100) — 41.75 % at that cell against 80.89 % at `w=1`,
+100.0 % at lr 3e-4 and 99.99 % at `w=1000`. The BC is `--pideeponet_bc zero`, a relative
+velocity penalty at the mesh's boundary nodes; an autodiff Laplacian at an interior collocation
+point cannot see a mask, which is why the structured arm needs the penalty too. The mollifier is
+refused here — no closed form vanishes on both boundary components of a domain with a hole.
+
+**On the structured PINO number.** Re-run at its selected settings to confirm from data, not
+from reading the code, that it imposes the BC by boundary *zeroing* and not by a mollifier:
+velocity 1.90 / 1.87 / 2.35 % against the archived 1.97 / 1.89 / 2.40 %. It does — there is no
+mollifier path for Stokes at all (`cli.py` skips the hard-BC wrapper when `pde == "stokes"`, and
+`PINOStokesTrainer._predict` zeroes the velocity ring itself). The *Poisson* archived runs are a
+different story: those are mollified, and the mollifier is worth 24× there.
+
+**And on what that 2.09 % actually measures.** The FEM `galerkin` control is *unweighted* while
+PINO carries a tuned continuity weight (`--pi_div_weight 300`). At `w=1` PINO scores 46.05 %
+velocity — worse than the unweighted FEM control's 31.27 % — and the gradient cosine between the
+two objectives is 0.993 at `w=1`, falling to 0.83 at `w=300`. So the two are very nearly the
+same objective and the weight, not the residual's form, separates them. `--stokes_div_weight`
+now gives the FEM arm the same knob; see `experiments/stokes/galerkin_divweight/`.
 
 **Read down a column.** The two domains are different problems with different reference
 solutions, so the cross-column numbers are not a like-for-like error — what transfers, or fails
