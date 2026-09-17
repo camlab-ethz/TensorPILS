@@ -1,0 +1,30 @@
+# Why is the FD (PINO) residual so much better than the FEM bare residual on the structured grid?
+#
+# It should not be. Measured at two points in parameter space with the same FNO and the same
+# hard-BC wrapper, the two losses are the SAME FUNCTION up to a constant:
+#
+#     cosine(grad 0.5||Au-Mf||^2 , grad mean(-Lap_h u - f)^2) = 1.000000
+#     ratio of losses and of gradient norms                   = 8.357e3, identical at both points
+#
+# Adam is invariant to a global loss scale, so at the same learning rate and the same model they
+# must train identically. The historical gap (galerkin 27.52 % vs pino 0.46 %, both at lr 1e-3)
+# therefore has to come from a configuration difference, and the only one left is the MODEL
+# WRAPPER: --mollify auto turns the hard-BC wrapper ON for pino/pideeponet and OFF for our arms.
+# The FEM residual projects u to zero on the boundary internally, so the loss and its gradient
+# should be unaffected -- that is the assumption this tests.
+#
+# A vs B isolates the wrapper.  B vs C isolates the operator (FEM vs FD) with everything else
+# held fixed.  150 epochs is enough: the gap being explained is 60x.
+
+#!time 01:00:00
+#!profile gpu1
+
+# name             profile  command
+fdfem-A-gal-nowrap -        python -m tensorpils.cli --pde poisson --model fno --grid_resolution 64 --n_train 1024 --n_val 128 --n_test 256 -k 4 --epochs 150 --batch_size 32 --seed 42 --optimizer adam --lr 1e-3 --lr_min 1e-6 --device cuda --no_checkpoint --loss galerkin --mollify off --output_dir output/poisson/fd_vs_fem/A_galerkin_nowrap
+fdfem-B-gal-wrap   -        python -m tensorpils.cli --pde poisson --model fno --grid_resolution 64 --n_train 1024 --n_val 128 --n_test 256 -k 4 --epochs 150 --batch_size 32 --seed 42 --optimizer adam --lr 1e-3 --lr_min 1e-6 --device cuda --no_checkpoint --loss galerkin --mollify on --pino_bc zero --output_dir output/poisson/fd_vs_fem/B_galerkin_wrap
+fdfem-C-pino-mse   -        python -m tensorpils.cli --pde poisson --model fno --grid_resolution 64 --n_train 1024 --n_val 128 --n_test 256 -k 4 --epochs 150 --batch_size 32 --seed 42 --optimizer adam --lr 1e-3 --lr_min 1e-6 --device cuda --no_checkpoint --loss pino --pino_reduction mse --mollify on --pino_bc zero --output_dir output/poisson/fd_vs_fem/C_pino_mse
+
+# D: the same FD operator as C, the same lr, the same budget -- only the reduction changes, from
+# mean(r^2) to PINO's relative NORM ||r||/||f||. A/B/C already showed the operator is not the
+# variable; this is what isolates the reduction.
+fdfem-D-pino-rel   -        python -m tensorpils.cli --pde poisson --model fno --grid_resolution 64 --n_train 1024 --n_val 128 --n_test 256 -k 4 --epochs 150 --batch_size 32 --seed 42 --optimizer adam --lr 1e-3 --lr_min 1e-6 --device cuda --no_checkpoint --loss pino --pino_reduction rel --mollify on --pino_bc zero --output_dir output/poisson/fd_vs_fem/D_pino_rel

@@ -1,0 +1,21 @@
+# Confirm the structured Stokes PINO arm imposes the BC by boundary ZEROING, not a mollifier.
+#
+# The code says it always did and that there is no mollifier path for Stokes at all:
+#   cli.py   'if mollify and args.pde != "stokes"'  -- Stokes never gets a hard-BC wrapper
+#   PINOStokesTrainer._predict  'u = out[:, :2] * self._vel_mask'  -- zeroes the velocity ring,
+#   and its docstring calls this "the Stokes form of --pino_bc zero".
+# Reading the code is what produced two wrong diagnoses earlier in this session, so this
+# re-runs the arm at its selected settings (lr 3e-3, continuity weight 300, 3 seeds) and
+# compares against the archived numbers:  u = 1.97 / 1.89 / 2.40 %,  p = 1.31 / 1.41 / 1.79 %.
+# Matching those confirms the archived table needs no correction; not matching means it does.
+#
+# See memory 'mollifier-baseline-fairness': baselines impose the zero Dirichlet BC the way our
+# own arms do, and any mollified number is a separately labelled control.
+
+#!time 04:00:00
+#!profile gpu1
+
+# name                profile  command
+stpino-zbc-s42        -        python -m tensorpils.cli --pde stokes -k 10 --grid_resolution 65 --n_train 1024 --n_val 128 --n_test 256 --epochs 500 --batch_size 32 --optimizer adam --lr 3e-3 --lr_min 1e-6 --device cuda --no_checkpoint --model fno --loss pino --pi_div_weight 300 --seed 42 --output_dir output/stokes/pino_zerobc/seed42
+stpino-zbc-s43        -        python -m tensorpils.cli --pde stokes -k 10 --grid_resolution 65 --n_train 1024 --n_val 128 --n_test 256 --epochs 500 --batch_size 32 --optimizer adam --lr 3e-3 --lr_min 1e-6 --device cuda --no_checkpoint --model fno --loss pino --pi_div_weight 300 --seed 43 --output_dir output/stokes/pino_zerobc/seed43
+stpino-zbc-s44        -        python -m tensorpils.cli --pde stokes -k 10 --grid_resolution 65 --n_train 1024 --n_val 128 --n_test 256 --epochs 500 --batch_size 32 --optimizer adam --lr 3e-3 --lr_min 1e-6 --device cuda --no_checkpoint --model fno --loss pino --pi_div_weight 300 --seed 44 --output_dir output/stokes/pino_zerobc/seed44

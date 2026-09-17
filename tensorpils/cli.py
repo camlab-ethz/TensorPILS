@@ -30,7 +30,8 @@ from .trainer import (PoissonTrainer, WaveTrainer, ACTrainer, StokesTrainer,
 from .baselines import (DeepONetModel, MollifiedModel, ZeroBoundaryModel,
                         PINOPoissonTrainer, PINOACTrainer, PINOStokesTrainer,
                         PIDeepONetPoissonTrainer, PIDeepONetACTrainer, PIDeepONetStokesTrainer,
-                        DeepONetPoissonTrainer, DeepONetACTrainer, DeepONetStokesTrainer)
+                        DeepONetPoissonTrainer, DeepONetACTrainer, DeepONetStokesTrainer,
+                        PIDeepONetUnstructuredStokesTrainer)
 
 
 def build_parser() -> ArgumentParser:
@@ -734,9 +735,15 @@ def _run_stokes_unstructured(args, device):
     # channel is gathered at the corner nodes, which is the unstructured analogue of the
     # structured [::2, ::2] read.
     model = _build_model(args, in_channels=2, out_channels=3,
-                         coords=train_ds.mesh.points.float())
-    trainer_cls = (GAOTUnstructuredStokesTrainer if args.model == "gaot"
-                   else UnstructuredStokesTrainer)
+                         coords=train_ds.mesh.points.float(), train_ds=train_ds)
+    if args.loss == "pideeponet":
+        trainer_cls = PIDeepONetUnstructuredStokesTrainer
+        extra = dict(n_colloc=args.pi_n_colloc, pi_reduction=args.pino_reduction,
+                     lambda_bc_pi=args.pi_lambda_bc, div_weight=args.pi_div_weight)
+    else:
+        trainer_cls = (GAOTUnstructuredStokesTrainer if args.model == "gaot"
+                       else UnstructuredStokesTrainer)
+        extra = {}
     trainer = trainer_cls(
         model=model,
         train_dataset=train_ds, val_dataset=val_ds, test_dataset=test_ds,
@@ -751,6 +758,7 @@ def _run_stokes_unstructured(args, device):
         precond_kind=args.stokes_precond, pls_form=args.stokes_pls_form,
         uzawa_pre=args.uzawa_pre, uzawa_post=args.uzawa_post,
         cheb_degree=args.cheb_degree, cheb_ratio=args.cheb_ratio,
+        **extra,
     )
     _run(trainer, train_ds, test_ds, args)
 
@@ -848,11 +856,18 @@ def _build_model(args, in_channels: int, out_channels: int = 1, train_ds=None,
         # Stokes: the hard BC (either mechanism) acts on the velocity pair only; the pressure
         # has a gauge, not a boundary condition, and the trainer fixes it by projection.
         bc_channels = (0, 1) if args.pde == "stokes" else None
+        # An unstructured sensor set: the branch is an MLP over flattened sensor values and
+        # never knew they were on a grid, and the trunk was always coordinate-based. The hard-BC
+        # mechanisms are grid-shaped, so on a mesh the BC is the loss's boundary penalty.
+        unstructured = coords is not None
         cfg = dict(grid_size=(nx, ny), in_channels=in_channels, p=args.deeponet_p,
                    width=args.deeponet_width, depth=args.deeponet_depth,
                    trunk_fourier=args.trunk_fourier, fourier_scale=args.trunk_fourier_scale,
-                   f_scale=f_scale, mollify=mollify_don, zero_boundary=zero_bc,
-                   out_channels=out_channels, bc_channels=bc_channels, seed=args.seed)
+                   f_scale=f_scale,
+                   mollify=False if unstructured else mollify_don,
+                   zero_boundary=False if unstructured else zero_bc,
+                   out_channels=out_channels, bc_channels=bc_channels, seed=args.seed,
+                   coords=coords)
         model = DeepONetModel(**cfg)
         print(f"  DeepONet  p={args.deeponet_p} width={args.deeponet_width} "
               f"depth={args.deeponet_depth} fourier={args.trunk_fourier}"
@@ -971,14 +986,27 @@ def _validate_mesh_args(args):
         if args.pde != "stokes":
             raise SystemExit(f"--mesh obstacle is the Stokes domain; use --pde stokes "
                              f"(got {args.pde!r}). For unstructured Poisson use --mesh circle.")
-        if args.model != "gaot":
+        if args.loss == "pideeponet":
+            # The one physics-informed baseline that CAN follow off the grid: its residual is
+            # taken by autodiff through a coordinate trunk, not by a finite-difference stencil.
+            if args.model != "deeponet":
+                raise SystemExit("--loss pideeponet differentiates through the trunk's "
+                                 "coordinate input, so it needs --model deeponet.")
+            if args.pideeponet_bc != "zero":
+                raise SystemExit(
+                    "--mesh obstacle requires --pideeponet_bc zero. The mollifier has no "
+                    "closed form vanishing on both boundary components of a domain with a "
+                    "hole, and a mollified number is a separately labelled control in this "
+                    "project, not a table row.")
+        elif args.model != "gaot":
             raise SystemExit(
                 f"--mesh obstacle has no grid, so the model must consume a point cloud: use "
-                f"--model gaot (got {args.model!r}).")
-        if args.loss not in ("data", "galerkin", "pls"):
-            raise SystemExit(f"--mesh obstacle supports --loss data|galerkin|pls (got "
-                             f"{args.loss!r}); the PINO / PI-DeepONet baselines take finite "
-                             f"differences on an image, which is the point.")
+                f"--model gaot (got {args.model!r}), or --model deeponet with "
+                f"--loss pideeponet.")
+        if args.loss not in ("data", "galerkin", "pls", "pideeponet"):
+            raise SystemExit(f"--mesh obstacle supports --loss data|galerkin|pls|pideeponet "
+                             f"(got {args.loss!r}); PINO takes finite differences on an image, "
+                             f"which is the point.")
         if args.loss == "pls" and args.stokes_precond != "block":
             raise SystemExit(
                 f"--mesh obstacle needs --stokes_precond block (got {args.stokes_precond!r}). "

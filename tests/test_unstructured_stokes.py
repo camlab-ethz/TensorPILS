@@ -225,3 +225,58 @@ def test_monolithic_preconditioner_is_refused():
     with pytest.raises(SystemExit, match="geometric"):
         UnstructuredStokesTrainer(model=None, train_dataset=None, val_dataset=None,
                                   test_dataset=None, precond_kind="monolithic")
+
+
+# ----------------------------------------------------------------- the baseline that follows
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="matches the other trainer test")
+def test_pi_deeponet_runs_on_the_mesh(mesh):
+    """The autodiff residual works off the grid, which is why PI-DeepONet is the baseline that
+    can follow and PINO is not.
+
+    PINO's residual is a finite-difference stencil and simply does not exist here. This one
+    differentiates through a coordinate trunk, so it is defined at any point of any mesh — and
+    reporting it is what makes the unstructured table a comparison rather than a walkover.
+    """
+    from tensorpils.baselines import DeepONetModel, PIDeepONetUnstructuredStokesTrainer
+    from tensorpils.data import create_unstructured_stokes_datasets
+
+    tr, va, te = create_unstructured_stokes_datasets(
+        n_train=4, n_val=2, n_test=2, K=6, chara_length=0.09, seed=0)
+    torch.manual_seed(0)
+    model = DeepONetModel(grid_size=(65, 65), in_channels=2, out_channels=3, p=16, width=32,
+                          depth=3, trunk_fourier=16, bc_channels=(0, 1),
+                          coords=tr.mesh.points.float())
+    assert model.grid_size is None
+    with pytest.raises(RuntimeError, match="forward_at"):
+        model(torch.randn(1, 2, 65, 65))
+
+    trainer = PIDeepONetUnstructuredStokesTrainer(
+        model=model, train_dataset=tr, val_dataset=va, test_dataset=te,
+        batch_size=2, epochs=1, device="cuda", n_colloc=64, lambda_bc_pi=0.1,
+        output_dir="/tmp/tensorpils_pidon_unstructured_test")
+    trainer.save_checkpoints = False
+    assert np.isfinite(trainer.train_epoch())
+    assert np.isfinite(trainer.validate())
+    assert "obstacle-n" in trainer._file_prefix()
+
+
+def test_unstructured_deeponet_branch_reads_node_sensors():
+    """``[B, N, C]`` mesh sensors must not be mistaken for an unbatched ``[C, H, W]`` image.
+
+    The two are both 3-D, so the sensor set the model was built on has to decide; getting it
+    wrong flattens the batch into one branch input and the shapes happen to line up often enough
+    to be missed.
+    """
+    from tensorpils.baselines import DeepONetModel
+
+    torch.manual_seed(0)
+    pts = torch.rand(40, 2)
+    m = DeepONetModel(grid_size=(9, 9), in_channels=2, out_channels=3, p=8, width=16, depth=2,
+                      trunk_fourier=0, coords=pts)
+    out = m.forward_at(torch.randn(5, 40, 2), pts)
+    assert out.shape == (5, 40, 3), "the branch collapsed the batch"
+    # Different samples must give different outputs -- the batch really is carried through.
+    f = torch.randn(2, 40, 2)
+    o = m.forward_at(f, pts)
+    assert not torch.allclose(o[0], o[1])

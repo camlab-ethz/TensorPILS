@@ -19,6 +19,7 @@ import torch
 
 from ..meshing import grid_to_node, node_to_grid
 from ..trainer import (PoissonTrainer, ACTrainer, StokesTrainer,
+                       UnstructuredStokesTrainer,
                        arch_tag as _arch_tag, ArchPrefixMixin as _ArchPrefixMixin)
 from .pino import PINOPoissonLoss, PINOACLoss, PINOStokesLoss, boundary_mask_grid
 from .pi_deeponet import (PIDeepONetPoissonLoss, PIDeepONetACLoss, PIDeepONetStokesLoss,
@@ -26,7 +27,8 @@ from .pi_deeponet import (PIDeepONetPoissonLoss, PIDeepONetACLoss, PIDeepONetSto
 
 __all__ = ["PINOPoissonTrainer", "PINOACTrainer", "PINOStokesTrainer",
            "PIDeepONetPoissonTrainer", "PIDeepONetACTrainer", "PIDeepONetStokesTrainer",
-           "DeepONetPoissonTrainer", "DeepONetACTrainer", "DeepONetStokesTrainer"]
+           "DeepONetPoissonTrainer", "DeepONetACTrainer", "DeepONetStokesTrainer",
+           "PIDeepONetUnstructuredStokesTrainer"]
 
 
 def _detach_coupling(bptt_mode):
@@ -459,3 +461,88 @@ class PIDeepONetStokesTrainer(StokesTrainer):
                 f"gr{nx}_K{self.K}_samples-{len(self.train_dataset)}-{len(self.val_dataset)}-"
                 f"{len(self.test_dataset)}")
 
+
+
+class PIDeepONetUnstructuredStokesTrainer(UnstructuredStokesTrainer):
+    r"""PI-DeepONet on an unstructured mesh — the physics-informed baseline that *can* follow.
+
+    PINO's residual is a finite-difference stencil and does not exist off a grid. An **autodiff**
+    residual does: the trunk consumes a coordinate, so the strong-form Stokes operator can be
+    differentiated at any point of any mesh. That makes this the honest comparison for the
+    unstructured table — the alternative is an absent competitor, which proves nothing.
+
+    Nothing in :class:`~tensorpils.baselines.pi_deeponet.PIDeepONetStokesLoss` had to change: it
+    already took ``(model, f, coords, f_at_coords, bc_coords)`` and never looked at a grid. What
+    changes here is only where those points come from — the mesh's own interior and boundary
+    nodes instead of a grid's — and that the model is queried through ``forward_at`` rather than
+    reshaped.
+
+    The boundary condition follows ``--pideeponet_bc zero``: a **relative penalty** on the
+    velocity at the mesh's boundary nodes. It cannot be a mask, because an autodiff Laplacian at
+    an interior collocation point is blind to one — the same reason the structured arm needs it.
+    The mollifier is deliberately not offered: on a mesh with a hole there is no closed-form
+    ansatz vanishing on both boundary components, and per the project's standing decision a
+    mollified number is a separately labelled control rather than a table row.
+    """
+
+    def __init__(self, *args, n_colloc: int = 0, pi_reduction: str = "rel",
+                 lambda_bc_pi: float = 0.0, div_weight: float = 1.0, **kwargs):
+        kwargs["loss_type"] = "data"
+        super().__init__(*args, **kwargs)
+        self.loss_type = "pideeponet"
+        self.n_colloc = n_colloc
+        self.pi_reduction = pi_reduction
+        self.lambda_bc = float(lambda_bc_pi)
+        self.div_weight = float(div_weight)
+        self.criterion = PIDeepONetStokesLoss(mu=self.mu, reduction=pi_reduction, p=2,
+                                              div_weight=div_weight, lambda_bc=self.lambda_bc,
+                                              p_scale=self.p_scale)
+        if not hasattr(self.model, "forward_at"):
+            raise TypeError("--loss pideeponet needs a coordinate-queryable model "
+                            "(--model deeponet)")
+        dev = self.model.grid_coords.device
+        bmask = self.problem.boundary_mask
+        self._interior_idx = (~bmask).nonzero(as_tuple=False).squeeze(1).to(dev)
+        self._bc_coords = self.model.grid_coords[bmask.nonzero(as_tuple=False).squeeze(1).to(dev)]
+
+    def _predict(self, f_node: torch.Tensor):
+        """``[B, n_u, 2]`` -> physical ``(u, p)``, queried at the mesh's own nodes.
+
+        The same four fixed steps as every other Stokes arm — input scaling, pressure scaling,
+        the velocity boundary projection and the pressure gauge — so evaluation is identical to
+        the arms this is compared against.
+        """
+        coords = self.model.grid_coords
+        out = self.model.forward_at(f_node / self.f_scale, coords)        # [B, n_u, 3]
+        u_node, p_node = self.problem.from_nodes(out)
+        return (self.problem.project_velocity_bc(u_node),
+                self.problem.project_pressure_gauge(p_node * self.p_scale))
+
+    def train_epoch(self) -> float:
+        self.model.train()
+        total, nb = 0.0, 0
+        for f_node, _, _ in self.train_loader:
+            f_node = f_node.to(self.device)
+            coords, idx = _interior_colloc(self.model, self._interior_idx, self.n_colloc,
+                                           f_node.shape[0])
+            f_at = f_node[:, idx]                                          # [B, Q, 2]
+            bc = self._bc_coords if self.lambda_bc > 0.0 else None
+            loss = self.criterion(self.model, f_node / self.f_scale, coords, f_at, bc_coords=bc)
+            self.optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            self.optimizer.step()
+            total += loss.item()
+            nb += 1
+        return total / nb
+
+    def _velocity_precond(self, sweeps: int, device: str):
+        """No preconditioner: this arm never builds one."""
+        return None
+
+    def _file_prefix(self) -> str:
+        ctag = "" if not self.n_colloc else f"-c{self.n_colloc}"
+        btag = f"-zbc{self.lambda_bc:g}" if self.lambda_bc > 0.0 else ""
+        dtag = "" if self.div_weight == 1.0 else f"-dw{self.div_weight:g}"
+        return (f"deeponet_stokes_pi-{self.pi_reduction}{ctag}{btag}{dtag}_mu{self.mu:g}_"
+                f"{self.mesh_tag}-n{self.n_nodes}_K{self.K}_"
+                f"samples-{len(self.train_dataset)}-{len(self.val_dataset)}-{len(self.test_dataset)}")

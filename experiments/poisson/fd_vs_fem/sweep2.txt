@@ -1,0 +1,21 @@
+# E and F close out the two candidates left after A-D.
+#
+#   A galerkin, no wrapper, lr 1e-3   56.10 %
+#   B galerkin, zero-BC wrapper       56.10 %   -> the wrapper is not a variable
+#   C pino, mse reduction, zero-BC    54.23 %   -> the OPERATOR is not a variable (FD == FEM)
+#   D pino, rel reduction, zero-BC    15.43 %   -> the reduction is worth ~3.5x, not 60x
+#
+# The benchmark's PINO reports 0.46 %, so 15.43 % is still 30x short. Two candidates remain:
+#   E the MOLLIFIER instead of boundary zeroing. CLAUDE.md warns it injects a sin(pi x)sin(pi y)
+#     decay profile close to this dataset's own solution structure -- information our arms do
+#     not get. It was the default before --pino_bc zero replaced it, so the archived benchmark
+#     runs may predate the change.
+#   F the learning rate 3e-3, which is what the poisson_paper lr sweep selected for PINO.
+
+#!time 01:00:00
+#!profile gpu1
+
+# name             profile  command
+fdfem-E-mollifier  -        python -m tensorpils.cli --pde poisson --model fno --grid_resolution 64 --n_train 1024 --n_val 128 --n_test 256 -k 4 --epochs 150 --batch_size 32 --seed 42 --optimizer adam --lr_min 1e-6 --device cuda --no_checkpoint --lr 1e-3 --loss pino --pino_reduction rel --mollify on --pino_bc mollifier --output_dir output/poisson/fd_vs_fem/E_pino_rel_mollifier
+fdfem-F-lr3e-3     -        python -m tensorpils.cli --pde poisson --model fno --grid_resolution 64 --n_train 1024 --n_val 128 --n_test 256 -k 4 --epochs 150 --batch_size 32 --seed 42 --optimizer adam --lr_min 1e-6 --device cuda --no_checkpoint --lr 3e-3 --loss pino --pino_reduction rel --mollify on --pino_bc zero --output_dir output/poisson/fd_vs_fem/F_pino_rel_lr3e-3
+fdfem-G-gal-lr3e-3 -        python -m tensorpils.cli --pde poisson --model fno --grid_resolution 64 --n_train 1024 --n_val 128 --n_test 256 -k 4 --epochs 150 --batch_size 32 --seed 42 --optimizer adam --lr_min 1e-6 --device cuda --no_checkpoint --lr 3e-3 --loss galerkin --mollify off --output_dir output/poisson/fd_vs_fem/G_galerkin_lr3e-3

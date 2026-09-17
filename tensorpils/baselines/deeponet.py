@@ -115,10 +115,16 @@ class DeepONetModel(nn.Module):
                  fourier_scale: float = 4.0, f_scale: float = 1.0,
                  mollify: bool = False, zero_boundary: bool = False,
                  out_channels: int = 1, bc_channels: Optional[Sequence[int]] = None,
-                 seed: int = 0):
+                 seed: int = 0, coords: Optional[torch.Tensor] = None):
         super().__init__()
         nx, ny = grid_size
-        self.grid_size = (nx, ny)
+        self.grid_size = None if coords is not None else (nx, ny)
+        # An UNSTRUCTURED sensor set. The branch is an MLP over flattened sensor values and never
+        # knew they were on a grid, so the only things that change are how many there are and
+        # where the default query points sit. The trunk was always coordinate-based, which is why
+        # a PI-DeepONet -- unlike PINO's finite differences -- carries over to an arbitrary mesh
+        # at all. The grid ``forward`` is withdrawn; ``forward_at`` is the whole interface here.
+        self.coords_given = coords is not None
         self.in_channels = in_channels
         self.out_channels = int(out_channels)
         self.p = p
@@ -137,6 +143,11 @@ class DeepONetModel(nn.Module):
             raise ValueError("mollify and zero_boundary are alternative hard-BC mechanisms; pick one")
         self.zero_boundary = zero_boundary
         if zero_boundary:
+            if coords is not None:
+                raise ValueError(
+                    "zero_boundary masks a grid's outer ring and has no unstructured form; on a "
+                    "mesh the BC is the loss's boundary penalty (--pideeponet_bc zero) evaluated "
+                    "at the mesh's own boundary nodes.")
             # Registered only when used, so checkpoints of mollified / plain models keep their
             # exact state_dict keys.
             mask = torch.ones(ny, nx)
@@ -148,7 +159,8 @@ class DeepONetModel(nn.Module):
         # p basis functions that share the hidden layers -- the standard "multiple-output
         # DeepONet" split, and for C=1 exactly the original network.
         C = self.out_channels
-        n_sensors = in_channels * nx * ny
+        n_points = coords.shape[0] if coords is not None else nx * ny
+        n_sensors = in_channels * n_points
         self.branch = _mlp([n_sensors] + [width] * (depth - 1) + [C * p])
 
         if trunk_fourier > 0:
@@ -160,18 +172,28 @@ class DeepONetModel(nn.Module):
         self.trunk = _mlp([trunk_in] + [width] * (depth - 1) + [C * p])
         self.bias = nn.Parameter(torch.zeros(C))
 
-        # Grid query coordinates, in the repo's row-major node order (row i -> y, col j -> x),
-        # so reshaping [B, ny*nx] -> [B, ny, nx] lands each value on its own node.
-        xs = torch.linspace(0.0, 1.0, nx)
-        ys = torch.linspace(0.0, 1.0, ny)
-        yy, xx = torch.meshgrid(ys, xs, indexing="ij")
-        self.register_buffer("grid_coords", torch.stack([xx.reshape(-1), yy.reshape(-1)], dim=-1))
+        # Default query coordinates: the mesh's own points when one was given, otherwise the
+        # grid in the repo's row-major node order (row i -> y, col j -> x), so reshaping
+        # [B, ny*nx] -> [B, ny, nx] lands each value on its own node.
+        if coords is not None:
+            self.register_buffer("grid_coords", torch.as_tensor(coords, dtype=torch.float32))
+        else:
+            xs = torch.linspace(0.0, 1.0, nx)
+            ys = torch.linspace(0.0, 1.0, ny)
+            yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+            self.register_buffer("grid_coords",
+                                 torch.stack([xx.reshape(-1), yy.reshape(-1)], dim=-1))
 
     # ------------------------------------------------------------------ core
     def _branch(self, f_grid: torch.Tensor) -> torch.Tensor:
-        """``[B, C, H, W]`` (or ``[C, H, W]``) -> ``[B, p]``."""
-        if f_grid.dim() == 3:
-            f_grid = f_grid.unsqueeze(0)
+        """Sensor values -> ``[B, C*p]``.
+
+        Grid sensors come as ``[B, C, H, W]`` (or ``[C, H, W]`` unbatched); mesh sensors as
+        ``[B, N, C]``. A 3-D tensor is ambiguous between the two, so the sensor set the model
+        was built on decides — anything else silently flattens the batch into the branch input.
+        """
+        if not self.coords_given and f_grid.dim() == 3:
+            f_grid = f_grid.unsqueeze(0)                    # [C, H, W] -> [1, C, H, W]
         return self.branch(f_grid.reshape(f_grid.shape[0], -1) / self.f_scale)
 
     def _trunk(self, coords: torch.Tensor) -> torch.Tensor:
@@ -218,6 +240,10 @@ class DeepONetModel(nn.Module):
 
     def forward(self, f_grid: torch.Tensor) -> torch.Tensor:
         """``[B, C_in, H, W]`` -> ``[B, C_out, H, W]`` — the ``FNOModel``-compatible signature."""
+        if self.grid_size is None:
+            raise RuntimeError(
+                "this DeepONet was built on an unstructured sensor set, which has no grid to "
+                "reshape to; query it with forward_at(f, coords).")
         squeeze = (f_grid.dim() == 3)
         if squeeze:
             f_grid = f_grid.unsqueeze(0)

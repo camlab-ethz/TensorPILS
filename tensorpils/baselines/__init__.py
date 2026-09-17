@@ -26,7 +26,8 @@ from .pi_deeponet import (PIDeepONetPoissonLoss, PIDeepONetACLoss, PIDeepONetSto
                           autodiff_laplacian, autodiff_stokes)
 from .trainers import (PINOPoissonTrainer, PINOACTrainer, PINOStokesTrainer,
                        PIDeepONetPoissonTrainer, PIDeepONetACTrainer, PIDeepONetStokesTrainer,
-                       DeepONetPoissonTrainer, DeepONetACTrainer, DeepONetStokesTrainer)
+                       DeepONetPoissonTrainer, DeepONetACTrainer, DeepONetStokesTrainer,
+                       PIDeepONetUnstructuredStokesTrainer)
 
 __all__ = [
     "MollifiedModel", "ZeroBoundaryModel", "PINOPoissonLoss", "PINOACLoss", "PINOStokesLoss",
@@ -37,4 +38,5 @@ __all__ = [
     "PINOPoissonTrainer", "PINOACTrainer", "PINOStokesTrainer",
     "PIDeepONetPoissonTrainer", "PIDeepONetACTrainer", "PIDeepONetStokesTrainer",
     "DeepONetPoissonTrainer", "DeepONetACTrainer", "DeepONetStokesTrainer",
+    "PIDeepONetUnstructuredStokesTrainer",
 ]
