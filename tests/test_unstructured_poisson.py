@@ -270,3 +270,28 @@ def test_square_target_is_sixteen_dimensional_and_the_disc_target_is_not(mesh, p
     assert outside_span(mesh, problem) > 0.02, (
         "the disc's FEM solution must leave that span — otherwise the unstructured case tests "
         "nothing the structured one did not")
+
+
+def test_boundary_mask_is_topological_not_coordinate_based(mesh):
+    """Every node on a boundary facet must be marked — a coordinate test cannot do this.
+
+    ``Mesh.gen_circle`` builds ``is_boundary`` from ``radius == r``, which misses the nodes Gmsh
+    places an ULP off the circle: 37 of 210 on the disc this repo trains on, sitting 5.6e-17 to
+    1.1e-16 off the radius. Unmarked means *free*, so the Dirichlet condition is not imposed
+    there and nothing raises — the reference simply solves a different problem (the labels move
+    by 2.8 % in FEM relative L², with ``|u|`` reaching 17 % of the interior peak on those nodes).
+    ``circle_mesh`` therefore replaces that mask; this test is what keeps it replaced.
+    """
+    import numpy as np
+    from tensorpils.meshing import topological_boundary_mask
+
+    assert torch.equal(mesh.boundary_mask.bool(), topological_boundary_mask(mesh))
+
+    # ... and the coordinate test the generator uses really is the thing that fails.
+    pts = mesh.points.numpy()
+    r = np.hypot(pts[:, 0] - 0.5, pts[:, 1] - 0.5)
+    marked = mesh.boundary_mask.numpy().astype(bool)
+    exact = r == 0.5
+    assert exact.sum() < marked.sum(), (
+        "exact float equality happens to catch every boundary node on this mesh, so this test "
+        "is not exercising anything; pick a resolution where it does not")

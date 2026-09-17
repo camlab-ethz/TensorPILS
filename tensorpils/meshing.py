@@ -19,7 +19,8 @@ import torch
 from tensormesh import Mesh
 
 __all__ = ["structured_quad_mesh", "structured_quad9_mesh", "circle_mesh",
-           "obstacle_mesh", "node_to_grid", "grid_to_node"]
+           "obstacle_mesh", "topological_boundary_mask",
+           "node_to_grid", "grid_to_node"]
 
 
 def structured_quad_mesh(nx: int = 64, ny: int = 64,
@@ -157,6 +158,37 @@ def grid_to_node(g: torch.Tensor, nx: int, ny: int) -> torch.Tensor:
     return g.reshape(*g.shape[:-2], ny * nx)
 
 
+
+def topological_boundary_mask(mesh) -> torch.Tensor:
+    r"""Boundary nodes from the mesh's **boundary facet cells**, not from coordinates.
+
+    A Gmsh mesh carries its boundary as ``line`` / ``line3`` cells, and a node is on the boundary
+    exactly when some boundary facet uses it. That is a topological fact and it is exact for any
+    geometry.
+
+    This exists because the coordinate test is not. TensorMesh's own generators build
+    ``is_boundary`` with exact equalities — ``points[:, 0] == left``, ``radius == r`` — and on a
+    curved boundary those miss the nodes Gmsh places an ULP off the exact locus. Measured on the
+    disc this repo uses (``chara_length=0.015``): ``gen_circle`` marks **173** of the **210**
+    boundary nodes, the 37 it drops sitting 5.6e-17 to 1.1e-16 off the radius. Those nodes are
+    then *free*, the Dirichlet condition is not imposed there, and nothing raises — the FEM
+    reference simply solves a different problem (measured: labels 2.8 % apart in FEM relative
+    L², and ``|u|`` reaching 17 % of the interior peak on the unconstrained nodes).
+
+    TensorMesh gained ``Mesh.topological_boundary_mask()`` in
+    ``camlab-ethz/TensorMesh#58``; once that is in the installed version this can defer to it.
+    """
+    keys = list(mesh.cells.keys())
+    facet_key = next((k for k in ("line3", "line") if k in keys), None)
+    if facet_key is None:                                    # pragma: no cover
+        raise RuntimeError(
+            f"mesh has no boundary facet cells (has {keys}); cannot identify the Dirichlet "
+            f"nodes topologically. Generate it with a boundary physical group.")
+    mask = torch.zeros(mesh.n_points, dtype=torch.bool)
+    mask[torch.unique(mesh.cells[facet_key].reshape(-1))] = True
+    return mask
+
+
 def circle_mesh(chara_length: float = 0.015, cx: float = 0.5, cy: float = 0.5,
                 r: float = 0.5, cache_path=None) -> Mesh:
     r"""Unstructured triangular mesh of a disc — the first domain the FNO cannot serve.
@@ -196,7 +228,7 @@ def circle_mesh(chara_length: float = 0.015, cx: float = 0.5, cy: float = 0.5,
     non-rectangular domain is silently wrong, and :mod:`tensorpils.cli` refuses it.
     """
     try:
-        return Mesh.gen_circle(chara_length=chara_length, element_type="tri",
+        mesh = Mesh.gen_circle(chara_length=chara_length, element_type="tri",
                                cx=cx, cy=cy, r=r, cache_path=cache_path)
     except OSError as e:                                        # pragma: no cover
         if "libGLU" in str(e):
@@ -207,6 +239,13 @@ def circle_mesh(chara_length: float = 0.015, cx: float = 0.5, cy: float = 0.5,
                 f"subshell, so the change to LD_LIBRARY_PATH is lost. Submitted jobs already "
                 f"get this from the project env file.") from e
         raise
+
+    # REPLACE gen_circle's boundary mask. It is built from `radius == r`, which misses every node
+    # Gmsh places an ULP off the circle -- 37 of 210 at chara_length=0.015. See
+    # topological_boundary_mask for what that costs. Overwriting point_data is not allowed, so
+    # the mask goes on under the name PoissonProblem reads first.
+    mesh.point_data["is_boundary"] = topological_boundary_mask(mesh)
+    return mesh
 
 
 def obstacle_mesh(chara_length: float = 0.02, order: int = 2,
@@ -302,12 +341,5 @@ def obstacle_mesh(chara_length: float = 0.02, order: int = 2,
     mesh = Mesh.from_file(path, reorder=True)
     # Boundary = every node carried by a boundary line cell. Exact for a curved hole, which a
     # coordinate test cannot be.
-    line_key = "line3" if order == 2 else "line"
-    # `in` on TensorMesh's BufferDict indexes by position, not by key -- ask for the keys.
-    if line_key not in list(mesh.cells.keys()):
-        raise RuntimeError(f"mesh has no {line_key!r} cells; the boundary physical group was "
-                           f"not written, so the Dirichlet nodes cannot be identified")
-    bmask = torch.zeros(mesh.n_points, dtype=torch.bool)
-    bmask[torch.unique(mesh.cells[line_key].reshape(-1))] = True
-    mesh.register_point_data("is_boundary", bmask)
+    mesh.register_point_data("is_boundary", topological_boundary_mask(mesh))
     return mesh
