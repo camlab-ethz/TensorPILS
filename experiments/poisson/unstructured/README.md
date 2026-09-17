@@ -124,6 +124,41 @@ python   experiments/poisson/unstructured/compare.py    # table + figure, vs the
 From a compute node `clsubmit` runs the sweep **in place** instead of submitting (see the note
 in the sweep file).
 
+## Result (2026-09-17, `gaot-model` @ 5006f9f)
+
+Test relative L2 (FEM norm), mean over seeds 42/43/44, GAOT throughout:
+
+| loss | square `64²` | disc 4205 |
+|------|-------------:|----------:|
+| `data` (supervised) | 0.55 % (0.51–0.61) | 1.66 % (1.61–1.68) |
+| `pls` (preconditioned residual) | 0.61 % (0.56–0.71) | **1.65 %** (1.61–1.71) |
+| `galerkin` (bare residual) | 37.57 % (35.64–40.16) | 73.59 % (57.71–94.37) |
+
+**The ranking transfers, and on the disc the label-free arm is not merely competitive — it ties
+the supervised one.** `pls` 1.65 % against `data` 1.66 %, with overlapping seed ranges, while
+the bare residual is 45× worse. That is the claim this repo is about, now demonstrated on a
+domain with no grid, a mesh with no structure and a preconditioner built from nothing but the
+matrix.
+
+Two readings that the numbers support and one that they do not:
+
+1. **`pls` catching `data` exactly is the expected shape, not luck.** The disc's labels are the
+   FEM solve, so `data` targets the discrete solution and `pls` minimises the residual whose
+   zero *is* that discrete solution. With a good enough `P` the two objectives have the same
+   minimiser, and here they land on it equally well — which is precisely the argument for
+   preferring the one that needs no labels.
+2. **The bare residual degrades more than everything else** (37.6 % → 73.6 %) and its seed
+   spread explodes (57.7–94.4 % against 35.6–40.2 %). Consistent with conditioning: `κ(A)` is
+   1.75× the square's here, so `κ(AᵀA)` is ~3×, and that arm is the only one exposed to it. It
+   is also still descending at epoch 500 on both domains, so this is a rate, not a floor.
+3. **What the numbers do NOT say is that GAOT degrades on an unstructured mesh.** See the
+   section above: the square task is a diagonal map on 16 coefficients and the disc task is not,
+   so the 0.55 % → 1.66 % column shift is mostly the problem getting harder. The
+   architecture-level question was already settled on the square, where GAOT matched the FNO.
+
+Cost: ~3.0 s/epoch (`data`, `galerkin`) and ~3.5 s/epoch (`pls`, one extra AMG V-cycle per
+step) on an RTX 4090, so ~25–30 min per run.
+
 ## What would count as a problem
 
 * **`data` far off its structured value (0.55 %).** The supervised arm has labels, so it tests
