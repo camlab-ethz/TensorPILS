@@ -97,6 +97,60 @@ the decisive knob for this arm (3.6 % → 2.4 % across it) and picked 256 for a 
 a uniform grid. There is no reason that number transfers to a P2/P1 operator on a domain with a
 hole.
 
+## Result (2026-09-17, `gaot-model`)
+
+Test relative FE-``L²``, mean ± sd over seeds 42/43/44. GAOT on the obstacle, FNO on the square.
+
+| loss | square `65²` (u / p) | obstacle 3998 P2 (u / p) |
+|------|---------------------:|-------------------------:|
+| `data` (supervised) | 2.85 ± 0.21 / 2.81 ± 0.21 % | 3.27 ± 0.13 / 1.79 ± 0.15 % |
+| `pls` (preconditioned) | 2.38 ± 0.27 / 1.69 ± 0.23 % | **1.55 ± 0.17 / 0.85 ± 0.04 %** |
+| `galerkin` (bare residual) | 31.27 ± 9.64 / 10.92 ± 2.30 % | 30.56 ± 1.28 / 11.40 ± 0.83 % |
+
+(PINO, for the square where it exists: 2.09 ± 0.26 / 1.50 ± 0.24 %.)
+
+**Read down a column.** The two domains are different problems with different reference
+solutions, so the cross-column numbers are not a like-for-like error — what transfers, or fails
+to, is the ordering within each.
+
+1. **The label-free arm beats the supervised one by about a factor of two, on both fields.**
+   1.55 / 0.85 % against 3.27 / 1.79 %, with non-overlapping seed ranges. On the square the same
+   comparison was a modest win (2.38 / 1.69 against 2.85 / 2.81); here it is decisive. Both arms
+   target the same discrete Taylor-Hood solution — one through labels, one through the residual
+   whose zero it is — so this says the residual is the better-conditioned route to it, not that
+   it is solving something easier.
+2. **The bare residual transfers unchanged, and that is the control working.** 30.6 / 11.4 %
+   against 31.3 / 10.9 %: the objective is as bad on one domain as the other, which is what says
+   the `pls` result is about the preconditioner rather than about the geometry. One difference
+   is worth noting: on the obstacle its best epoch is **64–77**, not 499 — it peaks early and
+   then drifts, where on the square it was still descending at the budget's end.
+3. **`omega` had to be re-selected, and where it landed is the interesting part.** See below.
+
+### The Schur weight does not transfer, and the conditioning optimum does
+
+Stage 1 on this mesh (seed 42, lr 1e-3):
+
+| `omega` | 0.5 | 4 | **16** | 32 | 64 | 256 |
+|---------|----:|--:|-------:|---:|---:|----:|
+| velocity | 2.58 % | 1.63 % | **1.69 %** | 3.35 % | 4.25 % | 22.94 % |
+| pressure | 1.25 % | 0.95 % | **0.79 %** | 1.40 % | 1.62 % | 3.93 % |
+
+The structured study selected **256** for this arm and called the weight its decisive knob. On
+this mesh 256 is catastrophic: run at it, the three stage-2 seeds gave velocity errors of
+99.92 / 10.32 / 15.61 % (kept under `superseded/`). The optimum is a broad plateau over 4–16 and
+falls off hard on either side.
+
+**16 is also the value this repo records as the *conditioning* optimum** for the block
+preconditioner used as a norm weight — the minimiser of `κ(KPK)`, measured h-independent. On the
+uniform grid the empirical optimum sat a factor of 16 away from the conditioning one; here the
+two coincide. The natural reading is that on the structured operator something other than
+conditioning was being compensated for by the large `omega`, and that on a genuinely
+unstructured operator the theory's value is the one that works. It is one mesh, so this is an
+observation to test at another resolution, not a result.
+
+Cost: ~2.9 s/epoch (`data`, `galerkin`) and ~3.9 s/epoch (`pls`, one algebraic V-cycle per
+step) on an RTX 4090; ~25–35 min per run.
+
 ## What would count as a problem
 
 * **`data` far off its structured 2.85 %.** The supervised arm has labels, so a large error
