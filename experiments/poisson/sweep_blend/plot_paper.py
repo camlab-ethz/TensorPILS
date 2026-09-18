@@ -247,7 +247,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--results_dir", default="output/poisson/sweep_blend/pls/results")
-    ap.add_argument("--out_dir", default="paper/figures")
+    ap.add_argument("--out_dir", default="../../paper/precond-pino-paper/figures")
     ap.add_argument("--dpi", type=int, default=600)
     ap.add_argument("--smooth_window", type=int, default=15)
     args = ap.parse_args()

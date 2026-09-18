@@ -123,7 +123,7 @@ def save_figure(fig, out_path, dpi=150):
     The ``.png`` is for quick viewing and the working notes in ``notes/paper_story/``; the
     ``.pdf`` is what the paper includes. Two reasons the vector copy matters: it stays sharp
     when a reviewer zooms, and ``*.png`` is git-ignored repo-wide (``.gitignore``), so a raster
-    figure dropped under ``paper/figures/`` would never be committed and the paper would fail
+    figure dropped into the paper repo's ``figures/`` would never be committed and the paper would fail
     to build on a fresh clone or in Overleaf.
     """
     fig.savefig(out_path, dpi=dpi)

@@ -105,7 +105,7 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, f"scaling_{args.metric}.png")
     # Raster for quick viewing and the working notes; vector for the paper. Note that
-    # *.png is git-ignored repo-wide, so only the .pdf can be committed under paper/figures/.
+    # *.png is git-ignored repo-wide, so only the .pdf can be committed into the paper repo's figures/.
     fig.savefig(out_path, dpi=150)
     pdf_path = os.path.splitext(out_path)[0] + ".pdf"
     fig.savefig(pdf_path)

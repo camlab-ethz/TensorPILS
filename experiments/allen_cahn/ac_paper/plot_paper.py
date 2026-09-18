@@ -24,7 +24,7 @@ together with the dataviz checks (all-pairs CVD dE >= 11.8, normal-vision dE >= 
 also has its own dash pattern, so identity never rests on hue alone.
 
 Usage:
-    python experiments/allen_cahn/ac_paper/plot_paper.py --figures_dir paper/figures
+    python experiments/allen_cahn/ac_paper/plot_paper.py --figures_dir ../../paper/precond-pino-paper/figures
 """
 
 import argparse
@@ -229,7 +229,7 @@ def main():
     ap.add_argument("--eval", default=None, help="default: <final>/test_eval.json")
     ap.add_argument("--out_dir", default="output/allen_cahn/ac_paper/paper")
     ap.add_argument("--figures_dir", default=None,
-                    help="also copy the PDFs here, e.g. paper/figures")
+                    help="also copy the PDFs here, e.g. ../../paper/precond-pino-paper/figures")
     ap.add_argument("--window", type=int, default=15, help="smoothing window (epochs)")
     args = ap.parse_args()
     style()

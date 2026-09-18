@@ -182,7 +182,7 @@ def main():
     fig.savefig(args.out, dpi=args.dpi)
     # PDF alongside: text and curves stay vector, the two heatmaps are already rasterized. This is
     # the one that goes in the paper -- *.png is git-ignored repo-wide, so a PNG under
-    # paper/figures/ could not be committed and the build would break on a fresh clone.
+    # the paper repo's figures/ could not be committed and the build would break on a fresh clone.
     pdf = os.path.splitext(args.out)[0] + ".pdf"
     fig.savefig(pdf, dpi=args.dpi)
     plt.close(fig)

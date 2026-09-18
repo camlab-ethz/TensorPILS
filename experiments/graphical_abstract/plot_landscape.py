@@ -1,7 +1,7 @@
 """Graphical abstract, part 2: figures from ``run_landscape.py``'s ``.npz``.
 
 Three independent figures, each written as both ``.png`` (quick viewing) and ``.pdf`` (the paper;
-note ``*.png`` is git-ignored repo-wide, so only the PDF can be committed under ``paper/figures/``):
+note ``*.png`` is git-ignored repo-wide, so only the PDF can be committed under the paper repo's ``figures/``):
 
   landscape_contours   loss contours in the plane of the extreme eigenvectors of A, with the true
                        Adam trajectory projected in, and an inset showing the contours at their
@@ -12,7 +12,7 @@ note ``*.png`` is git-ignored repo-wide, so only the PDF can be committed under 
 
 Usage:
     python experiments/graphical_abstract/plot_landscape.py \
-        --npz output/graphical_abstract/landscape.npz --out_dir paper/figures
+        --npz output/graphical_abstract/landscape.npz --out_dir ../../paper/precond-pino-paper/figures
 """
 
 import argparse

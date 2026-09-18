@@ -9,7 +9,7 @@ Authored at the text width so ``\\includegraphics[width=\\linewidth]`` does not 
 point sizes below are what reaches the page.
 
 Usage:
-    python experiments/poisson/dataset_samples/plot_dataset_samples.py --out_dir paper/figures
+    python experiments/poisson/dataset_samples/plot_dataset_samples.py --out_dir ../../paper/precond-pino-paper/figures
 """
 
 import argparse

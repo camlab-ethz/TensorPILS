@@ -69,8 +69,7 @@ uv.lock
 *.bcf
 *.run.xml
 
-# Compiled documents. Figure PDFs (e.g. paper/figures/*.pdf) are LaTeX *inputs*
-# and stay tracked, so these are listed by name rather than globbing *.pdf.
-paper/main.pdf
-paper/old_versions/*.pdf
+# Compiled documents. The manuscript itself lives in the sibling repository
+# ../../paper/precond-pino-paper (Overleaf-synced); nothing under paper/ is part
+# of this tree any more.
 notes/paper_story/paper_story_experiments.pdf

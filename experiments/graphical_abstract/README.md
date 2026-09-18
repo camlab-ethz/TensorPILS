@@ -90,7 +90,7 @@ result: at `16²` (`κ = 45`) **Adam simply solves the problem**, to 0.06%.
 python experiments/graphical_abstract/run_landscape.py \
     --out output/graphical_abstract/landscape.npz            # ~2 min, CPU
 python experiments/graphical_abstract/plot_landscape.py \
-    --npz output/graphical_abstract/landscape.npz --out_dir paper/figures
+    --npz output/graphical_abstract/landscape.npz --out_dir ../../paper/precond-pino-paper/figures
 ```
 
 Useful flags: `--grid`, `--steps`, `--init {zero,random}`, and `--render_aspect` on the plot script
