@@ -1,0 +1,17 @@
+# Re-run two arms WITH checkpointing, purely so the paper's error-field figure can be made.
+#
+# The main sweep passes --no_checkpoint (nothing there needs a reloadable model and the
+# checkpoints are large), so output/stokes/unstructured/*/checkpoints/ is empty and the trained
+# velocity field cannot be recovered. These two cells are identical to the corresponding cells of
+# sweep.txt except that the checkpoint is kept; they write to their own output directory so the
+# recorded results are not touched. Seed 42 only -- a figure needs one sample, not a mean.
+#
+# SUBMIT FROM A COMPUTE NODE WITH:
+#   bash <scratch>/force_submit.sh experiments/stokes/unstructured/sweep_checkpointed.txt
+
+#!time 04:00:00
+#!profile gpu1
+
+# name                profile  command
+uns-ckpt-pls         -        python -m tensorpils.cli --pde stokes --mesh obstacle --mesh_h 0.035 --mesh_cache /cluster/scratch/shiwen/TensorPILS_cache/meshes/obst_h0.035.msh --model gaot -k 10 --n_train 1024 --n_val 128 --n_test 256 --epochs 500 --batch_size 32 --optimizer adam --lr 1e-3 --lr_min 1e-6 --device cuda --seed 42 --loss pls --stokes_precond block --schur_omega 16 --output_dir output/stokes/unstructured_ckpt/pls
+uns-ckpt-galerkin    -        python -m tensorpils.cli --pde stokes --mesh obstacle --mesh_h 0.035 --mesh_cache /cluster/scratch/shiwen/TensorPILS_cache/meshes/obst_h0.035.msh --model gaot -k 10 --n_train 1024 --n_val 128 --n_test 256 --epochs 500 --batch_size 32 --optimizer adam --lr 1e-3 --lr_min 1e-6 --device cuda --seed 42 --loss galerkin --output_dir output/stokes/unstructured_ckpt/galerkin
