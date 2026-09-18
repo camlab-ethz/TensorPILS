@@ -10,7 +10,7 @@ mode deflated by projection, since B^T 1 = 0 makes that mode a gauge and not ill
 left in, it reports an infinite condition number for every omega alike. The velocity block uses
 the exact A^-1 that the algebraic V-cycle approximates, which is what the theory is about.
 
-Result (2026-09-18), chara_length 0.035, 8463 free DOF:
+Result (2026-09-18), omegas 0.5..256 at chara_length 0.035, 8463 free DOF:
 
     bare least squares   kappa(K^2)   = 1.204e+11
     block P, omega_S=0.5   3.663e+06     32866x
@@ -25,7 +25,28 @@ The minimum is at omega_S = 4, not at the 16 that validation selects, though the
 this corrects a claim carried over from the structured Q2/Q1 operator, whose kappa optimum is
 near 16; that number does not transfer to P2/P1 on this geometry.
 
-Run:  clrun -p cpu -t 60 -- python experiments/stokes/unstructured/conditioning.py
+Refinement sweep (2026-09-18), omegas 0.5..32 re-tuned at each mesh:
+
+    h_req  edge     P2 nodes  free DOF   kappa(K^2)    best kappa(KPK)  omega*    ratio
+    0.06   0.05736      1417      2877   1.105e+10        3.727e+05        4     2.96e+04
+    0.05   0.04829      1974      4074   2.234e+10        4.853e+05        4     4.60e+04
+    0.04   0.03929      2954      6189   5.078e+10        7.305e+05        4     6.95e+04
+    0.035  0.03365      3998      8463   1.204e+11        1.025e+06        4     1.17e+05
+    0.03   0.02897      5358     11433   1.891e+11        1.389e+06        4     1.36e+05
+    0.025  0.02454      7424     15969   3.451e+11        1.890e+06        4     1.83e+05
+
+Fitted against the REALISED mean edge length: bare h^-4.13, preconditioned h^-1.96, against the
+predicted -4 and -2. Node count follows h^-2.02, so the six meshes are one family refined rather
+than six shapes. The ratio grows 2.96e4 -> 1.83e5 and does not saturate, which is what a change
+of rate gives and a change of constant would not. omega* = 4 at every mesh.
+
+Consecutive-mesh slopes scatter (bare: -4.09, -3.98, -5.57, -3.01, -3.62) because each mesh is an
+independent Gmsh triangulation whose extreme eigenvalues depend on its worst element as well as on
+h, and kappa(K^2) squares that; the preconditioned series scatters less (-1.53 to -2.19). Only the
+trend over the whole range means anything, which is why six meshes are run and not two.
+
+Run:  clrun -p cpu -t 120 -- python experiments/stokes/unstructured/conditioning.py
+      (~45 min for the default six meshes; the 0.025 row alone is ~32 min and needs ~10 GB)
 """
 import argparse
 import os
