@@ -61,11 +61,11 @@ def speed(vec, n):
     return np.hypot(uv[:, 0], uv[:, 1])
 
 
-def load_arm(root, arm, problem, coords, f_node, f_scale, device):
+def load_arm(root, arm, problem, coords, f_node, f_scale, p_scale, device):
     """Rebuild the model from its checkpoint and predict on one sample."""
     hits = sorted(glob.glob(os.path.join(root, arm, "checkpoints", "*_best.pth")))
     if not hits:
-        return None
+        return None, None
     ckpt = torch.load(hits[0], map_location=device, weights_only=False)
     cfg = dict(ckpt["model_config"])
     # The checkpoint records no architecture tag, so read it off the config's own keys: GAOT
@@ -90,8 +90,12 @@ def load_arm(root, arm, problem, coords, f_node, f_scale, device):
         out = (model.forward_at(fs, coords) if kind == "deeponet"
                else model.forward_nodes(fs, coords=coords))
         u, p = problem.from_nodes(out)
+        # The same four fixed steps as StokesTrainer._predict: the pressure channel carries a
+        # scale of its own (the physics ties |p| ~ 50|u|), and both fields are projected onto the
+        # admissible space -- zero velocity on the two boundary components, zero-mean pressure.
         u = problem.project_velocity_bc(u)
-    return u[0].cpu()
+        p = problem.project_pressure_gauge(p * p_scale)
+    return u[0].cpu(), p[0].cpu()
 
 
 def main():
@@ -125,7 +129,8 @@ def main():
     mesh, problem, _ = test.get_shared_resources()
     problem = problem.to(args.device)
     f_scale = float(getattr(test, "f_scale", 1.0))
-    print(f"    f_scale = {f_scale:.4g}")
+    p_scale = float(getattr(test, "p_scale", 1.0))
+    print(f"    f_scale = {f_scale:.4g}   p_scale = {p_scale:.4g}")
 
     pts = mesh.points[:, :2].numpy()
     coords_t = mesh.points[:, :2].to(args.device, torch.float32)
@@ -133,16 +138,16 @@ def main():
     tri = mtri.Triangulation(pts[:, 0], pts[:, 1], mesh.cells["triangle6"][:, :3].numpy())
 
     def predict_all(idx):
-        f, u_ref, _ = test[idx]
+        f, u_ref, p_ref = test[idx]
         f = f.to(args.device, torch.float32)
-        s_ref = speed(u_ref.numpy(), n)
+        ref = (speed(u_ref.numpy(), n), p_ref.numpy().reshape(-1))
         out = {}
         for arm, _ in ARMS:
-            u = load_arm(args.root, arm, problem, coords_t, f, f_scale, args.device)
+            u, q = load_arm(args.root, arm, problem, coords_t, f, f_scale, p_scale, args.device)
             if u is None:
                 return None, None, None, arm
-            out[arm] = speed(u.numpy(), n)
-        return f, s_ref, out, None
+            out[arm] = (speed(u.numpy(), n), q.numpy().reshape(-1))
+        return f, ref, out, None
 
     # Draw a REPRESENTATIVE sample, not the first one. A panel is only worth printing if the
     # errors it shows are the errors the table reports, so scan and pick the sample whose per-arm
@@ -150,7 +155,7 @@ def main():
     # rather than an eye-picked frame.
     if args.sample >= 0:
         idx = args.sample
-        f_node, s_ref, preds, missing = predict_all(idx)
+        f_node, ref, preds, missing = predict_all(idx)
     else:
         target = np.asarray(args.dataset_err, dtype=float)
         best = (np.inf, None)
@@ -158,7 +163,8 @@ def main():
             _, sr, pr, missing = predict_all(k)
             if missing:
                 break
-            e = np.array([100 * np.linalg.norm(pr[a] - sr) / np.linalg.norm(sr) for a, _ in ARMS])
+            e = np.array([100 * np.linalg.norm(pr[a][0] - sr[0]) / np.linalg.norm(sr[0])
+                          for a, _ in ARMS])
             score = float(np.abs(np.log(e / target)).sum())
             if score < best[0]:
                 best = (score, k)
@@ -168,50 +174,76 @@ def main():
         idx = best[1]
         print(f"    scanned {min(args.n_scan, len(test))} test samples, drawing #{idx} "
               f"(log-ratio deviation {best[0]:.3f})")
-        f_node, s_ref, preds, missing = predict_all(idx)
+        f_node, ref, preds, missing = predict_all(idx)
     if missing:
         print(f"  !! no checkpoint yet for: {missing} -- run the sweep first")
         return
     s_f = speed(f_node.cpu().numpy(), n)
 
-    vmax_u = max([s_ref.max()] + [p.max() for p in preds.values()])
-    errs = {a: np.abs(preds[a] - s_ref) for a, _ in ARMS}
-    vmax_e = max(e.max() for e in errs.values())
+    s_ref, p_ref = ref
+    s_f = speed(f_node.cpu().numpy(), n)
+
+    # Pressure is P1: 1035 values on the corner vertices, which are exactly the P1 node set
+    # (verified: p_node_ids equals the unique corners of triangle6[:, :3]). Scatter onto a
+    # full-length array so one Triangulation serves both fields; the quadratic edge-node entries
+    # are never read, since a corner triangulation interpolates from its three corners only.
+    pid = problem.p_node_ids.cpu().numpy()
+
+    def on_mesh(vals_p1):
+        full = np.zeros(n, dtype=float)
+        full[pid] = vals_p1
+        return full
+
+    u_pred = {a: preds[a][0] for a, _ in ARMS}
+    q_pred = {a: preds[a][1] for a, _ in ARMS}
+    u_err = {a: np.abs(u_pred[a] - s_ref) for a, _ in ARMS}
+    q_err = {a: np.abs(q_pred[a] - p_ref) for a, _ in ARMS}
+
+    vmax_u = max([s_ref.max()] + [v.max() for v in u_pred.values()])
+    vmax_ue = max(v.max() for v in u_err.values())
+    vabs_p = max([np.abs(p_ref).max()] + [np.abs(v).max() for v in q_pred.values()])
+    vmax_pe = max(v.max() for v in q_err.values())
 
     ncol = 1 + len(ARMS)
-    fig, axes = plt.subplots(2, ncol, figsize=(5.5, 2.55),
+    fig, axes = plt.subplots(4, ncol, figsize=(5.5, 4.55),
                              gridspec_kw=dict(wspace=0.06, hspace=0.16))
 
-    def draw(ax, val, vmax, cmap):
-        m = ax.tripcolor(tri, val, shading="gouraud", cmap=cmap, vmin=0.0, vmax=vmax)
+    def draw(ax, val, cmap, vmin, vmax):
+        m = ax.tripcolor(tri, val, shading="gouraud", cmap=cmap, vmin=vmin, vmax=vmax)
         ax.set_aspect("equal"); ax.set_xlim(0, 1); ax.set_ylim(0, 1)
         ax.set_xticks([]); ax.set_yticks([])
         for sp in ax.spines.values():
             sp.set_linewidth(0.5); sp.set_color(MUTED)
         return m
 
-    # Row 0 is the reference and the four predictions, all on ONE viridis scale so the columns
-    # are comparable by eye. Row 1 is the forcing (its own scale -- different units) and the four
-    # error fields, all on one magma scale. Labelling the rows "prediction"/"error" would be wrong
-    # for column 0, so each cell is titled instead.
-    m_u = draw(axes[0, 0], s_ref, vmax_u, "viridis")
-    axes[0, 0].set_title(r"reference $|u^\ast|$", fontsize=FS_LAB, pad=2.5)
-    m_f = draw(axes[1, 0], s_f, float(s_f.max()), "cividis")
-    axes[1, 0].set_xlabel(r"input $|f|$", fontsize=FS_LAB, labelpad=2)
+    # Column 0 is the problem: the reference fields, plus the forcing that produced them.
+    m_u = draw(axes[0, 0], s_ref, "viridis", 0.0, vmax_u)
+    axes[0, 0].set_title(r"reference", fontsize=FS_LAB, pad=2.5)
+    draw(axes[1, 0], s_f, "cividis", 0.0, float(s_f.max()))
+    # Title, not xlabel: below the panel it sits against the pressure row and reads as that row's
+    # heading. Above it, it pairs with "reference" in the cell overhead.
+    axes[1, 0].set_title(r"input $|f|$", fontsize=FS_LAB, pad=2.5)
+    m_p = draw(axes[2, 0], on_mesh(p_ref), "RdBu_r", -vabs_p, vabs_p)
+    axes[3, 0].set_axis_off()
 
-    for j, (arm, head) in enumerate(ARMS, start=1):
-        draw(axes[0, j], preds[arm], vmax_u, "viridis")
-        axes[0, j].set_title(head, fontsize=FS_LAB, pad=2.5)
-        m_e = draw(axes[1, j], errs[arm], vmax_e, "magma")
-        rel = 100.0 * np.linalg.norm(preds[arm] - s_ref) / np.linalg.norm(s_ref)
-        axes[1, j].set_xlabel(f"{rel:.1f}%", fontsize=FS_TICK, labelpad=2)
+    for j, (arm, head_lab) in enumerate(ARMS, start=1):
+        draw(axes[0, j], u_pred[arm], "viridis", 0.0, vmax_u)
+        axes[0, j].set_title(head_lab, fontsize=FS_LAB, pad=2.5)
+        m_ue = draw(axes[1, j], u_err[arm], "magma", 0.0, vmax_ue)
+        draw(axes[2, j], on_mesh(q_pred[arm]), "RdBu_r", -vabs_p, vabs_p)
+        m_pe = draw(axes[3, j], on_mesh(q_err[arm]), "magma", 0.0, vmax_pe)
+        eu = 100.0 * np.linalg.norm(u_pred[arm] - s_ref) / np.linalg.norm(s_ref)
+        ep = 100.0 * np.linalg.norm(q_pred[arm] - p_ref) / np.linalg.norm(p_ref)
+        axes[1, j].set_xlabel(f"{eu:.1f}%", fontsize=FS_TICK, labelpad=2)
+        axes[3, j].set_xlabel(f"{ep:.1f}%", fontsize=FS_TICK, labelpad=2)
 
-    # Side labels, not titles: a title above the lower colorbar lands on the upper one's last
-    # tick. shrink leaves a gap between the two bars as well.
-    for m, ax_row, lab in ((m_u, axes[0, :], r"$|u|$"), (m_e, axes[1, :], r"$|u - u^\ast|$")):
-        cb = fig.colorbar(m, ax=list(ax_row), fraction=0.020, pad=0.014, shrink=0.88)
-        cb.set_label(lab, fontsize=FS_LAB, labelpad=3, rotation=90)
-        cb.ax.tick_params(labelsize=FS_TICK - 0.5, width=0.5, length=2, color=MUTED)
+    # Side labels, not titles: a title above one colorbar lands on the one above it.
+    bars = ((m_u, axes[0, :], r"$|u|$"), (m_ue, axes[1, :], r"$|u - u^\ast|$"),
+            (m_p, axes[2, :], r"$p$"),   (m_pe, axes[3, :], r"$|p - p^\ast|$"))
+    for m, ax_row, lab in bars:
+        cb = fig.colorbar(m, ax=list(ax_row), fraction=0.020, pad=0.014, shrink=0.92)
+        cb.set_label(lab, fontsize=FS_TICK + 0.5, labelpad=3, rotation=90)
+        cb.ax.tick_params(labelsize=FS_TICK - 1.0, width=0.5, length=2, color=MUTED)
         cb.outline.set_linewidth(0.5); cb.outline.set_edgecolor(MUTED)
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -227,8 +259,9 @@ def main():
         shutil.copy(pdf, os.path.join(args.figures_dir, stem + ".pdf"))
         print(f"  -> {os.path.join(args.figures_dir, stem + '.pdf')}")
     for arm, _ in ARMS:
-        print(f"    {arm:<11} sample rel. |u| error "
-              f"{100 * np.linalg.norm(preds[arm] - s_ref) / np.linalg.norm(s_ref):.2f} %")
+        eu = 100 * np.linalg.norm(u_pred[arm] - s_ref) / np.linalg.norm(s_ref)
+        ep = 100 * np.linalg.norm(q_pred[arm] - p_ref) / np.linalg.norm(p_ref)
+        print(f"    {arm:<11} sample rel. error   u {eu:6.2f} %   p {ep:6.2f} %")
 
 
 if __name__ == "__main__":
