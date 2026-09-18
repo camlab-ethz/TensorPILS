@@ -61,9 +61,9 @@ def speed(vec, n):
     return np.hypot(uv[:, 0], uv[:, 1])
 
 
-def load_arm(root, arm, problem, coords, f_node, f_scale, p_scale, device):
+def load_arm(arm_dir, problem, coords, f_node, f_scale, p_scale, device):
     """Rebuild the model from its checkpoint and predict on one sample."""
-    hits = sorted(glob.glob(os.path.join(root, arm, "checkpoints", "*_best.pth")))
+    hits = sorted(glob.glob(os.path.join(arm_dir, "checkpoints", "*_best.pth")))
     if not hits:
         return None, None
     ckpt = torch.load(hits[0], map_location=device, weights_only=False)
@@ -102,6 +102,11 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", default="output/stokes/unstructured_ckpt")
+    # PI-DeepONet is reported at full collocation, so the panel must show that model and not the
+    # 1024-point one that lives under --root; a figure and a table describing different models is
+    # the kind of mismatch nobody notices until a reviewer does.
+    ap.add_argument("--pidon_root",
+                    default="output/stokes/unstructured_allcolloc/seed42")
     ap.add_argument("--out_dir", default="output/stokes/unstructured/figures")
     ap.add_argument("--figures_dir", default="../../paper/precond-pino-paper/figures")
     ap.add_argument("--mesh_h", type=float, default=0.035)
@@ -113,13 +118,15 @@ def main():
                     help="test index to draw; -1 scans --n_scan samples and picks the most "
                          "representative one (see --dataset_err)")
     ap.add_argument("--n_scan", type=int, default=24)
-    ap.add_argument("--dataset_err", type=float, nargs=4, default=(1.74, 3.22, 29.45, 41.75),
+    ap.add_argument("--dataset_err", type=float, nargs=4, default=(1.74, 3.22, 29.45, 38.36),
                     help="dataset-level velocity rel. L2 per arm, in ARMS order, for the models "
                          "in --root; the scan picks the sample closest to these")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
     style()
+    roots = {a: os.path.join(args.root, a) for a, _ in ARMS}
+    roots["pideeponet"] = args.pidon_root
     from tensorpils.data import create_unstructured_stokes_datasets
 
     # The figure must use a TEST sample: a training one would flatter every arm.
@@ -143,7 +150,7 @@ def main():
         ref = (speed(u_ref.numpy(), n), p_ref.numpy().reshape(-1))
         out = {}
         for arm, _ in ARMS:
-            u, q = load_arm(args.root, arm, problem, coords_t, f, f_scale, p_scale, args.device)
+            u, q = load_arm(roots[arm], problem, coords_t, f, f_scale, p_scale, args.device)
             if u is None:
                 return None, None, None, arm
             out[arm] = (speed(u.numpy(), n), q.numpy().reshape(-1))
