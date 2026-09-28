@@ -33,7 +33,7 @@ def _amgx_available():
 
 requires_amgx = pytest.mark.skipif(
     not _amgx_available(),
-    reason="torch-amgx (CUDA-only) not importable; see experiments/poisson/amg_dropin/README.md")
+    reason="torch-amgx (CUDA-only) not importable; see the installation notes in README.md")
 
 
 @pytest.fixture(scope="module")
@@ -158,7 +158,7 @@ def test_pls_loss_gradient_matches_closed_form(amg, problem):
     dropped boundary mask.
     """
     B, N = 4, GRID * GRID
-    crit = build_loss("pls", problem, lambda_bc=0.0, precond=amg)
+    crit = build_loss("pls", problem, precond=amg)
     torch.manual_seed(0)
     u = torch.randn(B, N, device="cuda", requires_grad=True)
     f = torch.randn(B, N, device="cuda")

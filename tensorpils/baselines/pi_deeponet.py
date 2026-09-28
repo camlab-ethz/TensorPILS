@@ -15,9 +15,6 @@ the same, so the two baselines differ in architecture and differentiation, not i
   Off-node collocation would require interpolating the reference, which introduces an error
   that has nothing to do with the method under test.
 
-For Poisson the closed form (``PoissonMultiFrequency.source_term``) is exact anywhere, so
-genuinely random collocation is also available (``--pi_colloc random``).
-
 **Per-sample derivatives.** ``coords`` is passed as ``[B, Q, 2]``, not ``[Q, 2]``. With the
 shared form, ``grad(u.sum(), coords)`` would return :math:`\sum_b \partial u_b/\partial y`,
 the batch *sum* of the gradients, and the per-sample residual could not be recovered. With
@@ -28,9 +25,9 @@ exactly the per-sample derivatives.
 import torch
 import torch.nn as nn
 
-from .pino import rel_lp, stokes_reduce
+from .pino import rel_lp
 
-__all__ = ["autodiff_laplacian", "autodiff_stokes", "PIDeepONetPoissonLoss",
+__all__ = ["autodiff_laplacian", "autodiff_stokes", "stokes_reduce", "PIDeepONetPoissonLoss",
            "PIDeepONetACLoss", "PIDeepONetStokesLoss"]
 
 
@@ -120,56 +117,66 @@ class PIDeepONetACLoss(nn.Module):
     r"""Strong-form Allen–Cahn step residual over an autoregressive rollout.
 
     Identical in form to :class:`~tensorpils.baselines.pino.PINOACLoss` — the same dropped
-    mass matrix and the same :math:`A \leftrightarrow -\Delta` substitution — except that
-    :math:`\Delta u^{n+1}` is the autodiff Laplacian rather than the finite-difference one.
+    mass matrix, the same :math:`A \leftrightarrow -\Delta` substitution and the same detached
+    previous frame — except that :math:`\Delta u^{n+1}` is the autodiff Laplacian rather than
+    the finite-difference one.
 
-    ``forward(seq_node, laps)`` where ``seq_node`` is ``[B, 1+R, N]`` (seed frame + predicted
-    frames, at the collocation nodes) and ``laps`` is ``[B, R, N]``, the Laplacian of each
-    predicted frame. The trainer supplies both from a single model evaluation per step.
-
-    ``interior_mask`` (``[N]``, True on interior nodes) restricts the average to interior
-    nodes. It is not optional in practice: the rollout has to evaluate the model at *every*
-    node in order to feed the next frame back, while
-    :class:`~tensorpils.baselines.pino.PINOACLoss` averages over the interior only, as the
-    reference implementation does. Without the mask the two baselines' losses differ by the
-    ratio of node counts alone — 6 % at ``65^2`` — and their learning rates would not be
-    comparable.
-
-    ``detach_coupling`` mirrors :class:`~tensorpils.losses.ACGalerkinLoss` and
-    :class:`~tensorpils.baselines.pino.PINOACLoss`: it detaches the previous frame ``u^k``
-    inside the residual, and the trainer sets it from ``--bptt_mode`` exactly as the FEM arm
-    does. Without it, the baseline and the FEM arm would differ in what the gradient flows
-    through as well as in the residual, and the comparison would not be attributable.
+    ``forward(seq_node, laps)`` where ``seq_node`` is ``[B, 1+R, Q]`` (seed frame + predicted
+    frames, at the interior collocation nodes) and ``laps`` is ``[B, R, Q]``, the Laplacian of
+    each predicted frame. The trainer supplies both from a single model evaluation per step.
     """
 
-    def __init__(self, a: float, eps: float, dt: float,
-                 discount: float = 1.0, integrator: str = "convex_concave",
-                 interior_mask: torch.Tensor = None, detach_coupling=None):
+    def __init__(self, a: float, eps: float, dt: float):
         super().__init__()
-        if integrator not in ("backward_euler", "convex_concave"):
-            raise ValueError(f"unknown integrator {integrator!r}")
         self.a, self.eps, self.dt = a, eps, dt
-        self.discount = discount
-        self.integrator = integrator
-        self.detach_coupling = False if detach_coupling is None else detach_coupling
-        self.register_buffer("interior_mask", interior_mask)
 
     def forward(self, seq_node: torch.Tensor, laps: torch.Tensor) -> torch.Tensor:
         a2 = self.a * self.a
         e2 = self.eps * self.eps
         total = seq_node.new_zeros(())
         for k in range(laps.shape[1]):
-            uc = seq_node[:, k].detach() if self.detach_coupling else seq_node[:, k]
+            uc = seq_node[:, k].detach()
             un = seq_node[:, k + 1]
-            reaction = e2 * ((uc if self.integrator == "convex_concave" else un) - un ** 3)
+            reaction = e2 * (uc - un ** 3)
             r = (un - uc) / self.dt - a2 * laps[:, k] - reaction
-            if self.interior_mask is not None:
-                r = r[:, self.interior_mask]
-            total = total + (self.discount ** k) * (r ** 2).mean()
+            total = total + (r ** 2).mean()
         return total
 
 
 # ------------------------------------------------------------------------------- Stokes
+
+def stokes_reduce(r_mom: torch.Tensor, r_div: torch.Tensor, f: torch.Tensor,
+                  reduction: str = "rel", p: int = 2, div_weight: float = 1.0) -> torch.Tensor:
+    r"""Reduce a strong-form Stokes residual (the PI-DeepONet Stokes arm).
+
+    ``r_mom`` ``[B, ..., 2]`` is the momentum residual :math:`-\mu\Delta u + \nabla p - f`,
+    ``r_div`` ``[B, ...]`` the continuity residual :math:`\nabla\cdot u`, ``f`` ``[B, ..., 2]``
+    the body force at the same points (any trailing layout; everything is flattened per sample).
+
+    ``rel``: PINO's relative ratio on the **stacked** system, ``mean_b ‖(r_mom, w·r_div)‖ /
+    ‖(f, 0)‖`` — the strong-form analogue of the FEM least-squares loss ``½‖Kc − b‖²`` with
+    ``b = (M_u f, 0)``, in which momentum and continuity rows are likewise stacked with their
+    natural units. ``mse``: ``mean(r_mom²) + w² mean(r_div²)``. ``div_weight`` (``w``) is the
+    one knob a strong-form saddle point needs beyond Poisson: the two equations have different
+    units (``div u ~ k u`` against ``f ~ mu k² u``), so it is tuned on validation like a
+    learning rate.
+    """
+    b = r_mom.shape[0]
+    rm = r_mom.reshape(b, -1)
+    rd = div_weight * r_div.reshape(b, -1)
+    if reduction == "mse":
+        return (rm ** 2).mean() + (rd ** 2).mean()
+    if reduction != "rel":
+        raise ValueError(f"reduction must be 'rel' or 'mse', got {reduction!r}")
+    # ``r_mom`` is already the residual (the loss subtracts f before calling), so the ratio is
+    # formed directly -- NOT via rel_lp(residual, f), which would subtract f a second time and
+    # make the minimiser the solution for the force 2f (a bug that showed up as exactly 100 %
+    # velocity error; pinned by test_stokes_rel_reduction_is_the_ratio_of_residual_to_force).
+    res = torch.linalg.vector_norm(torch.cat([rm, rd], dim=1), ord=p, dim=1)
+    ref = torch.linalg.vector_norm(f.reshape(b, -1), ord=p, dim=1)
+    return (res / ref.clamp_min(1e-12)).mean()
+
+
 
 def autodiff_stokes(model, f_grid: torch.Tensor, coords: torch.Tensor, p_scale: float = 1.0):
     r"""Evaluate a 3-channel model at ``coords`` and return every derivative the Stokes
@@ -207,17 +214,15 @@ def autodiff_stokes(model, f_grid: torch.Tensor, coords: torch.Tensor, p_scale: 
 class PIDeepONetStokesLoss(nn.Module):
     r"""Strong-form Stokes residual at collocation points, differentiated by autodiff.
 
-    The same residual and the same reduction as :class:`~tensorpils.baselines.pino.PINOStokesLoss`
-    (see :func:`~tensorpils.baselines.pino.stokes_reduce`), so the two baselines differ only
-    in architecture and differentiation. ``forward(model, f_grid, coords, f_at_coords,
-    bc_coords=None)`` with ``f_at_coords`` ``[B, Q, 2]``; ``f_grid`` is whatever the model's
-    branch expects (the trainer hands it ``f / f_scale``, as :meth:`StokesTrainer._predict`
-    does for every arm), and ``p_scale`` puts the third channel in physical units.
+    Momentum and continuity residuals are stacked and reduced by :func:`stokes_reduce`.
+    ``forward(model, f_grid, coords, f_at_coords, bc_coords=None)`` with ``f_at_coords``
+    ``[B, Q, 2]``; ``f_grid`` is whatever the model's branch expects (the trainer hands it
+    ``f / f_scale``, as :meth:`StokesTrainer._predict` does for every arm), and ``p_scale`` puts
+    the third channel in physical units.
 
-    ``lambda_bc`` is the velocity boundary penalty of ``--pideeponet_bc zero`` — the same
-    relative form as the Poisson one (boundary RMS over the detached interior RMS, both
-    components stacked) for the same reason: the autodiff Laplacian cannot see a boundary
-    mask. The pressure has no boundary condition, only a gauge, which the trainer fixes by
+    ``lambda_bc`` is the velocity boundary penalty — the same relative form as the Poisson one
+    (boundary RMS over the detached interior RMS, both components stacked) for the same reason:
+    the autodiff Laplacian cannot see a boundary mask. The pressure has no boundary condition, only a gauge, which the trainer fixes by
     projection at evaluation and which ``∇p`` never sees.
     """
 

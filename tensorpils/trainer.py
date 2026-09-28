@@ -2,13 +2,14 @@
 
 ``BaseTrainer`` holds the machinery shared by every PDE: optimizer/scheduler,
 the epoch loop, best-model tracking, checkpointing (keyed by ``_file_prefix``),
-and the boundary projection / loss-curve helpers. Two subclasses specialize it:
+and the boundary projection / loss-curve helpers. Three subclasses specialize it:
 
-* :class:`PoissonTrainer` — static Poisson, one of four losses (grid-space MSE eval).
-* :class:`WaveTrainer`    — autoregressive wave time-stepper (trajectory-MSE eval).
+* :class:`PoissonTrainer` — static Poisson (``data`` / ``galerkin`` / ``pls``).
+* :class:`ACTrainer`      — autoregressive Allen–Cahn time-stepper (via :class:`RolloutTrainer`).
+* :class:`StokesTrainer`  — Stokes on the obstacle mesh; velocity and pressure scored separately.
 
-Evaluation is **always** grid-space MSE against the analytical solution, regardless of
-the training loss, so model selection and the reported error stay comparable.
+Model selection never uses the training loss: it is the validation error against the reference
+solution, identical for every loss, so model selection and the reported error stay comparable.
 """
 
 import math
@@ -26,19 +27,15 @@ from tqdm import tqdm
 
 from .meshing import node_to_grid, grid_to_node
 from .physics import apply_zero_boundary
-from .preconditioners import (Preconditioner, GeometricMultigrid,
-                              StokesBlockPreconditioner, StokesBlendPreconditioner,
-                              StokesMonolithicMultigrid, build_preconditioner)
-from .losses import build_loss, build_wave_loss, build_ac_loss, build_stokes_loss
+from .preconditioners import (Preconditioner, GeometricMultigrid, AMGXPreconditioner,
+                              StokesBlockPreconditioner, build_preconditioner)
+from .losses import build_loss, build_ac_loss, build_stokes_loss
 from .optim import build_optimizer
 from . import viz
 
-__all__ = ["BaseTrainer", "Trainer", "PoissonTrainer", "RolloutTrainer",
-           "WaveTrainer", "ACTrainer", "StokesTrainer", "TrainingStats",
-           "arch_tag", "ArchPrefixMixin",
-           "GAOTPoissonTrainer", "GAOTWaveTrainer", "GAOTACTrainer", "GAOTStokesTrainer",
-           "UnstructuredPoissonTrainer", "GAOTUnstructuredPoissonTrainer",
-           "UnstructuredStokesTrainer", "GAOTUnstructuredStokesTrainer"]
+__all__ = ["BaseTrainer", "PoissonTrainer", "RolloutTrainer", "ACTrainer", "StokesTrainer",
+           "TrainingStats", "arch_tag", "ArchPrefixMixin",
+           "GAOTPoissonTrainer", "GAOTStokesTrainer"]
 
 
 #: Model class name -> the tag that goes in a run's file names. ``fno`` is the default so that
@@ -87,22 +84,17 @@ class TrainingStats:
     val_rel_l2_steps: List[List[float]] = field(default_factory=list)
     val_st_rel_l2: List[float] = field(default_factory=list)
     val_final_rel_l2: List[float] = field(default_factory=list)
-    # Per-epoch relative-L2 on extra (out-of-distribution) eval sets, keyed by label.
-    ood_rel_l2: dict = field(default_factory=dict)
     best_epoch: int = 0
     best_val_error: float = float("inf")
-    # Epoch at which patience-based early stopping fired (-1: ran the full budget).
-    stopped_epoch: int = -1
-    # Stokes: the two fields are scored separately (different spaces and grids).
+    # Stokes: the two fields are scored separately (different spaces).
     val_rel_l2_u: List[float] = field(default_factory=list)
     val_rel_l2_p: List[float] = field(default_factory=list)
     # Wall-clock seconds of each training epoch (train_epoch only, no validation) -- the source
-    # for the paper's time-per-epoch column. Missing in results written before it existed.
+    # for the paper's time-per-epoch column.
     epoch_times: List[float] = field(default_factory=list)
-    # Preconditioner identity + conditioning (for the sweep / collapse plot).
+    # Preconditioner identity + conditioning (for the P_t sweep / collapse plot).
     precond_kind: str = ""
     precond_strength: float = float("nan")
-    precond_method: str = "dense"
     precond_cond_pa: float = float("nan")
     precond_cond_h: float = float("nan")
 
@@ -272,7 +264,7 @@ class BaseTrainer:
 
 
 class PoissonTrainer(BaseTrainer):
-    """Trainer for the static Poisson problem (``data`` / ``galerkin`` / ``deepritz`` / ``pls``)."""
+    """Trainer for the static Poisson problem (``data`` / ``galerkin`` / ``pls``)."""
 
     def __init__(
         self,
@@ -289,19 +281,13 @@ class PoissonTrainer(BaseTrainer):
         epochs: int = 500,
         device: str = "cuda",
         output_dir: str = "output",
-        lambda_bc: float = 100.0,
-        bc_mode: str = "penalty",
-        precondition: bool = False,
         precond_kind: str = "multigrid",
         precond_strength: float = 1.0,
-        precond_method: str = "dense",
         mg_levels: int = 4,
         mg_pre_smooth: int = 2,
         mg_post_smooth: int = 2,
         mg_omega: float = 2.0 / 3.0,
         steps_per_epoch: Optional[int] = None,
-        patience: Optional[int] = None,
-        eval_datasets: Optional[dict] = None,
     ):
         super().__init__(model, loss_type, train_dataset.K, optimizer_name,
                          lr, lr_min, weight_decay, epochs, device, output_dir)
@@ -311,7 +297,6 @@ class PoissonTrainer(BaseTrainer):
         self.grid_size = train_dataset.grid_size
         self.stream = isinstance(train_dataset, IterableDataset)
         self.steps_per_epoch = steps_per_epoch
-        self.patience = patience
 
         # All splits share one PoissonProblem; move it (and its A, M) to the device once.
         self.problem = train_dataset.problem.to(device)
@@ -336,50 +321,30 @@ class PoissonTrainer(BaseTrainer):
         self.test_loader = DataLoader(test_dataset, batch_size=batch_size,
                                       shuffle=False, collate_fn=self._collate)
 
-        # Extra (out-of-distribution) eval loaders, scored each epoch. Same grid as the
-        # training set, so self.problem.M is the correct metric for their relative-L2.
-        self.eval_loaders = {
-            label: DataLoader(ds, batch_size=batch_size, shuffle=False,
-                              collate_fn=self._collate)
-            for label, ds in (eval_datasets or {}).items()
-        }
-
-        self.bc_mode = bc_mode
-        self.precondition = precondition
-
-        # Preconditioner for PLS or preconditioned Deep Ritz (multigrid or spectral).
+        # Preconditioner for the PLS loss (geometric multigrid, AMG or the spectral blend).
         self.precond: Optional[Preconditioner] = None
         self.precond_kind = precond_kind
         self.precond_strength = precond_strength
-        self.precond_method = precond_method
         self.mg_settings = (mg_levels, mg_pre_smooth, mg_post_smooth, mg_omega)
-        needs_precond = (loss_type == "pls") or (loss_type == "deepritz" and precondition)
-        if needs_precond:
+        if loss_type == "pls":
             self.precond = build_preconditioner(
                 kind=precond_kind, problem=self.problem, grid_size=self.grid_size,
                 mg_levels=mg_levels, mg_pre_smooth=mg_pre_smooth,
                 mg_post_smooth=mg_post_smooth, mg_omega=mg_omega,
-                strength=precond_strength, method=precond_method, device=device,
+                strength=precond_strength, device=device,
             )
 
         # The homogeneous Dirichlet BC (u=0 on the boundary) is known data, so we always
         # enforce it at eval by projecting the prediction's boundary to zero — for every
         # loss, so the reported error never counts a boundary the BC already fixes.
-        # (Assumes homogeneous BC; a non-zero Dirichlet problem would project to the known
-        # boundary values instead.)
         self.eval_project_bc = True
 
-        self.criterion = build_loss(loss_type, self.problem, lambda_bc,
-                                    bc_mode=bc_mode, precond=self.precond,
-                                    precondition=precondition)
+        self.criterion = build_loss(loss_type, self.problem, precond=self.precond)
 
-        # OOD histories + preconditioner diagnostics on the shared stats object
-        # (BaseTrainer.__init__ already built optimizer/scheduler/stats/best_state).
-        self.stats.ood_rel_l2 = {label: [] for label in self.eval_loaders}
+        # Preconditioner diagnostics on the shared stats object.
         if self.precond is not None:
             self.stats.precond_kind = self.precond_kind
             self.stats.precond_strength = self.precond_strength
-            self.stats.precond_method = self.precond_method
             self.stats.precond_cond_pa = getattr(self.precond, "cond_PA", float("nan"))
             self.stats.precond_cond_h = getattr(self.precond, "cond_H", float("nan"))
         os.makedirs(f"{self.output_dir}/results", exist_ok=True)
@@ -398,7 +363,7 @@ class PoissonTrainer(BaseTrainer):
         u_pred_grid = self.model(fs_grid).squeeze(1)                     # [B, H, W]
         if self.loss_type == "data":
             return self.criterion(u_pred_grid, us_grid)
-        # Galerkin / Deep Ritz / PLS: convert back to node order.
+        # Galerkin / PLS: convert back to node order.
         nx, ny = self.grid_size
         u_pred_node = grid_to_node(u_pred_grid, nx, ny)                  # [B, N]
         return self.criterion(u_pred_node, fs_node, us_node)
@@ -493,7 +458,9 @@ class PoissonTrainer(BaseTrainer):
 
         with tqdm(range(self.epochs), desc="Training", unit="epoch", colour="green") as bar:
             for epoch in bar:
+                t0 = time.perf_counter()
                 tr = self.train_epoch()
+                self.stats.epoch_times.append(time.perf_counter() - t0)
                 vl, l2, rl2 = self.validate()
                 self.scheduler.step()
                 lr = self.scheduler.get_last_lr()[0]
@@ -504,10 +471,6 @@ class PoissonTrainer(BaseTrainer):
                 self.stats.val_rel_l2_errors.append(rl2)
                 self.stats.learning_rates.append(lr)
 
-                # Out-of-distribution generalization: relative-L2 on each extra eval set.
-                for label, loader in self.eval_loaders.items():
-                    self.stats.ood_rel_l2[label].append(self._eval_loader(loader)[2])
-
                 if vl < self.stats.best_val_error:
                     self.stats.best_val_error = vl
                     self.stats.best_epoch = epoch
@@ -517,13 +480,6 @@ class PoissonTrainer(BaseTrainer):
                 bar.set_postfix(loss=f"{tr:.2e}", val=f"{vl:.2e}",
                                 l2=f"{l2:.2e}", rl2=f"{rl2:.2%}",
                                 best=f"{self.stats.best_val_error:.2e}", lr=f"{lr:.2e}")
-
-                if (self.patience is not None
-                        and epoch - self.stats.best_epoch >= self.patience):
-                    self.stats.stopped_epoch = epoch
-                    print(f"\nEarly stop at epoch {epoch}: no val improvement "
-                          f"for {self.patience} epochs (best: epoch {self.stats.best_epoch}).")
-                    break
 
         if self.best_state is not None:
             self.model.load_state_dict(self.best_state, strict=False)
@@ -548,20 +504,15 @@ class PoissonTrainer(BaseTrainer):
         record = {
             "prefix": self._file_prefix(),
             "loss_type": self.loss_type,
-            "bc_mode": self.bc_mode,
-            "precondition": self.precondition,
             "precond_kind": self.precond_kind,
             "precond_strength": self.precond_strength,
-            "precond_method": self.precond_method,
             "K": self.K,
             # Which labels this run was trained and scored against. Without it, an analytic-label
-            # and a fem-label run are indistinguishable on disk -- same prefix, same filename --
-            # and the only signal is the file mtime.
+            # and a fem-label run are indistinguishable on disk -- same prefix, same filename.
             "dataset_solution": getattr(self.train_dataset, "solution", None),
             "n_train": (None if self.stream else len(self.train_dataset)),
             "stream": self.stream,
             "steps_per_epoch": self.steps_per_epoch,
-            "patience": self.patience,
             "epochs": self.epochs,
             "test_mse": test_mse, "test_l2": test_l2, "test_rl2": test_rl2,
             "stats": asdict(self.stats),
@@ -584,14 +535,7 @@ class PoissonTrainer(BaseTrainer):
         return f"{self.precond_kind}-{self.precond_strength:.2f}"
 
     def _file_prefix(self) -> str:
-        if self.loss_type == "deepritz":
-            tag = f"_precond-{self._precond_tag()}" if self.precondition else f"_bc-{self.bc_mode}"
-        elif self.loss_type == "data":
-            tag = "_bc-hard" if self.bc_mode == "hard" else ""
-        elif self.loss_type == "pls":
-            tag = f"_{self._precond_tag()}"
-        else:
-            tag = ""
+        tag = f"_{self._precond_tag()}" if self.loss_type == "pls" else ""
         ntr = "inf" if self.stream else len(self.train_dataset)
         return (f"fno_{self.loss_type}{tag}_K{self.K}_"
                 f"samples-{ntr}-{len(self.val_dataset)}-{len(self.test_dataset)}")
@@ -613,23 +557,19 @@ class PoissonTrainer(BaseTrainer):
         self.compute_error_distribution()
 
 
-# Backwards-compatible alias: the historical name for the Poisson trainer.
-Trainer = PoissonTrainer
-
-
 class RolloutTrainer(BaseTrainer):
-    r"""Shared trainer for time-dependent PDEs as autoregressive FNO steppers.
+    r"""Shared trainer for time-dependent PDEs as autoregressive steppers.
 
-    The FNO maps the last ``n_seed_frames`` frames (an ``n_seed_frames``-channel grid) to the
+    The model maps the last ``n_seed_frames`` frames (an ``n_seed_frames``-channel grid) to the
     next frame. Each batch is seeded with the first ``n_seed_frames`` ground-truth frames and
     rolled forward ``rollout_steps`` times; predicted frames are projected onto the zero
-    Dirichlet boundary before being fed back. The loss is ``λ_gal·galerkin + λ_data·data``:
-    the Galerkin term is the weak-form residual over the rollout (supplied by ``self.criterion``,
-    which the subclass builds), the optional data term is the trajectory MSE against the
-    reference. Evaluation is always grid-space rollout MSE versus the reference trajectory.
+    Dirichlet boundary before being fed back, **detached** (pushforward training: every step is
+    a one-step function of its input, no backpropagation through time). The loss is
+    ``λ_gal·physics + λ_data·data``: the physics term is the residual over the rollout (supplied
+    by ``self.criterion``, which the subclass builds), the data term is the trajectory MSE against
+    the reference. Model selection uses the space-time relative FE-L2 against the reference.
 
     Subclasses set ``self.criterion`` after ``super().__init__`` and implement ``_file_prefix``.
-    ``n_seed_frames`` = 2 for the (second-order) wave equation, 1 for (first-order) Allen–Cahn.
     """
 
     def __init__(
@@ -651,7 +591,6 @@ class RolloutTrainer(BaseTrainer):
         lambda_galerkin: float = 1.0,
         lambda_data: float = 0.0,
         rollout_steps: int = 4,
-        bptt_mode=None,
     ):
         super().__init__(model, loss_type, train_dataset.K, optimizer_name,
                          lr, lr_min, weight_decay, epochs, device, output_dir)
@@ -668,11 +607,6 @@ class RolloutTrainer(BaseTrainer):
         self.rollout_steps = max(1, min(rollout_steps, self.n_steps - n_seed_frames + 1))
         self.lambda_galerkin = lambda_galerkin
         self.lambda_data = lambda_data
-        # Autodiff/BPTT mode. None -> current behaviour (full BPTT rollout). "pushforward" detaches
-        # each step's rollout input so gradients are one-step; the loss-side "coupling" detach is
-        # resolved separately (see ACTrainer). full_bptt/detach_prev keep the full rollout graph.
-        self.bptt_mode = bptt_mode
-        self.detach_rollout = (bptt_mode == "pushforward")
 
         # Predictions are unconstrained on the boundary during training (the residual masks
         # it), so project to zero-BC at eval — matching the zero-boundary reference.
@@ -710,9 +644,9 @@ class RolloutTrainer(BaseTrainer):
             nxt = self._project_zero_bc(self.model(inp).squeeze(1))      # [B, H, W]
             preds_grid.append(nxt)
             seq_node.append(grid_to_node(nxt, nx, ny))
-            # Slide the window. detach_rollout (pushforward) feeds the next step a detached input,
-            # so each stored frame is a one-step function of its input (no backprop through time).
-            window = window[1:] + [nxt.detach() if self.detach_rollout else nxt]
+            # Slide the window. The next step gets a detached input (pushforward), so each stored
+            # frame is a one-step function of its input (no backprop through time).
+            window = window[1:] + [nxt.detach()]
         return torch.stack(preds_grid, dim=1), torch.stack(seq_node, dim=1)
 
     def train_epoch(self) -> float:
@@ -797,10 +731,7 @@ class RolloutTrainer(BaseTrainer):
         record = {
             "prefix": self._file_prefix(),
             "loss_type": self.loss_type,
-            "ac_loss_form": getattr(self, "ac_loss_form", None),
-            "ac_integrator": getattr(self, "ac_integrator", None),
             "ac_precond": getattr(self, "ac_precond", ""),
-            "bptt_mode": self.bptt_mode,
             "lambda_galerkin": self.lambda_galerkin,
             "lambda_data": self.lambda_data,
             "a": getattr(self, "a", None), "eps": getattr(self, "eps", None),
@@ -840,68 +771,30 @@ class RolloutTrainer(BaseTrainer):
         self.compute_error_distribution()
 
 
-class WaveTrainer(RolloutTrainer):
-    r"""Wave equation stepper: FNO maps ``[u^{n-1}, u^n]`` → ``u^{n+1}`` (2 seed frames),
-    trained on the central-difference weak-form residual (label-free) + optional data MSE."""
-
-    def __init__(self, model, train_dataset, val_dataset, test_dataset,
-                 loss_type="galerkin", optimizer_name="adam", lr=1e-3, lr_min=1e-6,
-                 weight_decay=0.0, batch_size=32, epochs=500, device="cuda",
-                 output_dir="output", lambda_galerkin=1.0, lambda_data=0.0,
-                 rollout_steps=4, discount_factor=1.0):
-        super().__init__(model, train_dataset, val_dataset, test_dataset, loss_type,
-                         n_seed_frames=2, optimizer_name=optimizer_name, lr=lr, lr_min=lr_min,
-                         weight_decay=weight_decay, batch_size=batch_size, epochs=epochs,
-                         device=device, output_dir=output_dir, lambda_galerkin=lambda_galerkin,
-                         lambda_data=lambda_data, rollout_steps=rollout_steps)
-        self.c = train_dataset.c
-        self.discount_factor = discount_factor
-        self.criterion = build_wave_loss(self.problem, c=self.c, dt=self.dt,
-                                         discount=discount_factor)
-
-    def _file_prefix(self) -> str:
-        return (f"fno_wave_{self.loss_type}_c{self.c:g}_dt{self.dt:g}_"
-                f"T{self.n_steps}_R{self.rollout_steps}_K{self.K}_"
-                f"samples-{len(self.train_dataset)}-{len(self.val_dataset)}-{len(self.test_dataset)}")
-
-
 class ACTrainer(RolloutTrainer):
-    r"""Allen–Cahn stepper: FNO maps ``u^n`` → ``u^{n+1}`` (1 seed frame), trained on the
-    backward-Euler weak-form residual (label-free) + optional data MSE against the FEM reference."""
+    r"""Allen–Cahn stepper: the model maps ``u^n`` → ``u^{n+1}`` (1 seed frame), trained on the
+    convex–concave weak-form step residual (label-free, optionally preconditioned) and/or the
+    trajectory MSE against the FEM reference."""
 
     def __init__(self, model, train_dataset, val_dataset, test_dataset,
                  loss_type="galerkin", optimizer_name="adam", lr=1e-3, lr_min=1e-6,
                  weight_decay=0.0, batch_size=32, epochs=500, device="cuda",
                  output_dir="output", lambda_galerkin=1.0, lambda_data=0.0,
-                 rollout_steps=4, discount_factor=1.0, ac_integrator=None,
-                 ac_loss_form="galerkin", bptt_mode=None, ac_precond="",
+                 rollout_steps=4, ac_precond="",
                  mg_levels=4, mg_pre_smooth=2, mg_post_smooth=2, mg_omega=2.0 / 3.0):
         super().__init__(model, train_dataset, val_dataset, test_dataset, loss_type,
                          n_seed_frames=1, optimizer_name=optimizer_name, lr=lr, lr_min=lr_min,
                          weight_decay=weight_decay, batch_size=batch_size, epochs=epochs,
                          device=device, output_dir=output_dir, lambda_galerkin=lambda_galerkin,
-                         lambda_data=lambda_data, rollout_steps=rollout_steps, bptt_mode=bptt_mode)
+                         lambda_data=lambda_data, rollout_steps=rollout_steps)
         self.a = train_dataset.a
         self.eps = train_dataset.eps
-        self.discount_factor = discount_factor
-        # Default the physics-loss residual to the same integrator the reference data was built
-        # with (kept coherent), unless explicitly overridden.
-        self.ac_integrator = ac_integrator or getattr(train_dataset, "integrator", "backward_euler")
-        self.ac_loss_form = ac_loss_form
-        # bptt_mode resolves to the loss-side "coupling" detach (proximal centre / previous frame);
-        # None keeps each loss's own default (MM detaches, Galerkin does not). detach_rollout (the
-        # pushforward) is handled on the base trainer.
-        detach_coupling = None if bptt_mode is None else (bptt_mode in ("detach_prev", "pushforward"))
 
         # Preconditioned least-squares: P ≈ J_0^{-1} with J_0 = a²A + cM the frozen (u²=1) Newton
-        # Jacobian (c = 1/dt + 3ε²), realized as a multigrid V-cycle on a²A + cM. See
-        # notes/ac_autoregressive/ §"Preconditioning the least-squares loss". Galerkin form only.
+        # Jacobian (c = 1/dt + 3ε²), realized as a multigrid V-cycle on a²A + cM.
         self.ac_precond = ac_precond or ""
         self.precond: Optional[Preconditioner] = None
         if self.ac_precond:
-            if ac_loss_form != "galerkin":
-                raise ValueError("--ac_precond applies to the least-squares residual only "
-                                 f"(--ac_loss_form galerkin), got {ac_loss_form!r}")
             if self.ac_precond != "multigrid":
                 raise ValueError(f"unknown ac_precond {self.ac_precond!r}; expected 'multigrid'")
             a2 = self.a * self.a
@@ -913,43 +806,43 @@ class ACTrainer(RolloutTrainer):
             print(f"[ac precond] multigrid V-cycle on a²A+cM  (a²={a2:g}, c=1/dt+3ε²={c:g})")
 
         self.criterion = build_ac_loss(self.problem, a=self.a, eps=self.eps, dt=self.dt,
-                                       discount=discount_factor, integrator=self.ac_integrator,
-                                       form=ac_loss_form, detach_coupling=detach_coupling,
                                        precond=self.precond)
 
     def _file_prefix(self) -> str:
-        itag = {"convex_concave": "cc", "backward_euler": "be"}.get(self.ac_integrator, self.ac_integrator)
-        ftag = {"galerkin": "ls", "min_movement": "mm"}.get(self.ac_loss_form, self.ac_loss_form)
+        # "ls" (least-squares form), "cc" (convex-concave) and "bptt-push" (pushforward) are fixed
+        # properties of every run here; they stay in the name so the files match the paper's runs.
         # Tag preconditioned LS so it never collides with the bare-LS run at the same config.
         ptag = "_precmg" if getattr(self, "ac_precond", "") else ""
-        # Tag the bptt mode only when set, so existing (mode=None) run filenames are unchanged.
-        btag = "" if self.bptt_mode is None else \
-            "_bptt-" + {"full_bptt": "full", "detach_prev": "detach", "pushforward": "push"}.get(
-                self.bptt_mode, self.bptt_mode)
-        return (f"fno_ac_{self.loss_type}_{ftag}{ptag}_{itag}{btag}_a{self.a:g}_eps{self.eps:g}_dt{self.dt:g}_"
+        return (f"fno_ac_{self.loss_type}_ls{ptag}_cc_bptt-push_a{self.a:g}_eps{self.eps:g}_dt{self.dt:g}_"
                 f"T{self.n_steps}_R{self.rollout_steps}_K{self.K}_"
                 f"samples-{len(self.train_dataset)}-{len(self.val_dataset)}-{len(self.test_dataset)}")
 
 
 class StokesTrainer(BaseTrainer):
-    r"""Trainer for the stationary Stokes saddle-point problem.
+    r"""Trainer for the stationary Stokes saddle-point problem on the obstacle mesh.
 
-    The FNO maps the body force to the *pair* of fields: ``[B, 2, Ny, Nx]`` → ``[B, 3, Ny, Nx]``
-    with channels ``(u_x, u_y, p)``. :meth:`~tensorpils.physics.StokesProblem.from_grid`
-    reads velocity on the full fine grid and pressure on the ``[::2, ::2]`` Q1 subgrid.
+    The model is queried at the P2 nodes and maps the body force to the *pair* of fields:
+    ``[B, n_u, 2]`` → ``[B, n_u, 3]`` with channels ``(u_x, u_y, p)``;
+    :meth:`~tensorpils.physics.StokesProblem.from_nodes` reads the velocity everywhere and the
+    pressure at the triangle corners (the P1 nodes).
 
     Every prediction — for *every* loss, at train and eval time — is passed through the two
     projections that encode known structure rather than learned structure:
 
-    * zero Dirichlet velocity on ``∂Ω``;
+    * zero Dirichlet velocity on ``∂Ω`` (both the outer box and the hole);
     * the zero-mean pressure gauge, since the residual is blind to the constant mode
       (:math:`B^\top\mathbf 1 = 0`) and could never determine it.
 
     Evaluation reports FE :math:`L^2` errors against the discrete Taylor-Hood reference,
-    separately for velocity and pressure — they live in different spaces on different grids,
-    so a single grid MSE would be meaningless. Best-model selection uses the combined
-    squared FE error.
+    separately for velocity and pressure — they live in different spaces, so a single MSE would
+    be meaningless. Best-model selection uses the mean of the two relative errors.
+
+    The ``pls`` loss uses the block preconditioner ``P = diag(Â⁻¹/μ, ω μ/diag(M_p))`` as a norm
+    weight, with ``Â⁻¹`` one **algebraic** V-cycle on the P2 scalar stiffness.
     """
+
+    #: Tag that goes in the run file name, next to the velocity node count.
+    mesh_tag = "obstacle"
 
     def __init__(
         self,
@@ -966,19 +859,8 @@ class StokesTrainer(BaseTrainer):
         epochs: int = 500,
         device: str = "cuda",
         output_dir: str = "output",
-        mg_levels: int = 4,
-        mg_pre_smooth: int = 2,
-        mg_post_smooth: int = 2,
-        mg_omega: float = 2.0 / 3.0,
+        amg_sweeps: int = 2,
         schur_omega: float = 0.5,
-        precond_strength: float = 1.0,
-        precond_kind: str = "block",
-        pls_form: str = "auto",
-        stokes_div_weight: float = 1.0,
-        uzawa_pre: int = 4,
-        uzawa_post: int = 4,
-        cheb_degree: int = 8,
-        cheb_ratio: float = 30.0,
     ):
         super().__init__(model, loss_type, train_dataset.K, optimizer_name,
                          lr, lr_min, weight_decay, epochs, device, output_dir)
@@ -986,8 +868,8 @@ class StokesTrainer(BaseTrainer):
         self.val_dataset = val_dataset
         self.test_dataset = test_dataset
         self.problem = train_dataset.problem.to(device)
-        self.grid_size = self.problem.grid_size
         self.mu = self.problem.mu
+        self.n_nodes = self.problem.n_u
         self.f_scale = float(getattr(train_dataset, "f_scale", 1.0))
         self.p_scale = float(getattr(train_dataset, "p_scale", 1.0))
         self.u_l2_scale = float(getattr(train_dataset, "u_l2_scale", 1.0))
@@ -1000,61 +882,20 @@ class StokesTrainer(BaseTrainer):
 
         self.precond: Optional[Preconditioner] = None
         self.schur_omega = schur_omega
-        self.precond_strength = float(precond_strength)
-        self.precond_kind = precond_kind
-        self.mg_settings = (mg_levels, mg_pre_smooth, mg_post_smooth, mg_omega)
-        self.uzawa_settings = (uzawa_pre, uzawa_post, cheb_degree, cheb_ratio)
+        self.amg_sweeps = int(amg_sweeps)
         if loss_type == "pls":
-            if precond_kind == "monolithic":
-                # A genuine P ~ K^-1, which is what makes the *applied* form viable at O(1)
-                # conditioning; the block preconditioner below is only norm-equivalent.
-                self.precond = StokesMonolithicMultigrid(
-                    self.problem, n_levels=mg_levels, n_pre=uzawa_pre, n_post=uzawa_post,
-                    cheb_degree=cheb_degree, cheb_ratio=cheb_ratio,
-                    schur_omega=schur_omega).to(device)
-            elif precond_kind == "block":
-                base = StokesBlockPreconditioner(
-                    self.problem, mg_levels=mg_levels, mg_pre_smooth=mg_pre_smooth,
-                    mg_post_smooth=mg_post_smooth, mg_omega=mg_omega,
-                    schur_omega=schur_omega,
-                    velocity_precond=self._velocity_precond(mg_pre_smooth, device)).to(device)
-                # strength < 1 blends toward the identity: P_t = (1-t)*alpha*I + t*P_block, so t=0
-                # reproduces the bare least-squares loss and t=1 the block preconditioner.
-                self.precond = (base if self.precond_strength >= 1.0
-                                else StokesBlendPreconditioner(
-                                    base, self.precond_strength).to(device))
-            else:
-                raise ValueError(f"precond_kind must be 'block' or 'monolithic', "
-                                 f"got {precond_kind!r}")
+            velocity = AMGXPreconditioner(self.problem.A, self.problem.boundary_mask,
+                                          sweeps=self.amg_sweeps, device=(device or "cuda:0"))
+            self.precond = StokesBlockPreconditioner(
+                self.problem, velocity_precond=velocity, schur_omega=schur_omega).to(device)
 
-        # 'auto': the weighted norm for a norm-equivalent block P; for a monolithic approximate
-        # inverse the applied form, in the FE metric — the plain nodal one is ~350x
-        # pressure-dominated for this dataset (see StokesAppliedPLSLoss).
-        self.pls_form = (("applied_fe" if precond_kind == "monolithic" else "weighted")
-                         if pls_form == "auto" else pls_form)
-        # The continuity-block weight of the FEM least-squares arm -- the counterpart of the
-        # strong-form baseline's --pi_div_weight, so the two controls can be read against each
-        # other instead of one carrying a tuned knob the other lacks.
-        self.stokes_div_weight = float(stokes_div_weight)
         self.criterion = (None if loss_type == "data"
-                          else build_stokes_loss(loss_type, self.problem, precond=self.precond,
-                                                 form=self.pls_form,
-                                                 u_scale=self.u_l2_scale, p_scale=self.p_l2_scale,
-                                                 div_weight=self.stokes_div_weight))
+                          else build_stokes_loss(loss_type, self.problem, precond=self.precond))
         os.makedirs(f"{self.output_dir}/results", exist_ok=True)
 
-    def _velocity_precond(self, sweeps: int, device: str):
-        """Operator for the block preconditioner's velocity half.
-
-        ``None`` means "build the geometric V-cycle from the grid", which is the structured
-        case. The unstructured subclass returns an algebraic V-cycle instead — that one
-        substitution is the only part of the block preconditioner that was ever tied to a grid.
-        """
-        return None
-
     # -------------------- prediction --------------------
-    def _predict(self, f_grid: torch.Tensor):
-        """FNO forward → physical ``(u_node, p_node)``.
+    def _predict(self, f_node: torch.Tensor):
+        """``[B, n_u, 2]`` body force → physical ``(u_node [B, n_u, 2], p_node [B, n_p])``.
 
         Four fixed, non-trainable steps. Two are *scaling* (see ``StokesDataset``): the
         input is divided by ``f_scale`` and the pressure channel multiplied by ``p_scale``,
@@ -1062,19 +903,18 @@ class StokesTrainer(BaseTrainer):
         magnitudes orders of magnitude apart. Two are *structural*: the velocity is
         projected to the zero Dirichlet boundary and the pressure to zero mean.
         """
-        out = self.model(f_grid / self.f_scale)                    # [B, 3, Ny, Nx]
-        u_node, p_node = self.problem.from_grid(out)
+        out = self.model.forward_nodes(f_node / self.f_scale)          # [B, n_u, 3]
+        u_node, p_node = self.problem.from_nodes(out)
         return (self.problem.project_velocity_bc(u_node),
                 self.problem.project_pressure_gauge(p_node * self.p_scale))
 
     def _data_loss(self, u_pred, p_pred, u_true, p_true) -> torch.Tensor:
         r"""Supervised FE-norm loss ``½(‖u−u*‖²_{M_u}/‖u‖² + ‖p−p*‖²_{M_p}/‖p‖²)``.
 
-        Mass-weighted rather than a flat grid MSE because velocity and pressure live on
-        different spaces and grids. Each term is divided by that field's mean squared FE
-        norm over the dataset: the physics fixes ``‖p‖ ≈ 50‖u‖`` here, so an *unweighted*
-        sum is ~2500x dominated by pressure and the velocity is effectively not optimized
-        at all (measured: 85% velocity error while pressure reaches 9%).
+        Mass-weighted rather than a flat MSE because velocity and pressure live on different
+        spaces. Each term is divided by that field's mean squared FE norm over the dataset: the
+        physics fixes ``‖p‖`` far above ``‖u‖`` here, so an *unweighted* sum is dominated by
+        pressure and the velocity is effectively not optimized at all.
         """
         eu = self.problem.velocity_l2(u_pred - u_true) ** 2 / self.u_l2_scale ** 2
         ep = self.problem.pressure_l2(p_pred - p_true) ** 2 / self.p_l2_scale ** 2
@@ -1084,14 +924,12 @@ class StokesTrainer(BaseTrainer):
     def train_epoch(self) -> float:
         self.model.train()
         total, nb = 0.0, 0
-        for f_grid, f_node, u_true, p_true in self.train_loader:
-            f_grid, f_node = f_grid.to(self.device), f_node.to(self.device)
+        for f_node, u_true, p_true in self.train_loader:
+            f_node = f_node.to(self.device)
             u_true, p_true = u_true.to(self.device), p_true.to(self.device)
-            u_pred, p_pred = self._predict(f_grid)
-            if self.loss_type == "data":
-                loss = self._data_loss(u_pred, p_pred, u_true, p_true)
-            else:
-                loss = self.criterion(u_pred, p_pred, f_node)
+            u_pred, p_pred = self._predict(f_node)
+            loss = (self._data_loss(u_pred, p_pred, u_true, p_true) if self.loss_type == "data"
+                    else self.criterion(u_pred, p_pred, f_node))
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
             self.optimizer.step()
@@ -1106,18 +944,18 @@ class StokesTrainer(BaseTrainer):
         self.model.eval()
         sq, n = 0.0, 0
         nu = du = np_ = dp = 0.0
-        for f_grid, f_node, u_true, p_true in loader:
-            f_grid = f_grid.to(self.device)
+        for f_node, u_true, p_true in loader:
+            f_node = f_node.to(self.device)
             u_true, p_true = u_true.to(self.device), p_true.to(self.device)
-            u_pred, p_pred = self._predict(f_grid)
-            eu = self.problem.velocity_l2(u_pred - u_true) ** 2          # [B]
-            ep = self.problem.pressure_l2(p_pred - p_true) ** 2          # [B]
+            u_pred, p_pred = self._predict(f_node)
+            eu = self.problem.velocity_l2(u_pred - u_true) ** 2
+            ep = self.problem.pressure_l2(p_pred - p_true) ** 2
             sq += (eu + ep).sum().item()
             nu += eu.sum().item()
             du += (self.problem.velocity_l2(u_true) ** 2).sum().item()
             np_ += ep.sum().item()
             dp += (self.problem.pressure_l2(p_true) ** 2).sum().item()
-            n += f_grid.shape[0]
+            n += f_node.shape[0]
         return (sq / n, math.sqrt(nu / max(du, 1e-30)), math.sqrt(np_ / max(dp, 1e-30)))
 
     def validate(self):
@@ -1153,19 +991,10 @@ class StokesTrainer(BaseTrainer):
             "mu": self.mu,
             "schur_omega": self.schur_omega,
             "K": self.K,
-            # None on an unstructured mesh; the node counts below are what identify it.
-            "grid": list(self.grid_size) if self.grid_size else None,
-            "pgrid": (list(self.problem.pgrid_size)
-                      if self.problem.pgrid_size else None),
             "n_u": self.problem.n_u, "n_p": self.problem.n_p,
-            "mesh": getattr(self, "mesh_tag", "structured"),
+            "mesh": self.mesh_tag,
             "n_train": len(self.train_dataset),
             "epochs": self.epochs,
-            "precond_strength": self.precond_strength if self.loss_type == "pls" else None,
-            "precond_alpha": getattr(self.precond, "alpha", None),
-            "precond_kind": self.precond_kind if self.loss_type == "pls" else None,
-            "pls_form": self.pls_form if self.loss_type == "pls" else None,
-            "uzawa": list(self.uzawa_settings) if self.precond_kind == "monolithic" else None,
             "test_sq_fe_l2": sq, "test_rel_l2_u": ru, "test_rel_l2_p": rp,
             "best_val_error": self.stats.best_val_error, "best_epoch": self.stats.best_epoch,
             "stats": asdict(self.stats),
@@ -1177,37 +1006,21 @@ class StokesTrainer(BaseTrainer):
 
     # -------------------- naming / viz --------------------
     def _file_prefix(self) -> str:
-        if self.loss_type == "pls" and self.precond_kind == "monolithic":
-            L, _, _, _ = self.mg_settings
-            nu1, nu2, cd, _ = self.uzawa_settings
-            tag = f"_mono-L{L}-u{nu1}{nu2}-c{cd}-w{self.schur_omega:g}"
-            if self.pls_form != "applied":
-                tag += f"-{self.pls_form}"
-        elif self.loss_type == "pls":
-            L, pre, post, _ = self.mg_settings
-            tag = f"_mg-L{L}-s{pre}{post}-w{self.schur_omega:g}"
-            if self.precond_strength < 1.0:
-                tag += f"-t{self.precond_strength:g}"
-            if self.pls_form != "weighted":
-                tag += f"-{self.pls_form}"
-        elif self.loss_type == "galerkin" and self.stokes_div_weight != 1.0:
-            tag = f"_dw{self.stokes_div_weight:g}"
-        else:
-            tag = ""
-        nx, _ = self.grid_size
-        return (f"fno_stokes_{self.loss_type}{tag}_mu{self.mu:g}_gr{nx}_K{self.K}_"
+        tag = f"_amg-s{self.amg_sweeps}-w{self.schur_omega:g}" if self.loss_type == "pls" else ""
+        return (f"fno_stokes_{self.loss_type}{tag}_mu{self.mu:g}_"
+                f"{self.mesh_tag}-n{self.n_nodes}_K{self.K}_"
                 f"samples-{len(self.train_dataset)}-{len(self.val_dataset)}-{len(self.test_dataset)}")
 
     @torch.no_grad()
-    def _predict_eval(self, f_grid: torch.Tensor):
+    def _predict_eval(self, f_node: torch.Tensor):
         """``_predict`` in eval mode — the single prediction path handed to ``viz``."""
         self.model.eval()
-        return self._predict(f_grid)
+        return self._predict(f_node)
 
     def visualize_sample(self, dataset, split: str, sample_idx: int = 0):
-        suffix = "" if sample_idx == 0 else f"_sample{sample_idx}"
+        suffix = "" if sample_idx == 0 else f"{sample_idx}"
         viz.visualize_stokes_sample(
-            self._predict_eval, dataset, self.problem, self.device, sample_idx=sample_idx,
+            self._predict_eval, dataset, self.problem, self.device, sample_idx,
             save_path=f"{self.output_dir}/visualization/{self._file_prefix()}_{split}{suffix}.png")
 
     def compute_error_distribution(self):
@@ -1221,9 +1034,9 @@ class StokesTrainer(BaseTrainer):
 
 
 # ================================================================= architecture variants
-# GAOT is a second *production* architecture, not a baseline: it runs the same losses, the same
-# validation and the same test metric as the FNO, and differs only in what maps f to u. These
-# subclasses exist solely so its runs get their own file prefix -- see ``ArchPrefixMixin``.
+# GAOT runs the same losses, the same validation and the same test metric as the FNO, and
+# differs only in what maps f to u. These subclasses exist solely so its runs get their own file
+# prefix -- see ``ArchPrefixMixin``.
 
 
 class GAOTPoissonTrainer(ArchPrefixMixin, PoissonTrainer):
@@ -1235,260 +1048,6 @@ class GAOTPoissonTrainer(ArchPrefixMixin, PoissonTrainer):
     """
 
 
-class GAOTWaveTrainer(ArchPrefixMixin, WaveTrainer):
-    """``WaveTrainer`` counterpart (autoregressive wave time-stepper)."""
-
-
-class GAOTACTrainer(ArchPrefixMixin, ACTrainer):
-    """``ACTrainer`` counterpart of :class:`GAOTPoissonTrainer` (autoregressive Allen-Cahn)."""
-
-
 class GAOTStokesTrainer(ArchPrefixMixin, StokesTrainer):
-    """``StokesTrainer`` counterpart: GAOT emits the 3-channel ``(u_x, u_y, p)`` grid the
-    Taylor-Hood plumbing already expects, so ``_predict`` and the evaluation are inherited."""
-
-
-# ============================================================== unstructured (no grid at all)
-
-
-class UnstructuredPoissonTrainer(PoissonTrainer):
-    r"""Poisson on an unstructured mesh: everything in node space, no image anywhere.
-
-    Subclasses :class:`PoissonTrainer` rather than replacing it, so the optimizer, the cosine
-    schedule, model selection, checkpointing, early stopping and the results JSON are the
-    *same code* as the structured runs — an unstructured number is therefore produced by the
-    same evaluation as a structured one, and the two are comparable.
-
-    Four things are overridden, and each is exactly the place the grid was assumed:
-
-    * ``_collate`` / ``train_epoch`` / ``_forward`` — items are ``(f_node, u_node)`` and the
-      model is called through ``forward_nodes``; there is no ``[B, C, H, W]`` to build.
-    * ``_project_zero_bc`` — the boundary is the mesh's ``boundary_mask``, not an outer frame.
-    * ``_eval_loader`` — model selection is node MSE, which on a uniform grid is *numerically*
-      the grid MSE the structured runs select on. The FEM L2 (``sqrt(e^T M e)``) and relative
-      L2 alongside it were already mesh-agnostic and are untouched.
-    * ``_file_prefix`` — carries a mesh tag, so an unstructured run cannot land on a structured
-      run's checkpoint.
-
-    The preconditioner is the other half of this. ``GeometricMultigrid`` re-discretises a
-    structured hierarchy and has no grid to do it on here — it builds without complaint and
-    then dies on a shape mismatch at the first apply — so the ``pls`` arm needs
-    ``--precond_kind amg``, which is assembled from the matrix. :mod:`tensorpils.cli` enforces
-    that rather than letting the job discover it after the queue wait.
-    """
-
-    #: Tag that goes in the run file name, so structured/unstructured runs never collide.
-    mesh_tag = "circle"
-
-    def __init__(self, *args, mesh_tag: Optional[str] = None, **kwargs):
-        super().__init__(*args, **kwargs)
-        if mesh_tag is not None:
-            self.mesh_tag = mesh_tag
-        self.n_nodes = self.train_dataset.n_nodes
-        # PoissonTrainer builds the criterion from build_loss(); `data` is the one loss defined
-        # on the image, so swap in its node counterpart.
-        if self.loss_type == "data":
-            self.criterion = build_loss(self.loss_type, self.problem, lambda_bc=0.0,
-                                        bc_mode=self.bc_mode, node_form=True)
-
-    # -------------------- node-space plumbing --------------------
-    @staticmethod
-    def _collate(batch):
-        fs = torch.stack([item[0] for item in batch], dim=0)        # [B, N]
-        us = torch.stack([item[1] for item in batch], dim=0)        # [B, N]
-        return fs, us
-
-    def _project_zero_bc(self, u_node: torch.Tensor) -> torch.Tensor:
-        """Zero the mesh's boundary nodes. ``[B, N]`` in, ``[B, N]`` out."""
-        return apply_zero_boundary(u_node, self.problem.boundary_mask.to(u_node.device))
-
-    def _predict(self, fs_node: torch.Tensor) -> torch.Tensor:
-        """``[B, N]`` source -> ``[B, N]`` prediction, through the point-cloud entry point."""
-        return self.model.forward_nodes(fs_node.unsqueeze(-1))[..., 0]
-
-    def _forward(self, fs_node, us_node):
-        u_pred = self._predict(fs_node)
-        if self.loss_type == "data":
-            return self.criterion(u_pred, us_node)
-        return self.criterion(u_pred, fs_node, us_node)
-
-    def train_epoch(self) -> float:
-        self.model.train()
-        total, nb = 0.0, 0
-        for fs, us in self.train_loader:
-            self.optimizer.zero_grad()
-            fs, us = fs.to(self.device), us.to(self.device)
-            loss = self._forward(fs, us)
-            loss.backward()
-            self.optimizer.step()
-            total += loss.item()
-            nb += 1
-        return total / nb
-
-    @torch.no_grad()
-    def _eval_loader(self, loader):
-        """``(node MSE, FEM L2, relative L2)`` — the structured tuple, read off nodes."""
-        self.model.eval()
-        total_mse, total_l2, total_rel_l2, n = 0.0, 0.0, 0.0, 0
-        for fs, us in loader:
-            fs, us = fs.to(self.device), us.to(self.device)
-            u_pred = self._apply_eval_bc(self._predict(fs))
-            b = fs.shape[0]
-            total_mse += ((u_pred - us) ** 2).mean().item() * b
-            e = u_pred - us
-            Me = self.problem._spmm(self.problem.M, e)
-            l2 = (e * Me).sum(dim=1).clamp(min=0).sqrt()
-            total_l2 += l2.sum().item()
-            Mu = self.problem._spmm(self.problem.M, us)
-            u_norm = (us * Mu).sum(dim=1).clamp(min=0).sqrt()
-            total_rel_l2 += (l2 / u_norm.clamp(min=1e-12)).sum().item()
-            n += b
-        return total_mse / n, total_l2 / n, total_rel_l2 / n
-
-    # -------------------- bookkeeping --------------------
-    def _file_prefix(self) -> str:
-        return f"{super()._file_prefix()}_{self.mesh_tag}-n{self.n_nodes}"
-
-    def visualize_sample(self, dataset, split: str, sample_idx: int = 0):
-        suffix = "" if sample_idx == 0 else f"{sample_idx}"
-        viz.visualize_unstructured_sample(
-            self._predict, dataset, self.device, self._apply_eval_bc, sample_idx,
-            save_path=f"{self.output_dir}/visualization/{self._file_prefix()}_{split}{suffix}.png")
-
-    def compute_error_distribution(self):
-        return viz.compute_unstructured_error_distribution(
-            self._predict, self.test_dataset, self.problem, self.device, self._apply_eval_bc,
-            save_path=f"{self.output_dir}/error/{self._file_prefix()}_error_dist.png")
-
-
-class GAOTUnstructuredPoissonTrainer(ArchPrefixMixin, UnstructuredPoissonTrainer):
-    """The unstructured arm as it is actually run: GAOT is the only architecture here that can
-    consume a point cloud, but the prefix tag is kept general so a future one drops in."""
-
-
-class UnstructuredStokesTrainer(StokesTrainer):
-    r"""Taylor-Hood Stokes on an unstructured mesh — no image on either side.
-
-    Subclasses :class:`StokesTrainer` for the same reason the Poisson one does: the optimizer,
-    the schedule, model selection, checkpointing, the results JSON and — decisively — the
-    **evaluation** (per-field relative FE ``L²``, selected on their mean) are the same code as
-    the structured runs, so an unstructured Stokes number is produced by exactly the evaluation
-    that produced the structured table.
-
-    What had to change is small and all of it was grid:
-
-    * ``_predict`` — the model is called through ``forward_nodes`` on the P2 node set and emits
-      three channels there; pressure is gathered at the corner nodes by
-      :meth:`~tensorpils.physics.UnstructuredStokesProblem.from_nodes` instead of read off the
-      ``[::2, ::2]`` subgrid. The two scalings and the two projections are untouched.
-    * ``_velocity_precond`` — an **algebraic** V-cycle on the P2 scalar stiffness replaces the
-      geometric one. This is the only part of the block preconditioner
-      ``P = diag(Â⁻¹/μ, ω μ/diag(M_p))`` that was ever tied to a grid: the pressure half is a
-      lumped diagonal and was always mesh-agnostic.
-    * the loaders' item is ``(f, u, p)`` rather than ``(f_grid, f, u, p)``.
-
-    ``--stokes_precond monolithic`` is **not** available here. That preconditioner's transfer
-    operators are geometric (nested grids for both fields simultaneously), and an algebraic
-    monolithic saddle-point preconditioner is a research question rather than a port. The block
-    form is the arm the structured table's label-free number came from, and it is the one that
-    carries over.
-    """
-
-    mesh_tag = "obstacle"
-
-    def __init__(self, *args, mesh_tag: Optional[str] = None, **kwargs):
-        if kwargs.get("precond_kind") == "monolithic":
-            raise SystemExit(
-                "--stokes_precond monolithic has no unstructured form: its transfer operators "
-                "are geometric (both fields nesting by two on a grid). Use --stokes_precond "
-                "block, whose velocity half becomes an algebraic V-cycle.")
-        super().__init__(*args, **kwargs)
-        if mesh_tag is not None:
-            self.mesh_tag = mesh_tag
-        self.n_nodes = self.problem.n_u
-
-    def _velocity_precond(self, sweeps: int, device: str):
-        """Algebraic V-cycle on the P2 scalar stiffness — the velocity block up to ``mu``."""
-        from .preconditioners import AMGXPreconditioner
-        return AMGXPreconditioner(self.problem.A, self.problem.boundary_mask,
-                                  sweeps=sweeps, device=(device or "cuda:0"))
-
-    # -------------------- prediction --------------------
-    def _predict(self, f_node: torch.Tensor):
-        """``[B, n_u, 2]`` body force → physical ``(u_node [B, n_u, 2], p_node [B, n_p])``.
-
-        The same four fixed steps as the structured trainer — input scaling, pressure scaling,
-        the velocity boundary projection and the pressure gauge — with the grid reshape
-        replaced by a gather. Nothing here is trainable.
-        """
-        out = self.model.forward_nodes(f_node / self.f_scale)          # [B, n_u, 3]
-        u_node, p_node = self.problem.from_nodes(out)
-        return (self.problem.project_velocity_bc(u_node),
-                self.problem.project_pressure_gauge(p_node * self.p_scale))
-
-    # -------------------- train / eval --------------------
-    def train_epoch(self) -> float:
-        self.model.train()
-        total, nb = 0.0, 0
-        for f_node, u_true, p_true in self.train_loader:
-            f_node = f_node.to(self.device)
-            u_true, p_true = u_true.to(self.device), p_true.to(self.device)
-            u_pred, p_pred = self._predict(f_node)
-            loss = (self._data_loss(u_pred, p_pred, u_true, p_true) if self.loss_type == "data"
-                    else self.criterion(u_pred, p_pred, f_node))
-            self.optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            self.optimizer.step()
-            total += loss.item()
-            nb += 1
-        return total / nb
-
-    @torch.no_grad()
-    def _eval_loader(self, loader):
-        """``(sq_err, rel_l2_u, rel_l2_p)`` — the structured tuple, read off nodes."""
-        self.model.eval()
-        sq, n = 0.0, 0
-        nu = du = np_ = dp = 0.0
-        for f_node, u_true, p_true in loader:
-            f_node = f_node.to(self.device)
-            u_true, p_true = u_true.to(self.device), p_true.to(self.device)
-            u_pred, p_pred = self._predict(f_node)
-            eu = self.problem.velocity_l2(u_pred - u_true) ** 2
-            ep = self.problem.pressure_l2(p_pred - p_true) ** 2
-            sq += (eu + ep).sum().item()
-            nu += eu.sum().item()
-            du += (self.problem.velocity_l2(u_true) ** 2).sum().item()
-            np_ += ep.sum().item()
-            dp += (self.problem.pressure_l2(p_true) ** 2).sum().item()
-            n += f_node.shape[0]
-        return (sq / n, math.sqrt(nu / max(du, 1e-30)), math.sqrt(np_ / max(dp, 1e-30)))
-
-    # -------------------- bookkeeping --------------------
-    def _file_prefix(self) -> str:
-        tag = ""
-        if self.loss_type == "galerkin" and self.stokes_div_weight != 1.0:
-            tag = f"_dw{self.stokes_div_weight:g}"
-        if self.loss_type == "pls":
-            _, pre, _, _ = self.mg_settings
-            tag = f"_amg-s{pre}-w{self.schur_omega:g}"
-            if self.pls_form != "weighted":
-                tag += f"-{self.pls_form}"
-        return (f"fno_stokes_{self.loss_type}{tag}_mu{self.mu:g}_"
-                f"{self.mesh_tag}-n{self.n_nodes}_K{self.K}_"
-                f"samples-{len(self.train_dataset)}-{len(self.val_dataset)}-{len(self.test_dataset)}")
-
-    def visualize_sample(self, dataset, split: str, sample_idx: int = 0):
-        suffix = "" if sample_idx == 0 else f"{sample_idx}"
-        viz.visualize_unstructured_stokes_sample(
-            self._predict, dataset, self.problem, self.device, sample_idx,
-            save_path=f"{self.output_dir}/visualization/{self._file_prefix()}_{split}{suffix}.png")
-
-    def compute_error_distribution(self):
-        return viz.compute_unstructured_stokes_error_distribution(
-            self._predict, self.test_dataset, self.problem, self.device,
-            save_path=f"{self.output_dir}/error/{self._file_prefix()}_error_dist.png")
-
-
-class GAOTUnstructuredStokesTrainer(ArchPrefixMixin, UnstructuredStokesTrainer):
-    """The unstructured Stokes arm as it is run: GAOT is the only architecture here that can
-    consume a point cloud and emit three fields on it."""
+    """The Stokes arm as it is run: GAOT consumes the mesh's point cloud and emits the three
+    fields on it."""

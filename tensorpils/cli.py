@@ -1,14 +1,18 @@
 """Command-line entry point: ``tensorpils`` (or ``python -m tensorpils.cli``).
 
-Trains an FNO to solve one of four PDEs (``--pde``):
+Trains a neural operator on one of the three problems of the paper (``--pde``):
 
-* ``poisson`` (static) with one of four losses: ``data`` / ``galerkin`` / ``deepritz`` / ``pls``.
-* ``wave`` (time-dependent) as an autoregressive time-stepper with a ``galerkin`` (label-free
-  central-difference residual) and/or ``data`` (supervised) loss.
-* ``ac`` (Allen–Cahn, time-dependent nonlinear) as an autoregressive time-stepper with a
-  ``galerkin`` (label-free backward-Euler residual) and/or ``data`` (supervised) loss.
-* ``stokes`` (static saddle point) on a Taylor-Hood Q2/Q1 pair, with ``data`` (supervised),
-  ``galerkin`` (bare ``½‖Kc−b‖²``) or ``pls`` (block-preconditioned ``½ rᵀPr``).
+* ``poisson`` — static :math:`-\\Delta u = f` on the unit square (FNO or GAOT), with the
+  supervised ``data`` loss, the least-squares loss ``galerkin`` (``L_LS``) or the preconditioned
+  least-squares loss ``pls`` (``L_PLS``; geometric multigrid, or the exact spectral blend).
+* ``ac`` — the Allen–Cahn convex–concave time stepper (FNO, autoregressive rollout), with the
+  ``data`` loss or the ``galerkin`` step residual, optionally preconditioned
+  (``--ac_precond multigrid``).
+* ``stokes`` — stationary Stokes past an obstacle, Taylor-Hood P2/P1 on an unstructured mesh
+  (GAOT), with ``data``, ``galerkin`` or ``pls`` (block preconditioner with an algebraic V-cycle).
+
+The baselines are selected with ``--loss pino`` (Poisson, Allen–Cahn) and ``--loss pideeponet``
+(all three problems, with ``--model deeponet``).
 """
 
 from argparse import ArgumentParser
@@ -16,40 +20,28 @@ from argparse import ArgumentParser
 import numpy as np
 import torch
 
-from .data import (create_datasets, create_scaling_datasets, PoissonDataset,
-                   create_wave_datasets, create_ac_datasets, create_stokes_datasets,
-                   create_unstructured_datasets,
-                   create_unstructured_stokes_datasets)
+from .data import create_datasets, create_scaling_datasets, create_ac_datasets, create_stokes_datasets
 from .models import FNOModel
 from .gaot import GAOTModel
-from .trainer import (PoissonTrainer, WaveTrainer, ACTrainer, StokesTrainer,
-                      GAOTPoissonTrainer, GAOTWaveTrainer, GAOTACTrainer,
-                      GAOTStokesTrainer, UnstructuredPoissonTrainer,
-                      GAOTUnstructuredPoissonTrainer, UnstructuredStokesTrainer,
-                      GAOTUnstructuredStokesTrainer)
+from .trainer import (PoissonTrainer, ACTrainer, StokesTrainer, GAOTPoissonTrainer,
+                      GAOTStokesTrainer)
 from .baselines import (DeepONetModel, MollifiedModel, ZeroBoundaryModel,
-                        PINOPoissonTrainer, PINOACTrainer, PINOStokesTrainer,
-                        PIDeepONetPoissonTrainer, PIDeepONetACTrainer, PIDeepONetStokesTrainer,
-                        DeepONetPoissonTrainer, DeepONetACTrainer, DeepONetStokesTrainer,
-                        PIDeepONetUnstructuredStokesTrainer)
+                        PINOPoissonTrainer, PINOACTrainer,
+                        PIDeepONetPoissonTrainer, PIDeepONetACTrainer, PIDeepONetStokesTrainer)
 
 
 def build_parser() -> ArgumentParser:
-    p = ArgumentParser(description="FNO training for 2D Poisson / wave / Allen-Cahn / Stokes "
-                                   "(data / Galerkin / Deep Ritz / PLS losses).")
-    p.add_argument("--pde", choices=["poisson", "wave", "ac", "stokes"], default="poisson",
-                   help="Which PDE to train on. 'poisson'/'stokes' (static), "
-                        "'wave'/'ac' (time-dependent).")
-    p.add_argument("--loss",
-                   choices=["data", "data_l2", "data_h1", "galerkin", "deepritz", "pls",
-                            "pino", "pideeponet"],
+    p = ArgumentParser(description="Preconditioned physics-informed neural operator training "
+                                   "(Poisson / Allen-Cahn / Stokes).")
+    p.add_argument("--pde", choices=["poisson", "ac", "stokes"], default="poisson",
+                   help="Which problem to train on.")
+    p.add_argument("--loss", choices=["data", "galerkin", "pls", "pino", "pideeponet"],
                    default="galerkin",
-                   help="poisson: data/data_l2/data_h1/galerkin/deepritz/pls. wave/ac: data or "
-                        "galerkin (preset for the lambda_galerkin/lambda_data mix). "
-                        "BASELINES (poisson/ac/stokes): 'pino' = strong-form residual by finite "
-                        "differences (hard zero Dirichlet BC by zeroing the boundary nodes, as "
-                        "our own arms do; see --pino_bc); 'pideeponet' = the same strong form by "
-                        "autodiff through the trunk, and requires --model deeponet.")
+                   help="'data': supervised. 'galerkin': FEM least-squares residual (L_LS). "
+                        "'pls': preconditioned least squares (L_PLS; for --pde ac use "
+                        "--loss galerkin --ac_precond multigrid). BASELINES: 'pino' = strong-form "
+                        "residual by finite differences (poisson/ac); 'pideeponet' = the strong "
+                        "form by autodiff through the trunk, requires --model deeponet.")
     p.add_argument("--n_train", type=int, default=1024)
     p.add_argument("--n_val", type=int, default=128)
     p.add_argument("--n_test", type=int, default=256)
@@ -64,16 +56,11 @@ def build_parser() -> ArgumentParser:
                    help="Poisson: fixed number of optimizer steps per epoch, independent of "
                         "n_train (finite datasets are sampled i.i.d. with replacement). "
                         "Equalizes the optimization budget across dataset sizes.")
-    p.add_argument("--patience", type=int, default=None,
-                   help="Poisson: early-stop when the validation error has not improved for "
-                        "this many epochs (default: off).")
     p.add_argument("--dataset_solution", choices=["analytic", "fem"], default="analytic",
                    help="Poisson labels: 'analytic' (default) samples the closed-form solution "
                         "at the nodes; 'fem' solves A u = M f with Q1 on the regular grid, i.e. "
                         "labels become the discrete solution the FEM losses target. Applies to "
-                        "train, val AND test, so under 'fem' the reported error is measured "
-                        "against the discrete solution and the residual losses lose their "
-                        "discretisation floor (~0.7%% relative at 65^2, K=10).")
+                        "train, val AND test.")
     p.add_argument("--fixed_eval", action="store_true",
                    help="Poisson: draw val/test from dedicated seeds (seed+1/seed+2), identical "
                         "for every --n_train — all runs of a dataset-size sweep share the same "
@@ -84,65 +71,34 @@ def build_parser() -> ArgumentParser:
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--lr_min", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=0.0)
+    p.add_argument("--optimizer", type=str, default="adam", help="adam | adamw | sgd")
 
-    # -------- Poisson boundary handling --------
-    p.add_argument("--lambda_bc", type=float, default=100.0,
-                   help="BC penalty weight for Deep Ritz when --bc_mode penalty.")
-    p.add_argument("--bc_mode", choices=["penalty", "hard"], default="penalty",
-                   help="Poisson boundary handling. Deep Ritz: 'penalty' (soft, uses lambda_bc) or "
-                        "'hard' (project u->0 before energy). Data loss: 'penalty' (full-grid "
-                        "MSE) or 'hard' (interior-only MSE, boundary unconstrained).")
-    p.add_argument("--precondition", action="store_true",
-                   help="Deep Ritz only: precondition the energy gradient with a GMG V-cycle "
-                        "(M~A^-1). Flattens the A-norm dynamics toward the supervised/Newton "
-                        "direction. Implies hard-BC.")
-
-    # -------- Preconditioner selection (PLS, or preconditioned Deep Ritz) --------
-    p.add_argument("--precond_kind", choices=["multigrid", "amg", "blend", "power"],
-                   default="multigrid",
-                   help="Preconditioner P≈A^-1. 'multigrid' (default): geometric-multigrid "
-                        "V-cycle (computational path). 'amg': algebraic (AmgX) V-cycle — same "
-                        "contract, but its hierarchy comes from the matrix instead of the grid, "
-                        "so it is the path to unstructured meshes; CUDA-only, and it uses "
-                        "--mg_pre_smooth for both pre- and post-smoothing (they must be equal). "
-                        "'blend': convex mix (1-t)I+tA^-1. "
-                        "'power': fractional power A^-s. blend/power are exact spectral "
-                        "operators for illustrating the residual->supervised transition.")
+    # -------- Preconditioner (poisson pls) --------
+    p.add_argument("--precond_kind", choices=["multigrid", "blend"], default="multigrid",
+                   help="Preconditioner P≈A^-1 for --loss pls. 'multigrid' (default): one "
+                        "geometric-multigrid V-cycle. 'blend': the exact spectral blend "
+                        "(1-t)I + tA^-1 of the conditioning study (dense eigendecomposition).")
     p.add_argument("--precond_strength", type=float, default=1.0,
-                   help="Strength for blend (t) / power (s) in [0,1]. 0 -> P=I "
-                        "(no preconditioning); 1 -> P=A^-1 (supervised). Ignored for multigrid.")
-    p.add_argument("--precond_method", choices=["dense", "sine"], default="dense",
-                   help="Realization for blend/power: 'dense' (default) eigendecomposition, or "
-                        "'sine' = fast DST equivalent for a uniform grid (needed at 128²/256², "
-                        "where the dense route is infeasible). Ignored for multigrid.")
+                   help="Blend parameter t in [0,1] for --precond_kind blend. 0 -> P=I "
+                        "(no preconditioning); 1 -> P=A^-1 (supervised).")
 
-    # -------- Multigrid preconditioner settings (used when --precond_kind multigrid) --------
+    # -------- Geometric multigrid V-cycle (poisson pls, ac --ac_precond multigrid) --------
     p.add_argument("--mg_levels", type=int, default=4,
-                   help="Number of GMG levels for PLS (incl. finest).")
+                   help="Number of multigrid levels (incl. finest).")
     p.add_argument("--mg_pre_smooth", type=int, default=2,
                    help="Pre-smoothing Jacobi sweeps per V-cycle level.")
     p.add_argument("--mg_post_smooth", type=int, default=2,
                    help="Post-smoothing Jacobi sweeps per V-cycle level.")
     p.add_argument("--mg_omega", type=float, default=2.0 / 3.0,
-                   help="Damping factor for weighted Jacobi smoother.")
-
-    # -------- Wave equation (time-dependent) --------
-    p.add_argument("--wave_c", type=float, default=1.0, help="Wave speed c.")
-    p.add_argument("--wave_r", type=float, default=0.5,
-                   help="Spectral decay exponent r for WaveMultiFrequency.")
-    p.add_argument("--dt", type=float, default=0.005, help="Wave time step.")
-    p.add_argument("--n_steps", type=int, default=20,
-                   help="Number of analytical trajectory frames generated per sample.")
-    p.add_argument("--rollout_steps", type=int, default=4,
-                   help="Autoregressive rollout length used for the loss and eval.")
-    p.add_argument("--discount_factor", type=float, default=1.0,
-                   help="Per-step weighting of the Galerkin residual across the rollout.")
-    p.add_argument("--lambda_galerkin", type=float, default=None,
-                   help="Weight of the Galerkin residual (wave/ac; default from --loss preset).")
-    p.add_argument("--lambda_data", type=float, default=None,
-                   help="Weight of the trajectory MSE (wave/ac; default from --loss preset).")
+                   help="Damping factor for the weighted Jacobi smoother (8/9 is optimal for Q1 "
+                        "in 2D).")
 
     # -------- Allen–Cahn (time-dependent, nonlinear) --------
+    p.add_argument("--dt", type=float, default=0.005, help="Time step tau.")
+    p.add_argument("--n_steps", type=int, default=20,
+                   help="Number of reference time steps generated per sample.")
+    p.add_argument("--rollout_steps", type=int, default=4,
+                   help="Autoregressive rollout length used for the loss and eval.")
     p.add_argument("--ac_a", type=float, default=1.0, help="Allen–Cahn diffusion coefficient a.")
     p.add_argument("--ac_eps", type=float, default=2.0, help="Allen–Cahn reaction strength eps.")
     p.add_argument("--ac_r", type=float, default=0.5,
@@ -157,46 +113,12 @@ def build_parser() -> ArgumentParser:
                    help="Device for the FEM reference solve. 'cpu' (default): scipy sparse direct "
                         "solver, exact and deterministic. 'cuda': without cupy this is torch_sla's "
                         "iterative PBiCGStab, which can break down and has produced NaN labels.")
-    p.add_argument("--ac_integrator", choices=["convex_concave", "backward_euler"],
-                   default="convex_concave",
-                   help="Allen–Cahn time integrator for BOTH the reference data and the physics "
-                        "(Galerkin) residual loss (kept coherent). Default: convex_concave (Eyre).")
-    p.add_argument("--ac_loss_form", choices=["galerkin", "min_movement"], default="galerkin",
-                   help="Form of the AC label-free physics loss: 'galerkin' (½‖R‖² least-squares "
-                        "residual) or 'min_movement' (convex–concave JKO objective J; Deep-Ritz "
-                        "analogue). Default: galerkin.")
-    p.add_argument("--ac_loss_integrator", choices=["convex_concave", "backward_euler"],
-                   default=None,
-                   help="Override the residual integrator used by the Galerkin physics loss, "
-                        "decoupled from the reference data (--ac_integrator). Default: follow the "
-                        "data. Lets a BE-residual loss train on convex_concave reference data.")
     p.add_argument("--ac_precond", choices=["none", "multigrid"], default="none",
-                   help="Precondition the AC least-squares residual (--ac_loss_form galerkin only): "
-                        "'multigrid' trains ½‖P R‖² with P ≈ J0^-1, J0 = a²A + cM the frozen (u²=1) "
-                        "Newton Jacobian (c = 1/dt + 3ε²), removing the κ² conditioning of the bare "
-                        "residual. Uses the --mg_* V-cycle settings. Default: none (bare ½‖R‖²).")
-    p.add_argument("--bptt_mode", choices=["full_bptt", "detach_prev", "pushforward"], default=None,
-                   help="Autodiff/backprop-through-time strategy for the rollout. 'full_bptt': no "
-                        "detach (backprop through the whole rollout). 'detach_prev': detach the "
-                        "previous-frame coupling in the loss (MM proximal centre / Galerkin R) but "
-                        "keep full BPTT. 'pushforward': also detach each rollout input, so gradients "
-                        "are one-step (Brandstetter et al.). Default: None = current per-loss "
-                        "behaviour (MM detaches the coupling; Galerkin/data do full BPTT).")
+                   help="Precondition the Allen–Cahn least-squares residual: 'multigrid' trains "
+                        "½‖P R‖² with P ≈ J0^-1, J0 = a²A + cM the frozen (u²=1) Newton Jacobian "
+                        "(c = 1/dt + 3ε²). Uses the --mg_* V-cycle settings. Default: none.")
 
-    # -------- Optimizer (the place to plug in Shampoo via build_optimizer) --------
-    p.add_argument("--optimizer", type=str, default="adam",
-                   help="adam | adamw | sgd | <register-yours-in build_optimizer>")
-
-    # -------- Out-of-distribution generalization eval (poisson): relative-L2 each epoch on
-    #          datasets with different source complexity K (same grid). E.g. --ood_k 6 8. --------
-    p.add_argument("--ood_k", type=int, nargs="+", default=[],
-                   help="Extra K values to evaluate each epoch (out-of-distribution sources).")
-    p.add_argument("--ood_n_val", type=int, default=128,
-                   help="Number of samples per OOD eval dataset.")
-    p.add_argument("--ood_seed", type=int, default=123,
-                   help="Seed for the OOD eval datasets (fixed across runs for fair comparison).")
-
-    # -------- Stokes (saddle point, Taylor-Hood Q2/Q1) --------
+    # -------- Stokes (Taylor-Hood P2/P1 on the obstacle mesh) --------
     p.add_argument("--stokes_mu", type=float, default=1.0,
                    help="Stokes: dynamic viscosity mu.")
     p.add_argument("--stokes_r", type=float, default=-0.5,
@@ -204,96 +126,38 @@ def build_parser() -> ArgumentParser:
                         "(amplitude ~ (k^2+l^2)^r), matching the Poisson source convention.")
     p.add_argument("--stokes_ref_chunk", type=int, default=64,
                    help="Stokes: right-hand sides per batched reference solve (memory control).")
-    p.add_argument("--stokes_no_normalize", action="store_true",
-                   help="Stokes: do NOT rescale each sample to unit reference velocity norm "
-                        "(the rescaling is exact — Stokes is linear — and just fixes the "
-                        "output scale the FNO must hit).")
     p.add_argument("--schur_omega", type=float, default=0.5,
-                   help="Stokes pls: relaxation omega on the lumped-pressure-mass Schur surrogate "
-                        "S^-1 = omega*mu*diag(M_p)^-1. The note's (0,1] restriction applies to "
-                        "omega inside an Uzawa *iteration*; as a norm weight it is unconstrained, "
-                        "and kappa(KPK) is minimized near omega=16 (see "
-                        "experiments/stokes/conditioning/omega_scan.py).")
-    p.add_argument("--stokes_precond", choices=["block", "monolithic"], default="block",
-                   help="Stokes pls: 'block' = P = diag(A_hat^-1, S_hat^-1), only NORM-equivalent "
-                        "to K^-1, used as a norm weight (kappa = O(h^-2)). 'monolithic' = a full "
-                        "Stokes V-cycle with a symmetric Uzawa smoother, a genuine P ~ K^-1, which "
-                        "unlocks the applied form at O(1) conditioning.")
-    p.add_argument("--stokes_pls_form",
-                   choices=["auto", "weighted", "applied", "applied_fe"], default="auto",
-                   help="Stokes pls: 'weighted' = 0.5*r^T P r; 'applied' = 0.5*||P r||^2 in nodal "
-                        "units; 'applied_fe' = the same with each field block divided by its "
-                        "dataset FE norm, which removes the ~350x pressure domination the nodal "
-                        "norm carries here. 'auto' (default) picks weighted for --stokes_precond "
-                        "block and applied_fe for monolithic. Forcing applied+block is the note's "
-                        "documented dead end and exists only as a control.")
-    p.add_argument("--uzawa_pre", type=int, default=4,
-                   help="Stokes monolithic: symmetric Uzawa sweeps before the coarse-grid "
-                        "correction (nu_1).")
-    p.add_argument("--uzawa_post", type=int, default=4,
-                   help="Stokes monolithic: symmetric Uzawa sweeps after (nu_2).")
-    p.add_argument("--cheb_degree", type=int, default=8,
-                   help="Stokes monolithic: Chebyshev-Jacobi degree for A_hat^-1 inside the Uzawa "
-                        "smoother (0 falls back to weighted Jacobi).")
-    p.add_argument("--cheb_ratio", type=float, default=30.0,
-                   help="Stokes monolithic: Chebyshev targets [lambda_max/ratio, lambda_max] of "
-                        "D^-1 A — a smoother damps the top of the spectrum and leaves the rest to "
-                        "the coarse grid.")
-    p.add_argument("--stokes_div_weight", type=float, default=1.0,
-                   help="Weight on the CONTINUITY rows of the FEM least-squares Stokes loss: "
-                        "0.5*||(r_mom, w*r_cont)||^2. The counterpart of the strong-form "
-                        "baseline's --pi_div_weight, which is tuned on validation and is worth "
-                        "~27x to it (46.05 pct velocity at w=1, 1.73 pct at w=100). w=1 is the "
-                        "bare control. As a norm weight this is diag(I, w^2 I), i.e. the pls "
-                        "preconditioner with the velocity block's A^-1 replaced by the identity "
-                        "-- sweeping it separates a two-block rescaling from what the velocity "
-                        "preconditioner adds.")
-    p.add_argument("--stokes_precond_strength", type=float, default=1.0,
-                   help="Stokes pls: blend strength t in [0,1] for P_t = (1-t)*alpha*I + "
-                        "t*P_block. t=1 (default) is the block preconditioner; t=0 reproduces the "
-                        "bare least-squares loss. Sweeping t moves kappa(KPK) continuously from "
-                        "O(h^-4) to O(h^-2).")
+                   help="Stokes pls: weight omega of the lumped-pressure-mass Schur surrogate "
+                        "S^-1 = omega*mu*diag(M_p)^-1 in the block preconditioner. As a norm "
+                        "weight it is a free parameter; the paper selects 16 on validation.")
+    p.add_argument("--amg_sweeps", type=int, default=2,
+                   help="Stokes pls: pre- and post-smoothing sweeps of the algebraic V-cycle on "
+                        "the velocity block (equal, so the cycle is symmetric).")
+    p.add_argument("--mesh_h", type=float, default=0.035,
+                   help="Stokes: Gmsh target edge length of the obstacle mesh. 0.035 gives the "
+                        "paper's mesh (3998 P2 / 1035 P1 nodes).")
+    p.add_argument("--obstacle_center", type=float, nargs=2, default=[0.40, 0.50],
+                   help="Stokes: centre of the circular hole. Off-centre by default -- a centred "
+                        "hole makes the solution inherit the domain's symmetry.")
+    p.add_argument("--obstacle_radius", type=float, default=0.14,
+                   help="Stokes: radius of the circular hole.")
+    p.add_argument("--mesh_cache_dir", type=str, default=None,
+                   help="Stokes: directory to cache the generated mesh in. The file name encodes "
+                        "every geometric parameter, so a cached mesh is only reused for the exact "
+                        "geometry it was built for.")
 
     # -------- FNO model --------
     p.add_argument("--hidden_dim", type=int, default=64)
     p.add_argument("--num_layers", type=int, default=5)
     p.add_argument("--n_modes", type=int, nargs=2, default=[16, 16])
-    p.add_argument("--grid_resolution", type=int, default=64)
+    p.add_argument("--grid_resolution", type=int, default=64,
+                   help="Poisson / Allen–Cahn: nodes per side of the structured grid.")
 
-    # -------- domain / mesh (Poisson only) --------
-    p.add_argument("--mesh", choices=["square", "circle", "obstacle"], default="square",
-                   help="Computational domain. 'square' is the structured grid every result so "
-                        "far used. 'circle' is an UNSTRUCTURED Gmsh triangulation of the "
-                        "inscribed disc: no image, so it needs --model gaot, and no grid "
-                        "hierarchy, so a preconditioned loss needs --precond_kind amg. Labels "
-                        "are forced to the FEM solve -- the closed form is only zero on the "
-                        "square's boundary. 'obstacle' is the Stokes counterpart: a rectangle "
-                        "with a circular hole, meshed P2/P1 Taylor-Hood on triangles -- the "
-                        "canonical benchmark shape, and a curved boundary no grid resolves.")
-    p.add_argument("--mesh_h", type=float, default=0.015,
-                   help="Gmsh target edge length for --mesh circle. 0.015 gives ~4200 nodes, "
-                        "the node budget of the 64^2 structured grid, so the two are "
-                        "comparable in problem size.")
-    p.add_argument("--obstacle", choices=["circle", "square"], default="circle",
-                   help="--mesh obstacle: hole shape. A curved hole is the interesting case; "
-                        "'square' is the polygonal control.")
-    p.add_argument("--obstacle_center", type=float, nargs=2, default=[0.40, 0.50],
-                   help="--mesh obstacle: hole centre. Off-centre by default -- a centred hole "
-                        "makes the solution inherit the domain's symmetry.")
-    p.add_argument("--obstacle_radius", type=float, default=0.14,
-                   help="--mesh obstacle: hole radius (or half-width for the square).")
-    p.add_argument("--mesh_cache", type=str, default=None,
-                   help="Cache the generated mesh here so a sweep does not re-run Gmsh per job.")
-
-    # -------- architecture / baselines (experiments/baselines/) --------
+    # -------- architecture --------
     p.add_argument("--model", choices=["fno", "deeponet", "gaot"], default="fno",
-                   help="Neural-operator architecture. All three share the [B,C,H,W] -> "
-                        "[B,C_out,H,W] signature, so any of them can be paired with ANY loss. "
-                        "'deeponet' additionally exposes a coordinate query, which is what "
-                        "--loss pideeponet differentiates through. 'gaot' is the geometry-aware "
-                        "operator transformer: it works on a point cloud internally and is the "
-                        "arm that carries over to an unstructured mesh, where the FNO's FFT "
-                        "cannot go -- see tensorpils/gaot/.")
+                   help="Neural-operator architecture. 'fno' (Poisson, Allen–Cahn); 'gaot', the "
+                        "geometry-aware operator transformer (Poisson, and Stokes, which has no "
+                        "grid); 'deeponet' carries the PI-DeepONet baseline.")
     p.add_argument("--deeponet_p", type=int, default=128,
                    help="DeepONet: number of basis functions (branch/trunk latent width).")
     p.add_argument("--deeponet_width", type=int, default=256,
@@ -311,11 +175,9 @@ def build_parser() -> ArgumentParser:
     # lifting 64, transformer 256 wide and 3 deep, and a radius of 0.033 (see --gaot_radius).
     p.add_argument("--gaot_latent", type=int, nargs=2, default=[64, 64],
                    help="GAOT: structured latent token grid (H W). Sets the transformer's cost, "
-                        "independently of how the physical points are arranged -- which is why "
-                        "the same processor serves a structured and an unstructured mesh.")
+                        "independently of how the physical points are arranged.")
     p.add_argument("--gaot_patch", type=int, default=2,
-                   help="GAOT: patch side on the latent grid; (H/P)*(W/P) transformer tokens. "
-                        "Raise it to cut attention cost quadratically.")
+                   help="GAOT: patch side on the latent grid; (H/P)*(W/P) transformer tokens.")
     p.add_argument("--gaot_radius", type=float, default=None,
                    help="GAOT: neighbour-ball radius in domain units for both MAGNO searches. "
                         "Default (None) derives it as --gaot_radius_scale * max(h_phys, "
@@ -341,9 +203,7 @@ def build_parser() -> ArgumentParser:
     p.add_argument("--gaot_heads", type=int, default=8,
                    help="GAOT: attention heads.")
     p.add_argument("--gaot_no_geoembed", action="store_true",
-                   help="GAOT: disable the geometric embedding of each neighbourhood. It encodes "
-                        "local point density, so it is close to inert on a uniform grid and "
-                        "earns its keep on an irregular one -- this flag is the ablation.")
+                   help="GAOT: disable the geometric embedding of each neighbourhood.")
     p.add_argument("--gaot_attention", choices=["cosine", "dot_product"], default="cosine",
                    help="GAOT: neighbour weighting inside the AGNO kernel integral.")
     p.add_argument("--gaot_node_embedding", action="store_true",
@@ -352,42 +212,38 @@ def build_parser() -> ArgumentParser:
                    help="GAOT: transformer positional embedding ('rope' needs "
                         "rotary-embedding-torch).")
 
+    # -------- baselines --------
     p.add_argument("--mollify", choices=["auto", "on", "off"], default="auto",
                    help="Impose the zero Dirichlet BC hard as part of the model. 'auto' turns it "
-                        "on for the baseline losses (pino/pideeponet) and off otherwise so "
-                        "existing arms are unchanged. HOW it is imposed depends on the arm: "
-                        "PI-DeepONet multiplies by sin(pi x)sin(pi y) (the reference's "
-                        "mollifier); PINO zeroes the boundary nodes -- see --pino_bc.")
+                        "on for the baseline losses (pino/pideeponet) and off otherwise. HOW it is "
+                        "imposed depends on the arm: PI-DeepONet multiplies by sin(pi x)sin(pi y) "
+                        "(the reference's mollifier) unless --pideeponet_bc zero; PINO zeroes the "
+                        "boundary nodes -- see --pino_bc.")
     p.add_argument("--pino_bc", choices=["zero", "mollifier"], default="zero",
                    help="PINO only: how the hard zero Dirichlet BC is imposed. 'zero' (default) "
-                        "zeroes the boundary nodes, exactly as losses.py does to our own arms via "
-                        "apply_zero_boundary, so PINO differs from the galerkin arm only in the "
-                        "residual. 'mollifier' multiplies by sin(pi x)sin(pi y), reproducing the "
-                        "reference -- but that injects a decay profile close to this dataset's own "
-                        "structure, which our arms never get.")
+                        "zeroes the boundary nodes, exactly as our own arms do, so PINO differs "
+                        "from the galerkin arm only in the residual. 'mollifier' multiplies by "
+                        "sin(pi x)sin(pi y), reproducing the reference implementation.")
     p.add_argument("--pideeponet_bc", choices=["mollifier", "zero"], default="mollifier",
                    help="pideeponet only: how the zero Dirichlet BC enters. 'mollifier' (default) "
                         "multiplies every query by sin(pi x)sin(pi y), as the reference does. "
-                        "'zero' is the counterpart of --pino_bc zero: the grid output's boundary "
-                        "nodes are set to 0 exactly as our arms do, and -- because the autodiff "
-                        "Laplacian at interior points cannot see that -- the residual gets the "
-                        "original PI-DeepONet soft boundary penalty, weighted by --pi_lambda_bc.")
+                        "'zero' sets the grid output's boundary nodes to 0 as our arms do and adds "
+                        "the original PI-DeepONet soft boundary penalty, weighted by "
+                        "--pi_lambda_bc (required for --pde stokes).")
     p.add_argument("--pi_lambda_bc", type=float, default=1.0,
-                   help="pideeponet with --pideeponet_bc zero: weight of the boundary penalty. "
-                        "The penalty is expressed in the residual's own units (see "
-                        "PIDeepONetPoissonLoss), so 1 is a meaningful default.")
+                   help="pideeponet with --pideeponet_bc zero: weight of the boundary penalty, "
+                        "expressed in the residual's own units.")
     p.add_argument("--pi_div_weight", type=float, default=1.0,
-                   help="pino/pideeponet (stokes): weight of the continuity residual div(u) "
-                        "relative to the momentum residual in the stacked strong-form loss. "
-                        "The two equations have different units, so this is tuned on "
-                        "validation like a learning rate (see baselines.pino.stokes_reduce).")
+                   help="pideeponet (stokes): weight of the continuity residual div(u) relative "
+                        "to the momentum residual in the stacked strong-form loss. The two "
+                        "equations have different units, so this is tuned on validation.")
     p.add_argument("--pi_n_colloc", type=int, default=0,
-                   help="pideeponet: collocation points per step, drawn afresh from the grid "
-                        "nodes each step. 0 (default) uses all nodes, which matches every "
-                        "other arm's discretisation budget.")
+                   help="pideeponet (poisson, stokes): collocation points per step, drawn afresh "
+                        "from the interior nodes each step. 0 (default) uses all of them.")
     p.add_argument("--pino_reduction", choices=["rel", "mse"], default="rel",
-                   help="pino/pideeponet (poisson): 'rel' is the reference implementation's "
-                        "relative-Lp ratio ||Lu-f||/||f||; 'mse' is the plain mean square.")
+                   help="pino/pideeponet (poisson, stokes): 'rel' is the reference "
+                        "implementation's relative-Lp ratio ||Lu-f||/||f||; 'mse' is the plain "
+                        "mean square.")
 
     # -------- Misc --------
     p.add_argument("--seed", type=int, default=42)
@@ -406,30 +262,19 @@ def build_parser() -> ArgumentParser:
 
 
 def run_poisson(args, device):
-    if args.mesh == "circle":
-        return _run_poisson_unstructured(args, device)
-    print(f"loss        : {args.loss}"
-          + ("  (preconditioned)" if (args.loss == "deepritz" and args.precondition) else ""))
-    if args.loss == "deepritz" and not args.precondition:
-        print(f"bc_mode     : {args.bc_mode}"
-              + (f"  (lambda_bc={args.lambda_bc})" if args.bc_mode == "penalty" else ""))
-    if args.loss == "data":
-        print(f"bc_mode     : {args.bc_mode}"
-              + ("  (interior-only MSE)" if args.bc_mode == "hard" else "  (full-grid MSE)"))
-    if args.loss == "pls" or (args.loss == "deepritz" and args.precondition):
+    print(f"loss        : {args.loss}")
+    if args.loss == "pls":
         if args.precond_kind == "multigrid":
             print(f"precond     : multigrid  levels={args.mg_levels}  "
                   f"smooth={args.mg_pre_smooth}/{args.mg_post_smooth}  omega={args.mg_omega:.3f}")
         else:
-            print(f"precond     : {args.precond_kind}  strength={args.precond_strength:.3f}"
-                  f"  method={args.precond_method}")
+            print(f"precond     : {args.precond_kind}  strength={args.precond_strength:.3f}")
     if args.stream and args.steps_per_epoch is None:
         raise SystemExit("--stream requires --steps_per_epoch (an epoch has no natural "
                          "length on an infinite stream).")
-    if args.stream or args.steps_per_epoch or args.patience or args.fixed_eval:
+    if args.stream or args.steps_per_epoch or args.fixed_eval:
         print(f"data mode   : {'stream (fresh samples every step)' if args.stream else 'finite'}"
               + (f"  steps/epoch={args.steps_per_epoch}" if args.steps_per_epoch else "")
-              + (f"  patience={args.patience}" if args.patience else "")
               + ("  fixed-eval split" if (args.stream or args.fixed_eval) else ""))
     _print_common(args, device)
 
@@ -452,17 +297,6 @@ def run_poisson(args, device):
     print(f"  train={ntr}, val={len(val_ds)}, test={len(test_ds)}, "
           f"grid={train_ds.grid_size}\n")
 
-    # Out-of-distribution eval datasets (higher source complexity K, same grid).
-    eval_datasets = {
-        f"K{k}": PoissonDataset(num_samples=args.ood_n_val, K=k, seed=args.ood_seed,
-                                grid_resolution=args.grid_resolution,
-                                solution=args.dataset_solution)
-        for k in args.ood_k
-    }
-    if eval_datasets:
-        print(f"  OOD eval sets: {', '.join(eval_datasets)} "
-              f"(n={args.ood_n_val} each, seed={args.ood_seed})\n")
-
     model = _build_model(args, in_channels=1, train_ds=train_ds)
     common = dict(
         model=model,
@@ -472,13 +306,10 @@ def run_poisson(args, device):
         lr=args.lr, lr_min=args.lr_min, weight_decay=args.weight_decay,
         batch_size=args.batch_size, epochs=args.epochs,
         device=device, output_dir=args.output_dir,
-        lambda_bc=args.lambda_bc, bc_mode=args.bc_mode, precondition=args.precondition,
         precond_kind=args.precond_kind, precond_strength=args.precond_strength,
-        precond_method=args.precond_method,
         mg_levels=args.mg_levels, mg_pre_smooth=args.mg_pre_smooth,
         mg_post_smooth=args.mg_post_smooth, mg_omega=args.mg_omega,
-        steps_per_epoch=args.steps_per_epoch, patience=args.patience,
-        eval_datasets=eval_datasets,
+        steps_per_epoch=args.steps_per_epoch,
     )
     # The baseline trainers subclass PoissonTrainer, so validation, model selection and the
     # reported test metric are the inherited ones -- every arm is scored identically.
@@ -491,87 +322,30 @@ def run_poisson(args, device):
                                            pi_bc=args.pideeponet_bc,
                                            lambda_bc_pi=(args.pi_lambda_bc if zero_bc else 0.0),
                                            **common)
-    elif args.model in ("deeponet", "gaot"):
+    elif args.model == "gaot":
         # Same losses, other architecture. The arch-tagged prefix keeps these runs from
         # landing on (and overwriting) the identically-configured FNO run's files.
-        trainer = (DeepONetPoissonTrainer if args.model == "deeponet"
-                   else GAOTPoissonTrainer)(**common)
+        trainer = GAOTPoissonTrainer(**common)
     else:
         trainer = PoissonTrainer(**common)
     _run(trainer, train_ds, test_ds, args)
 
 
-def run_wave(args, device):
-    if args.loss not in ("data", "galerkin"):
-        raise SystemExit(f"--pde wave supports --loss data|galerkin, got {args.loss!r}")
-    # --loss is a preset for the (lambda_galerkin, lambda_data) mix; explicit flags override.
-    lg = args.lambda_galerkin
-    ld = args.lambda_data
-    if lg is None:
-        lg = 1.0 if args.loss == "galerkin" else 0.0
-    if ld is None:
-        ld = 1.0 if args.loss == "data" else 0.0
-
-    h = 1.0 / (args.grid_resolution - 1)
-    cfl = h / (args.wave_c * (2 ** 0.5))
-    print(f"loss        : {args.loss}  (lambda_galerkin={lg}, lambda_data={ld})")
-    print(f"wave        : c={args.wave_c}  r={args.wave_r}  dt={args.dt}  n_steps={args.n_steps}  "
-          f"rollout={args.rollout_steps}")
-    print(f"CFL         : dt={args.dt:.4g} vs h/(c*sqrt2)={cfl:.4g}  "
-          + ("(OK)" if args.dt <= cfl else "(WARNING: above CFL)"))
-    _print_common(args, device)
-
-    print("Building datasets...")
-    train_ds, val_ds, test_ds = create_wave_datasets(
-        n_train=args.n_train, n_val=args.n_val, n_test=args.n_test,
-        K=args.k, grid_resolution=args.grid_resolution,
-        dt=args.dt, n_steps=args.n_steps, c=args.wave_c, r=args.wave_r, seed=args.seed,
-    )
-    print(f"  train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}, "
-          f"grid={train_ds.grid_size}, frames/sample={args.n_steps + 1}\n")
-
-    model = _build_model(args, in_channels=2)
-    trainer = (GAOTWaveTrainer if args.model == "gaot" else WaveTrainer)(
-        model=model,
-        train_dataset=train_ds, val_dataset=val_ds, test_dataset=test_ds,
-        loss_type=args.loss,
-        optimizer_name=args.optimizer,
-        lr=args.lr, lr_min=args.lr_min, weight_decay=args.weight_decay,
-        batch_size=args.batch_size, epochs=args.epochs,
-        device=device, output_dir=args.output_dir,
-        lambda_galerkin=lg, lambda_data=ld,
-        rollout_steps=args.rollout_steps, discount_factor=args.discount_factor,
-    )
-    _run(trainer, train_ds, test_ds, args)
-
-
 def run_ac(args, device):
-    if args.loss not in ("data", "galerkin", "pino", "pideeponet"):
-        raise SystemExit("--pde ac supports --loss data|galerkin|pino|pideeponet, "
-                         f"got {args.loss!r}")
-    # --loss is a preset for the (lambda_galerkin, lambda_data) mix; explicit flags override.
-    # The baselines are physics-only, so they sit on the galerkin side of the preset.
-    lg = args.lambda_galerkin
-    ld = args.lambda_data
-    if lg is None:
-        lg = 0.0 if args.loss == "data" else 1.0
-    if ld is None:
-        ld = 1.0 if args.loss == "data" else 0.0
+    # --loss is a preset for the (physics, data) weights of the rollout loss. The baselines are
+    # physics-only, so they sit on the physics side of the preset.
+    lg = 0.0 if args.loss == "data" else 1.0
+    ld = 1.0 if args.loss == "data" else 0.0
 
     total = args.n_train + max(args.n_val, 0) + max(args.n_test, 0)
-    print(f"loss        : {args.loss}  (lambda_galerkin={lg}, lambda_data={ld})")
+    print(f"loss        : {args.loss}  (lambda_physics={lg}, lambda_data={ld})")
     print(f"allen-cahn  : a={args.ac_a}  eps={args.ac_eps}  r={args.ac_r}  dt={args.dt}  "
-          f"n_steps={args.n_steps}  rollout={args.rollout_steps}")
-    loss_integ = args.ac_loss_integrator or args.ac_integrator
-    print(f"integrator  : data={args.ac_integrator}  loss-residual={loss_integ}")
-    print(f"phys loss   : {args.ac_loss_form}  "
-          f"({'least-squares residual ½‖R‖²' if args.ac_loss_form == 'galerkin' else 'minimizing-movement objective J'})")
+          f"n_steps={args.n_steps}  rollout={args.rollout_steps}  (convex-concave, pushforward)")
     if args.ac_precond != "none":
         c_shift = 1.0 / args.dt + 3.0 * args.ac_eps ** 2
         print(f"precond     : {args.ac_precond}  ½‖P R‖², P≈(a²A+cM)⁻¹  "
               f"(a²={args.ac_a ** 2:g}, c=1/dt+3ε²={c_shift:g}, mg_levels={args.mg_levels})")
-    print(f"bptt mode   : {args.bptt_mode or 'default (per-loss)'}")
-    print(f"reference   : FEM {args.ac_integrator} + Newton on {args.ac_ref_device} "
+    print(f"reference   : FEM convex-concave + Newton on {args.ac_ref_device} "
           f"(build cost ~ {total}x{args.n_steps} steps; "
           f"no analytical solution exists for AC)")
     _print_common(args, device)
@@ -582,8 +356,7 @@ def run_ac(args, device):
         K=args.k, grid_resolution=args.grid_resolution,
         dt=args.dt, n_steps=args.n_steps, a=args.ac_a, eps=args.ac_eps, r=args.ac_r,
         newton_tol=args.ac_newton_tol, newton_max=args.ac_newton_max,
-        ref_chunk=args.ac_ref_chunk, integrator=args.ac_integrator, seed=args.seed,
-        ref_device=args.ac_ref_device,
+        ref_chunk=args.ac_ref_chunk, seed=args.seed, ref_device=args.ac_ref_device,
     )
     print(f"  train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}, "
           f"grid={train_ds.grid_size}, frames/sample={args.n_steps + 1}\n")
@@ -598,81 +371,46 @@ def run_ac(args, device):
         batch_size=args.batch_size, epochs=args.epochs,
         device=device, output_dir=args.output_dir,
         lambda_galerkin=lg, lambda_data=ld,
-        rollout_steps=args.rollout_steps, discount_factor=args.discount_factor,
-        ac_loss_form=args.ac_loss_form, ac_integrator=args.ac_loss_integrator,
-        bptt_mode=args.bptt_mode,
+        rollout_steps=args.rollout_steps,
         ac_precond=("" if args.ac_precond == "none" else args.ac_precond),
         mg_levels=args.mg_levels, mg_pre_smooth=args.mg_pre_smooth,
         mg_post_smooth=args.mg_post_smooth, mg_omega=args.mg_omega,
     )
     # Both baselines inherit ACTrainer's rollout evaluation, so their reported per-step /
     # space-time relative L2 is produced by exactly the same code as the FEM arms.
-    arch_cls = {"deeponet": DeepONetACTrainer, "gaot": GAOTACTrainer}.get(args.model, ACTrainer)
-    cls = {"pino": PINOACTrainer, "pideeponet": PIDeepONetACTrainer}.get(args.loss, arch_cls)
+    cls = {"pino": PINOACTrainer, "pideeponet": PIDeepONetACTrainer}.get(args.loss, ACTrainer)
     trainer = cls(**common)
     _run(trainer, train_ds, test_ds, args)
 
 
 def run_stokes(args, device):
-    if args.mesh == "obstacle":
-        return _run_stokes_unstructured(args, device)
-    if args.loss not in ("data", "galerkin", "pls", "pino", "pideeponet"):
-        raise SystemExit(f"--pde stokes supports --loss data|galerkin|pls|pino|pideeponet, "
-                         f"got {args.loss!r}")
-    if args.grid_resolution % 2 == 0:
-        raise SystemExit(
-            f"--pde stokes needs an odd --grid_resolution (the Q2 velocity grid has "
-            f"2*n_p-1 nodes), got {args.grid_resolution}. Try {args.grid_resolution + 1}.")
-    n_p = (args.grid_resolution + 1) // 2
-
-    mono = (args.stokes_precond == "monolithic")
-    applied = args.stokes_pls_form.startswith("applied") or (args.stokes_pls_form == "auto" and mono)
-    blurb = {
-        "data": "supervised FE-L2 vs the discrete Taylor-Hood solution",
-        "galerkin": "bare least squares ½‖Kc−b‖²  (kappa = O(h^-4): the negative control)",
-        "pls": (("applied preconditioned least squares ½‖Pr‖²" if applied
-                 else "preconditioned least squares ½ rᵀPr")
-                + (",  P = monolithic Stokes V-cycle ~ K^-1" if mono
-                   else ",  P = diag(mg/mu, w*mu/diag(M_p))")),
-        "pino": (f"PINO baseline: strong-form momentum + continuity by central differences on "
-                 f"the velocity grid, interior nodes, {args.pino_reduction} reduction, "
-                 f"div weight {args.pi_div_weight:g}"),
-        "pideeponet": (f"PI-DeepONet baseline: strong-form momentum + continuity by autodiff "
-                       f"through the trunk, {args.pino_reduction} reduction, div weight "
-                       f"{args.pi_div_weight:g}, BC={args.pideeponet_bc}"),
-    }[args.loss]
-    print(f"loss        : {args.loss}  ({blurb})")
+    """Stokes past an obstacle: Taylor-Hood P2/P1 on an unstructured triangulation."""
+    print(f"loss        : {args.loss}")
+    print(f"domain      : unit square with a circular hole at "
+          f"({args.obstacle_center[0]:g}, {args.obstacle_center[1]:g}) r={args.obstacle_radius:g}; "
+          f"unstructured P2/P1, chara_length={args.mesh_h}")
     print(f"stokes      : mu={args.stokes_mu}  force decay r={args.stokes_r}")
-    print(f"spaces      : Taylor-Hood Q2/Q1 — velocity {args.grid_resolution}^2 (2 comps), "
-          f"pressure {n_p}^2")
-    if args.loss == "pls" and mono:
-        print(f"precond     : monolithic MG, levels={args.mg_levels}, "
-              f"Uzawa pre/post={args.uzawa_pre}/{args.uzawa_post}, "
-              f"cheb_degree={args.cheb_degree} (ratio {args.cheb_ratio:g}), "
-              f"schur_omega={args.schur_omega}")
-    elif args.loss == "pls":
-        print(f"precond     : block, mg_levels={args.mg_levels} "
-              f"(pre/post={args.mg_pre_smooth}/{args.mg_post_smooth}), "
-              f"schur_omega={args.schur_omega}, "
-              f"blend t={args.stokes_precond_strength:g}")
-    print("reference   : discrete Taylor-Hood solve of K c = (M_u f, 0) "
-          "(batched sparse, float64)")
+    if args.loss == "pls":
+        print(f"precond     : block P = diag(A^-1/mu, w*mu/diag(M_p)), velocity half = algebraic "
+              f"V-cycle ({args.amg_sweeps}/{args.amg_sweeps} sweeps), schur_omega={args.schur_omega:g}")
+    print("reference   : discrete Taylor-Hood solve of K c = (M_u f, 0) (batched sparse, float64)")
     _print_common(args, device)
 
-    print("Building datasets (Stokes reference solve; may take a moment)...")
+    print("Building datasets (Gmsh P2 mesh + one sparse factorisation for the references)...")
     train_ds, val_ds, test_ds = create_stokes_datasets(
-        n_train=args.n_train, n_val=args.n_val, n_test=args.n_test,
-        K=args.k, grid_resolution=args.grid_resolution, mu=args.stokes_mu,
-        r=args.stokes_r, ref_chunk=args.stokes_ref_chunk,
-        normalize=not args.stokes_no_normalize, seed=args.seed,
+        n_train=args.n_train, n_val=args.n_val, n_test=args.n_test, K=args.k,
+        chara_length=args.mesh_h, mu=args.stokes_mu, r=args.stokes_r,
+        ref_chunk=args.stokes_ref_chunk, cx=args.obstacle_center[0],
+        cy=args.obstacle_center[1], radius=args.obstacle_radius, seed=args.seed,
+        cache_dir=args.mesh_cache_dir,
     )
     print(f"  train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}, "
-          f"velocity grid={train_ds.grid_size}, pressure grid={train_ds.pgrid_size}\n")
+          f"velocity(P2) nodes={train_ds.n_u}, pressure(P1) nodes={train_ds.n_p}\n")
 
-    # f = (f_x, f_y) in; (u_x, u_y, p) out — pressure is read on the [::2, ::2] subgrid.
-    # No train_ds here: StokesTrainer._predict already feeds every model f / f_scale, so a
-    # DeepONet's own branch scale must stay 1.
-    model = _build_model(args, in_channels=2, out_channels=3)
+    # f = (f_x, f_y) in, (u_x, u_y, p) out -- all three on the P2 node set; the pressure
+    # channel is gathered at the corner nodes.
+    model = _build_model(args, in_channels=2, out_channels=3,
+                         coords=train_ds.mesh.points.float(), train_ds=train_ds)
     common = dict(
         model=model,
         train_dataset=train_ds, val_dataset=val_ds, test_dataset=test_ds,
@@ -681,147 +419,15 @@ def run_stokes(args, device):
         lr=args.lr, lr_min=args.lr_min, weight_decay=args.weight_decay,
         batch_size=args.batch_size, epochs=args.epochs,
         device=device, output_dir=args.output_dir,
-        mg_levels=args.mg_levels, mg_pre_smooth=args.mg_pre_smooth,
-        mg_post_smooth=args.mg_post_smooth, mg_omega=args.mg_omega,
-        schur_omega=args.schur_omega, precond_strength=args.stokes_precond_strength,
-        precond_kind=args.stokes_precond, pls_form=args.stokes_pls_form,
-        stokes_div_weight=args.stokes_div_weight,
-        uzawa_pre=args.uzawa_pre, uzawa_post=args.uzawa_post,
-        cheb_degree=args.cheb_degree, cheb_ratio=args.cheb_ratio,
+        amg_sweeps=args.amg_sweeps, schur_omega=args.schur_omega,
     )
-    # The baseline trainers subclass StokesTrainer, so evaluation (both fields, projections,
-    # Q1 pressure subgrid) and model selection are the inherited ones for every arm.
-    if args.loss == "pino":
-        trainer = PINOStokesTrainer(pino_reduction=args.pino_reduction,
-                                    div_weight=args.pi_div_weight, **common)
-    elif args.loss == "pideeponet":
-        zero_bc = (args.pideeponet_bc == "zero")
+    if args.loss == "pideeponet":
         trainer = PIDeepONetStokesTrainer(n_colloc=args.pi_n_colloc,
                                           pi_reduction=args.pino_reduction,
-                                          pi_bc=args.pideeponet_bc,
-                                          lambda_bc_pi=(args.pi_lambda_bc if zero_bc else 0.0),
+                                          lambda_bc_pi=args.pi_lambda_bc,
                                           div_weight=args.pi_div_weight, **common)
-    elif args.model in ("deeponet", "gaot"):
-        trainer = (DeepONetStokesTrainer if args.model == "deeponet"
-                   else GAOTStokesTrainer)(**common)
     else:
-        trainer = StokesTrainer(**common)
-    _run(trainer, train_ds, test_ds, args)
-
-
-def _run_stokes_unstructured(args, device):
-    """``--pde stokes --mesh obstacle``: Taylor-Hood P2/P1 on a triangulation with a hole.
-
-    Separate from ``run_stokes`` for the same reason the Poisson one is separate: the grid
-    diagnostics, the monolithic preconditioner and the two strong-form baselines all assume an
-    image and none of them applies. What is shared is everything that decides comparability --
-    the source distribution, the operator, the losses, the optimizer and the per-field
-    evaluation -- because none of those looked at the grid.
-    """
-    print(f"loss        : {args.loss}")
-    print(f"domain      : rectangle with a {args.obstacle} hole at "
-          f"({args.obstacle_center[0]:g}, {args.obstacle_center[1]:g}) r={args.obstacle_radius:g}; "
-          f"unstructured P2/P1, chara_length={args.mesh_h}")
-    if args.loss == "pls":
-        print(f"precond     : block, velocity half = ALGEBRAIC V-cycle  "
-              f"(schur_omega={args.schur_omega:g})")
-    print("reference   : discrete Taylor-Hood solve of K c = (M_u f, 0) (batched sparse, float64)")
-    _print_common(args, device)
-
-    print("Building datasets (Gmsh P2 mesh + one sparse factorisation for the references)...")
-    train_ds, val_ds, test_ds = create_unstructured_stokes_datasets(
-        n_train=args.n_train, n_val=args.n_val, n_test=args.n_test, K=args.k,
-        chara_length=args.mesh_h, mu=args.stokes_mu, r=args.stokes_r,
-        ref_chunk=args.stokes_ref_chunk, normalize=not args.stokes_no_normalize,
-        obstacle=args.obstacle, cx=args.obstacle_center[0], cy=args.obstacle_center[1],
-        radius=args.obstacle_radius, seed=args.seed, cache_path=args.mesh_cache,
-    )
-    print(f"  train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}, "
-          f"velocity(P2) nodes={train_ds.n_u}, pressure(P1) nodes={train_ds.n_p}  "
-          f"(structured reference: {args.grid_resolution}^2 = {args.grid_resolution ** 2} / "
-          f"{((args.grid_resolution + 1) // 2) ** 2})\n")
-
-    # f = (f_x, f_y) in, (u_x, u_y, p) out -- all three on the P2 node set; the pressure
-    # channel is gathered at the corner nodes, which is the unstructured analogue of the
-    # structured [::2, ::2] read.
-    model = _build_model(args, in_channels=2, out_channels=3,
-                         coords=train_ds.mesh.points.float(), train_ds=train_ds)
-    if args.loss == "pideeponet":
-        trainer_cls = PIDeepONetUnstructuredStokesTrainer
-        extra = dict(n_colloc=args.pi_n_colloc, pi_reduction=args.pino_reduction,
-                     lambda_bc_pi=args.pi_lambda_bc, div_weight=args.pi_div_weight)
-    else:
-        trainer_cls = (GAOTUnstructuredStokesTrainer if args.model == "gaot"
-                       else UnstructuredStokesTrainer)
-        extra = {}
-    trainer = trainer_cls(
-        model=model,
-        train_dataset=train_ds, val_dataset=val_ds, test_dataset=test_ds,
-        loss_type=args.loss,
-        optimizer_name=args.optimizer,
-        lr=args.lr, lr_min=args.lr_min, weight_decay=args.weight_decay,
-        batch_size=args.batch_size, epochs=args.epochs,
-        device=device, output_dir=args.output_dir,
-        mg_levels=args.mg_levels, mg_pre_smooth=args.mg_pre_smooth,
-        mg_post_smooth=args.mg_post_smooth, mg_omega=args.mg_omega,
-        schur_omega=args.schur_omega, precond_strength=args.stokes_precond_strength,
-        precond_kind=args.stokes_precond, pls_form=args.stokes_pls_form,
-        stokes_div_weight=args.stokes_div_weight,
-        uzawa_pre=args.uzawa_pre, uzawa_post=args.uzawa_post,
-        cheb_degree=args.cheb_degree, cheb_ratio=args.cheb_ratio,
-        **extra,
-    )
-    _run(trainer, train_ds, test_ds, args)
-
-
-def _run_poisson_unstructured(args, device):
-    """``--pde poisson --mesh circle``: the same operator and the same losses, off the grid.
-
-    Deliberately a separate function rather than a branch inside ``run_poisson``: the streaming
-    dataset, the OOD eval sets and the grid-shaped baselines all assume an image, and none of
-    them applies here. What *is* shared is everything that matters for comparability -- the
-    source distribution (same ``K``, same ``r=-0.5``), the operator, the losses, the optimizer
-    and the evaluation -- because those never looked at the grid.
-    """
-    print(f"loss        : {args.loss}")
-    print(f"domain      : disc (unstructured Gmsh triangulation), chara_length={args.mesh_h}")
-    print(f"labels      : fem  (the closed form is NOT zero on this boundary -- see "
-          f"meshing.circle_mesh)")
-    if args.loss == "pls":
-        print(f"precond     : amg  (algebraic V-cycle from the matrix; the geometric one has "
-              f"no grid here)")
-    _print_common(args, device)
-
-    print("Building datasets (Gmsh mesh + one sparse factorisation for the labels)...")
-    train_ds, val_ds, test_ds = create_unstructured_datasets(
-        n_train=args.n_train, n_val=args.n_val, n_test=args.n_test,
-        K=args.k, chara_length=args.mesh_h, seed=args.seed, cache_path=args.mesh_cache,
-    )
-    n_nodes = train_ds.n_nodes
-    print(f"  train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}, "
-          f"nodes={n_nodes} (structured reference: {args.grid_resolution}^2 = "
-          f"{args.grid_resolution ** 2})\n")
-
-    # The model is built on the mesh's own points; there is no grid to reshape to, so
-    # GAOTModel drops its image path and only forward_nodes works.
-    model = _build_model(args, in_channels=1, coords=train_ds.mesh.points.float())
-    trainer_cls = (GAOTUnstructuredPoissonTrainer if args.model == "gaot"
-                   else UnstructuredPoissonTrainer)
-    trainer = trainer_cls(
-        model=model,
-        train_dataset=train_ds, val_dataset=val_ds, test_dataset=test_ds,
-        loss_type=args.loss,
-        optimizer_name=args.optimizer,
-        lr=args.lr, lr_min=args.lr_min, weight_decay=args.weight_decay,
-        batch_size=args.batch_size, epochs=args.epochs,
-        device=device, output_dir=args.output_dir,
-        lambda_bc=args.lambda_bc, bc_mode=args.bc_mode, precondition=args.precondition,
-        precond_kind=args.precond_kind, precond_strength=args.precond_strength,
-        precond_method=args.precond_method,
-        mg_levels=args.mg_levels, mg_pre_smooth=args.mg_pre_smooth,
-        mg_post_smooth=args.mg_post_smooth, mg_omega=args.mg_omega,
-        patience=args.patience,
-    )
+        trainer = GAOTStokesTrainer(**common)
     _run(trainer, train_ds, test_ds, args)
 
 
@@ -855,8 +461,8 @@ def _build_model(args, in_channels: int, out_channels: int = 1, train_ds=None,
 
     if args.model == "deeponet":
         nx = ny = args.grid_resolution
-        # Branch inputs are standardized like StokesDataset.f_scale already does: an MLP on a
-        # raw O(1e2) field trains badly, while the FNO's lifting layer absorbs the scale itself.
+        # Branch inputs are standardized: an MLP on a raw O(1e2) field trains badly, while the
+        # FNO's lifting layer absorbs the scale itself.
         f_scale = 1.0
         if train_ds is not None and getattr(train_ds, "fs", None):
             f_scale = float(torch.stack(list(train_ds.fs)).abs().mean().clamp_min(1e-8))
@@ -864,12 +470,9 @@ def _build_model(args, in_channels: int, out_channels: int = 1, train_ds=None,
         # (plus the soft penalty in the loss); see PIDeepONetPoissonLoss.
         zero_bc = (args.loss == "pideeponet" and args.pideeponet_bc == "zero")
         mollify_don = mollify and not zero_bc
-        # Stokes: the hard BC (either mechanism) acts on the velocity pair only; the pressure
-        # has a gauge, not a boundary condition, and the trainer fixes it by projection.
-        bc_channels = (0, 1) if args.pde == "stokes" else None
-        # An unstructured sensor set: the branch is an MLP over flattened sensor values and
-        # never knew they were on a grid, and the trunk was always coordinate-based. The hard-BC
-        # mechanisms are grid-shaped, so on a mesh the BC is the loss's boundary penalty.
+        # An unstructured sensor set (Stokes): the branch is an MLP over flattened sensor values
+        # and never knew they were on a grid, and the trunk was always coordinate-based. The
+        # hard-BC mechanisms are grid-shaped, so on a mesh the BC is the loss's boundary penalty.
         unstructured = coords is not None
         cfg = dict(grid_size=(nx, ny), in_channels=in_channels, p=args.deeponet_p,
                    width=args.deeponet_width, depth=args.deeponet_depth,
@@ -877,20 +480,20 @@ def _build_model(args, in_channels: int, out_channels: int = 1, train_ds=None,
                    f_scale=f_scale,
                    mollify=False if unstructured else mollify_don,
                    zero_boundary=False if unstructured else zero_bc,
-                   out_channels=out_channels, bc_channels=bc_channels, seed=args.seed,
+                   out_channels=out_channels, seed=args.seed,
                    coords=coords)
         model = DeepONetModel(**cfg)
         print(f"  DeepONet  p={args.deeponet_p} width={args.deeponet_width} "
               f"depth={args.deeponet_depth} fourier={args.trunk_fourier}"
               f"(scale {args.trunk_fourier_scale})  f_scale={f_scale:.3g}"
-              f"{'  mollified' if mollify_don else ''}"
+              f"{'  mollified' if mollify_don and not unstructured else ''}"
               f"{f'  zero-BC + boundary penalty (lambda={args.pi_lambda_bc:g})' if zero_bc else ''}")
     elif args.model == "gaot":
         nx = ny = args.grid_resolution
         # GAOT consumes a point cloud; GAOTModel wraps it in the FNO's grid signature and builds
         # the node coordinates in the repo's row-major order, so grid_to_node on its output is
-        # the field the FEM losses expect. An unstructured mesh means passing coords= here
-        # instead and calling forward_nodes -- nothing downstream changes.
+        # the field the FEM losses expect. On the obstacle mesh, coords= is the mesh's own points
+        # and the trainer calls forward_nodes -- nothing downstream changes.
         cfg = dict(grid_size=(nx, ny), in_channels=in_channels, out_channels=out_channels,
                    latent_grid=tuple(args.gaot_latent), patch_size=args.gaot_patch,
                    radius=args.gaot_radius, radius_scale=args.gaot_radius_scale,
@@ -916,12 +519,9 @@ def _build_model(args, in_channels: int, out_channels: int = 1, train_ds=None,
         cfg = dict(n_modes=tuple(args.n_modes), hidden_channels=args.hidden_dim,
                    in_channels=in_channels, out_channels=out_channels, n_layers=args.num_layers)
         model = FNOModel(**cfg)
-        # Stokes PINO needs no wrapper: PINOStokesTrainer zeroes the velocity boundary ring
-        # itself (the pressure channel must stay free), exactly as _predict projects it.
-        if mollify and args.pde != "stokes":
+        if mollify:
             model = _apply_hard_bc(model, args)
-    # Stash the constructor config so a checkpoint can be reloaded without re-guessing it later
-    # (e.g. the long_rollout analysis rebuilds the model from this).
+    # Stash the constructor config so a checkpoint can be reloaded without re-guessing it later.
     model.build_config = cfg
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  parameters: {n_params:,}\n")
@@ -930,23 +530,25 @@ def _build_model(args, in_channels: int, out_channels: int = 1, train_ds=None,
 
 def _print_common(args, device):
     print(f"K           : {args.k}")
-    print(f"labels      : {args.dataset_solution}"
-          + ("  (Q1 FEM solve of A u = M f; train+val+test)"
-             if args.dataset_solution == "fem" else "  (closed form at nodes)"))
+    if args.pde == "poisson":
+        print(f"labels      : {args.dataset_solution}"
+              + ("  (Q1 FEM solve of A u = M f; train+val+test)"
+                 if args.dataset_solution == "fem" else "  (closed form at nodes)"))
     print(f"samples     : train={args.n_train}, val={args.n_val}, test={args.n_test}")
     print(f"epochs/bs   : {args.epochs} / {args.batch_size}")
     print(f"lr          : {args.lr}  ->  {args.lr_min}")
     print(f"optimizer   : {args.optimizer}  (weight_decay={args.weight_decay})")
+    grid = "" if args.pde == "stokes" else f"   grid={args.grid_resolution}^2"
     if args.model == "gaot":
         print(f"GAOT        : latent={tuple(args.gaot_latent)} patch={args.gaot_patch}   "
               f"lifting={args.gaot_lifting}   transformer={args.gaot_hidden}x{args.gaot_layers}"
-              f"   grid={args.grid_resolution}^2")
+              f"{grid}")
     elif args.model == "deeponet":
         print(f"DeepONet    : p={args.deeponet_p}   width={args.deeponet_width}   "
-              f"depth={args.deeponet_depth}   grid={args.grid_resolution}^2")
+              f"depth={args.deeponet_depth}{grid}")
     else:
         print(f"FNO modes   : {tuple(args.n_modes)}   hidden={args.hidden_dim}   "
-              f"layers={args.num_layers}   grid={args.grid_resolution}^2")
+              f"layers={args.num_layers}{grid}")
     print(f"device      : {device}")
     print("=" * 60 + "\n")
 
@@ -973,10 +575,9 @@ def _run(trainer, train_ds, test_ds, args):
 
 
 def _report_test(result, pde: str = "poisson"):
-    """Poisson trainers return (mse, l2, rel_l2); rollout trainers a rollout MSE; Stokes the
-    mean of the velocity and pressure relative FE-L2 errors (the per-field numbers are
-    printed by the trainer) — a squared error would be dominated by pressure, whose scale
-    is set by the physics and cannot be normalized independently of velocity."""
+    """Poisson trainers return (mse, l2, rel_l2); the Allen–Cahn trainer a rollout MSE; Stokes
+    the mean of the velocity and pressure relative FE-L2 errors (the per-field numbers are
+    printed by the trainer)."""
     if isinstance(result, tuple):
         mse, l2, rl2 = result
         print(f"  final test     : MSE {mse:.2e}  FEM-L2 {l2:.2e}  rel-L2 {rl2:.2%}")
@@ -986,106 +587,48 @@ def _report_test(result, pde: str = "poisson"):
         print(f"  final test     : rollout MSE {result:.2e}")
 
 
-def _validate_mesh_args(args):
-    """Refuse the unstructured combinations that cannot work, before the queue wait.
-
-    Each of these fails anyway, but late and unhelpfully: the FNO would die inside the FFT, the
-    geometric V-cycle builds without complaint and then dies on a shape mismatch at its first
-    apply, and analytic labels would not fail at all -- they would just be wrong.
-    """
-    if args.mesh == "obstacle":
-        if args.pde != "stokes":
-            raise SystemExit(f"--mesh obstacle is the Stokes domain; use --pde stokes "
-                             f"(got {args.pde!r}). For unstructured Poisson use --mesh circle.")
-        if args.loss == "pideeponet":
-            # The one physics-informed baseline that CAN follow off the grid: its residual is
-            # taken by autodiff through a coordinate trunk, not by a finite-difference stencil.
-            if args.model != "deeponet":
-                raise SystemExit("--loss pideeponet differentiates through the trunk's "
-                                 "coordinate input, so it needs --model deeponet.")
-            if args.pideeponet_bc != "zero":
-                raise SystemExit(
-                    "--mesh obstacle requires --pideeponet_bc zero. The mollifier has no "
-                    "closed form vanishing on both boundary components of a domain with a "
-                    "hole, and a mollified number is a separately labelled control in this "
-                    "project, not a table row.")
-        elif args.model != "gaot":
-            raise SystemExit(
-                f"--mesh obstacle has no grid, so the model must consume a point cloud: use "
-                f"--model gaot (got {args.model!r}), or --model deeponet with "
-                f"--loss pideeponet.")
-        if args.loss not in ("data", "galerkin", "pls", "pideeponet"):
-            raise SystemExit(f"--mesh obstacle supports --loss data|galerkin|pls|pideeponet "
-                             f"(got {args.loss!r}); PINO takes finite differences on an image, "
-                             f"which is the point.")
-        if args.loss == "pls" and args.stokes_precond != "block":
-            raise SystemExit(
-                f"--mesh obstacle needs --stokes_precond block (got {args.stokes_precond!r}). "
-                f"The monolithic V-cycle's transfer operators are geometric -- both fields "
-                f"nesting by two on a grid -- and have no unstructured form. The block "
-                f"preconditioner's velocity half becomes an algebraic V-cycle instead.")
-        return
-    if args.mesh != "circle":
-        return
-    if args.pde != "poisson":
-        raise SystemExit(f"--mesh circle is implemented for --pde poisson only (got "
-                         f"{args.pde!r}).")
-    if args.model != "gaot":
-        raise SystemExit(
-            f"--mesh circle has no grid, so the model must consume a point cloud: use "
-            f"--model gaot (got {args.model!r}). The FNO is tied to the FFT and the DeepONet's "
-            f"branch is a fixed sensor grid.")
-    if args.loss not in ("data", "data_l2", "data_h1", "galerkin", "deepritz", "pls"):
-        raise SystemExit(f"--mesh circle supports --loss data|data_l2|data_h1|galerkin|"
-                         f"deepritz|pls (got {args.loss!r}); the PINO / PI-DeepONet baselines "
-                         f"take finite differences on an image.")
-    needs_p = (args.loss == "pls") or (args.loss == "deepritz" and args.precondition)
-    if needs_p and args.precond_kind != "amg":
-        raise SystemExit(
-            f"--mesh circle with a preconditioned loss needs --precond_kind amg (got "
-            f"{args.precond_kind!r}). The geometric V-cycle re-discretises a structured "
-            f"hierarchy and the spectral preconditioners eigendecompose a grid operator; only "
-            f"the algebraic V-cycle is built from the matrix.")
-    if args.dataset_solution != "fem":
-        raise SystemExit(
-            "--mesh circle must use --dataset_solution fem. The analytical solution is a sum "
-            "of sin(i pi x) sin(j pi y): it vanishes on the boundary of the SQUARE, and on the "
-            "disc it reaches ~90% of its interior peak there, so it is not a solution of this "
-            "problem. Nothing would raise -- the labels would simply be wrong.")
-    if args.stream or args.fixed_eval or args.steps_per_epoch:
-        raise SystemExit("--mesh circle has no streaming dataset: every label costs a sparse "
-                         "solve, so samples are generated once as a pool.")
-    if args.ood_k:
-        raise SystemExit("--mesh circle does not support --ood_k yet (the OOD eval sets are "
-                         "built as grid PoissonDatasets).")
-
-
-def _validate_baseline_args(args):
-    """Fail fast and legibly on baseline flag combinations that cannot work."""
-    if _is_baseline_loss(args.loss) and args.pde not in ("poisson", "ac", "stokes"):
-        raise SystemExit(f"--loss {args.loss} is implemented for --pde poisson|ac|stokes only "
-                         f"(got {args.pde!r}); see experiments/baselines/README.md.")
+def _validate_args(args):
+    """Refuse the combinations that are not implemented, before any data is built."""
     if args.loss == "pideeponet" and args.model != "deeponet":
         raise SystemExit("--loss pideeponet differentiates through the trunk's coordinate "
                          "input, so it needs --model deeponet.")
-    if args.model == "deeponet" and args.pde == "wave":
-        raise SystemExit("--model deeponet is wired for --pde poisson|ac|stokes only (got 'wave').")
-    if (args.model == "deeponet" and args.mollify == "off" and args.loss == "pideeponet"
-            and args.pideeponet_bc != "zero"):
+    if args.model == "deeponet" and args.loss != "pideeponet":
+        raise SystemExit("--model deeponet carries the PI-DeepONet baseline; use it with "
+                         "--loss pideeponet.")
+    if args.loss == "pideeponet" and args.mollify == "off" and args.pideeponet_bc != "zero":
         raise SystemExit("--loss pideeponet with --mollify off has no boundary condition at all "
                          "(the autodiff residual cannot see the boundary). Use "
-                         "--pideeponet_bc zero (boundary nodes zeroed + soft penalty, the "
-                         "counterpart of --pino_bc zero) or keep the mollifier.")
-    if args.loss == "pideeponet" and args.pideeponet_bc == "zero" and args.pde not in ("poisson", "stokes"):
-        raise SystemExit("--pideeponet_bc zero is implemented for --pde poisson|stokes only; the "
-                         "Allen-Cahn rollout needs the residual and fed-back values to coincide "
-                         "on the boundary, which the mollifier guarantees.")
+                         "--pideeponet_bc zero (boundary nodes zeroed + soft penalty) or keep "
+                         "the mollifier.")
+    if args.pde == "poisson":
+        if args.model == "gaot" and _is_baseline_loss(args.loss):
+            raise SystemExit("--model gaot is run with --loss data|galerkin|pls.")
+    elif args.pde == "ac":
+        if args.loss == "pls":
+            raise SystemExit("--pde ac: the preconditioned loss is "
+                             "--loss galerkin --ac_precond multigrid.")
+        if args.model == "gaot":
+            raise SystemExit("--pde ac is run with --model fno (or deeponet for pideeponet).")
+        if args.loss == "pideeponet" and args.pideeponet_bc == "zero":
+            raise SystemExit("--pde ac: PI-DeepONet uses the mollifier; the rollout needs the "
+                             "residual and fed-back values to coincide on the boundary.")
+    elif args.pde == "stokes":
+        if args.loss == "pino":
+            raise SystemExit("--pde stokes lives on an unstructured mesh; PINO takes finite "
+                             "differences on an image and has no counterpart there.")
+        if args.loss == "pideeponet" and args.pideeponet_bc != "zero":
+            raise SystemExit(
+                "--pde stokes with --loss pideeponet requires --pideeponet_bc zero: no "
+                "closed-form mollifier vanishes on both boundary components of a domain with a "
+                "hole, so the BC is the boundary penalty (--pi_lambda_bc).")
+        if args.loss != "pideeponet" and args.model != "gaot":
+            raise SystemExit("--pde stokes has no grid, so the model must consume a point cloud: "
+                             "use --model gaot.")
 
 
 def main():
     args = build_parser().parse_args()
-    _validate_baseline_args(args)
-    _validate_mesh_args(args)
+    _validate_args(args)
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -1098,9 +641,7 @@ def main():
     print(f"TensorPILS — {args.model.upper()} + {args.pde.capitalize()} 2D")
     print("=" * 60)
 
-    if args.pde == "wave":
-        run_wave(args, device)
-    elif args.pde == "ac":
+    if args.pde == "ac":
         run_ac(args, device)
     elif args.pde == "stokes":
         run_stokes(args, device)

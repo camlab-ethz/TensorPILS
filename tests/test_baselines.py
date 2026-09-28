@@ -20,7 +20,7 @@ import torch
 from tensorpils.baselines import (DeepONetModel, MollifiedModel, ZeroBoundaryModel,
                                   boundary_mask_grid, PINOACLoss,
                                   PINOPoissonLoss, PIDeepONetACLoss,
-                                  PINOStokesLoss, PIDeepONetStokesLoss, autodiff_stokes,
+                                  PIDeepONetStokesLoss, autodiff_stokes,
                                   autodiff_laplacian, mollifier_grid, rel_lp)
 from tensorpils.baselines.trainers import _arch_tag
 from tensorpils.meshing import node_to_grid, structured_quad_mesh
@@ -364,11 +364,10 @@ def test_pino_ac_residual_is_small_at_the_fem_reference():
     from tensormesh.dataset.equation.wave import WaveMultiFrequency
     ic = WaveMultiFrequency(a=torch.rand(2, 4, 4) * 2 - 1, r=0.5)
     u0 = ic.initial_condition(mesh.points).float()                  # [B, N]
-    traj = prob.fem_reference(u0, a=a, eps=eps, dt=dt, n_steps=2,
-                              integrator="convex_concave")          # [B, 3, N]
+    traj = prob.fem_reference(u0, a=a, eps=eps, dt=dt, n_steps=2)   # [B, 3, N]
 
     seq_grid = node_to_grid(traj.float(), n, n)                     # [B, 3, H, W]
-    loss = PINOACLoss((n, n), a=a, eps=eps, dt=dt, integrator="convex_concave")
+    loss = PINOACLoss((n, n), a=a, eps=eps, dt=dt)
     residual = loss(seq_grid).item()
     # Scale: the leading term is (u^{n+1}-u^n)/dt, whose mean square sets what "small" means.
     du = ((seq_grid[:, 1:] - seq_grid[:, :-1]) / dt) ** 2
@@ -397,12 +396,13 @@ def test_pino_and_pi_deeponet_ac_losses_agree_on_the_same_field():
 
     seq_node = torch.stack([0.5 * u, u], dim=1)                     # [1, 2, N]
     # Same node set on both sides: PINOACLoss averages over the grid interior, so the autodiff
-    # loss gets the matching interior mask. Comparing a full-grid mean against an interior
-    # mean differs by 63^2/65^2 = 6% at this resolution for scale reasons alone.
+    # loss gets the interior nodes, as the trainer's collocation points are. Comparing a
+    # full-grid mean against an interior mean differs by 63^2/65^2 = 6% at this resolution for
+    # scale reasons alone.
     interior = ~structured_quad_mesh(nx=n, ny=n).boundary_mask.bool()
-    ad = PIDeepONetACLoss(a=a, eps=eps, dt=dt, integrator="convex_concave",
-                          interior_mask=interior)(seq_node, lap.unsqueeze(1)).item()
-    fd = PINOACLoss((n, n), a=a, eps=eps, dt=dt, integrator="convex_concave")(
+    ad = PIDeepONetACLoss(a=a, eps=eps, dt=dt)(
+        seq_node[..., interior], lap[..., interior].unsqueeze(1)).item()
+    fd = PINOACLoss((n, n), a=a, eps=eps, dt=dt)(
         node_to_grid(seq_node.detach(), n, n)).item()
     assert ad == pytest.approx(fd, rel=0.02), (
         f"autodiff ({ad:.4e}) and FD ({fd:.4e}) Allen–Cahn residuals disagree by more than "
@@ -425,9 +425,9 @@ def test_arch_tag_sees_through_the_mollifier_wrapper():
 
 
 def test_deeponet_run_prefix_does_not_collide_with_the_fno_one():
-    """A ``--model deeponet --loss data`` run must not overwrite the identically-configured
-    FNO run's checkpoint and results JSON."""
-    from tensorpils.baselines.trainers import _ArchPrefixMixin
+    """A run of another architecture must not overwrite the identically-configured FNO run's
+    checkpoint and results JSON."""
+    from tensorpils.trainer import ArchPrefixMixin as _ArchPrefixMixin
 
     class _Fake:
         def _file_prefix(self):
@@ -466,58 +466,32 @@ def _stokes_manufactured(pts):
     return u, p, lap, gp, -lap + gp
 
 
-def _grid_pts(n):
-    xs = torch.linspace(0, 1, n, dtype=torch.float64)
-    yy, xx = torch.meshgrid(xs, xs, indexing="ij")           # row -> y, col -> x
-    return torch.stack([xx, yy], dim=-1)                      # [n, n, 2]
-
-
-def test_stokes_fd_residual_is_second_order_at_a_manufactured_solution():
-    """The strong-form FD residual of an exact Stokes solution vanishes at O(h^2), and both
-    equations do. This also pins the axis convention: with d/dx and d/dy swapped the momentum
-    residual would be O(1) rather than shrinking."""
-    errs = []
-    for n in (17, 33, 65):
-        pts = _grid_pts(n)
-        u, p, _, _, f = _stokes_manufactured(pts)
-        out = torch.cat([u.permute(2, 0, 1), p[None]], dim=0)[None].double()   # [1, 3, n, n]
-        f_grid = f.permute(2, 0, 1)[None]                                       # [1, 2, n, n]
-        mom, div = PINOStokesLoss((n, n), mu=1.0).residual(out)
-        f_int = f_grid.permute(0, 2, 3, 1)[:, 1:-1, 1:-1]
-        rel_mom = ((mom - f_int) ** 2).mean().sqrt() / (f_int ** 2).mean().sqrt()
-        rel_div = (div ** 2).mean().sqrt() / (u ** 2).mean().sqrt()
-        errs.append((1.0 / (n - 1), rel_mom.item(), rel_div.item()))
-    assert errs[0][1] < 0.2, errs                                  # right axes, right signs
-    for (h0, m0, _), (h1, m1, _) in zip(errs, errs[1:]):
-        assert math.log(m0 / m1) / math.log(h0 / h1) > 1.8, errs
-    # For this curl field the central-difference divergence cancels exactly (both terms carry
-    # the same sin(2*pi*h)/h factor), so it is ~1e-15 at every h rather than O(h^2). That still
-    # tests the axes: with d/dx and d/dy swapped it would be O(1).
-    assert all(d < 1e-10 for _, _, d in errs), errs
-
-
 def test_stokes_rel_reduction_is_the_ratio_of_residual_to_force():
-    """The 'rel' Stokes loss is ||(r_mom, w r_div)|| / ||f|| with r_mom the residual: it must be
-    O(h^2) at the exact solution and exactly 1 for the all-zero prediction (r_mom = -f). A version
-    that fed the residual through rel_lp(residual, f) subtracted f twice, giving 1.0 at the
-    solution and 2.0 at zero, and trained every Stokes baseline toward the solution for 2f."""
-    n = 33
-    pts = _grid_pts(n)
-    u, p, _, _, f = _stokes_manufactured(pts)
-    out = torch.cat([u.permute(2, 0, 1), p[None]], dim=0)[None].double()
-    f_grid = f.permute(2, 0, 1)[None]
-    loss = PINOStokesLoss((n, n), mu=1.0, reduction="rel", div_weight=1.0)
-    assert loss(out, f_grid).item() < 0.02
-    assert loss(torch.zeros_like(out), f_grid).item() == pytest.approx(1.0, rel=1e-6)
-    # the momentum-only part dominates: scaling u, p by 2 doubles the residual against f
-    assert loss(2 * out, f_grid).item() == pytest.approx(1.0, abs=0.03)
+    """The 'rel' Stokes loss is ||(r_mom, w r_div)|| / ||f|| with r_mom the residual: it must
+    vanish at the exact solution and be exactly 1 for the all-zero prediction (r_mom = -f). A
+    version that fed the residual through rel_lp(residual, f) subtracted f twice, giving 1.0 at
+    the solution and 2.0 at zero, and trained the Stokes baseline toward the solution for 2f."""
+    torch.manual_seed(0)
+    coords = torch.rand(2, 64, 2, dtype=torch.float64)
+    _, _, _, _, f = _stokes_manufactured(coords)
+    loss = PIDeepONetStokesLoss(mu=1.0, reduction="rel", div_weight=1.0)
+    # exact solution -> 0; zero prediction -> 1; doubled solution (r_mom = f) -> 1
+    for scale, expected in ((1.0, 0.0), (0.0, 1.0), (2.0, 1.0)):
+        c = coords.clone().requires_grad_(True)
+        assert loss(_AnalyticStokesModel(scale), None, c, f).item() == pytest.approx(
+            expected, abs=1e-8)
 
 
 class _AnalyticStokesModel(torch.nn.Module):
-    """A 'model' whose forward_at returns the manufactured (u_x, u_y, p) -- to test autodiff."""
+    """A 'model' whose forward_at returns ``scale`` times the manufactured (u_x, u_y, p) -- to
+    test autodiff."""
+    def __init__(self, scale: float = 1.0):
+        super().__init__()
+        self.scale = scale
+
     def forward_at(self, f_grid, coords):
         u, p, _, _, _ = _stokes_manufactured(coords)
-        return torch.cat([u, p.unsqueeze(-1)], dim=-1)          # [B, Q, 3]
+        return self.scale * torch.cat([u, p.unsqueeze(-1)], dim=-1)          # [B, Q, 3]
 
 
 def test_autodiff_stokes_matches_the_analytic_derivatives():
@@ -553,58 +527,3 @@ def test_multi_output_deeponet_bc_acts_on_the_velocity_channels_only():
     m1 = DeepONetModel((n, n), p=8, width=16, depth=2)
     assert m1(torch.randn(2, 1, n, n)).shape == (2, 1, n, n)
     assert m1.forward_at(torch.randn(2, 1, n, n), torch.rand(5, 2)).shape == (2, 5)
-
-
-def test_pino_and_pi_deeponet_stokes_losses_agree_on_a_resolved_field():
-    """Same residual, same reduction; FD vs autodiff differ only by the O(h^2) stencil error,
-    which is small for a smooth (low-frequency trunk) DeepONet field on a 33^2 grid."""
-    n = 33
-    torch.manual_seed(0)
-    model = DeepONetModel((n, n), in_channels=2, out_channels=3, p=8, width=16, depth=2,
-                          trunk_fourier=4, fourier_scale=0.5).double()
-    f_grid = torch.ones(2, 2, n, n, dtype=torch.float64)      # f = (1, 1): nonzero, smooth
-    out = model(f_grid)                                          # [2, 3, n, n], raw
-    fd_loss = PINOStokesLoss((n, n), mu=1.0, reduction="mse", div_weight=2.0)(out, f_grid)
-    bmask = torch.zeros(n, n, dtype=torch.bool)
-    bmask[0, :] = bmask[-1, :] = bmask[:, 0] = bmask[:, -1] = True
-    coords = model.grid_coords[~bmask.reshape(-1)].unsqueeze(0).expand(2, -1, -1).clone().requires_grad_(True)
-    f_at = torch.ones(2, coords.shape[1], 2, dtype=torch.float64)
-    ad_loss = PIDeepONetStokesLoss(mu=1.0, reduction="mse", div_weight=2.0)(model, f_grid, coords, f_at)
-    assert ad_loss.item() == pytest.approx(fd_loss.item(), rel=0.05)
-    ad_loss.backward()
-    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.parameters())
-
-
-def test_stokes_baseline_trainers_run_an_epoch(tmp_path):
-    """PINO, PI-DeepONet (both BC modes) and our data loss on a DeepONet all train and
-    evaluate through the inherited StokesTrainer on a 9^2 problem."""
-    from tensorpils.baselines import (PINOStokesTrainer, PIDeepONetStokesTrainer,
-                                      DeepONetStokesTrainer)
-    from tensorpils.data import create_stokes_datasets
-    from tensorpils.models import FNOModel
-
-    tr, va, te = create_stokes_datasets(n_train=4, n_val=2, n_test=2, K=2, grid_resolution=9)
-    common = dict(train_dataset=tr, val_dataset=va, test_dataset=te, epochs=1, batch_size=2,
-                  device="cpu", output_dir=str(tmp_path), lr=1e-3, lr_min=1e-4)
-    fno = FNOModel(n_modes=(4, 4), hidden_channels=8, in_channels=2, out_channels=3, n_layers=2)
-    don = lambda **kw: DeepONetModel((9, 9), in_channels=2, out_channels=3, bc_channels=(0, 1),
-                                     p=8, width=16, depth=2, **kw)
-    trainers = [
-        PINOStokesTrainer(model=fno, pino_reduction="rel", div_weight=0.5, **common),
-        PIDeepONetStokesTrainer(model=don(mollify=True), pi_bc="mollifier", **common),
-        PIDeepONetStokesTrainer(model=don(zero_boundary=True), pi_bc="zero", lambda_bc_pi=1.0,
-                                n_colloc=16, **common),
-        DeepONetStokesTrainer(model=don(), loss_type="data", **common),
-    ]
-    prefixes = set()
-    for t in trainers:
-        loss = t.train_epoch()
-        assert math.isfinite(loss)
-        val = t.validate()
-        assert math.isfinite(val)
-        prefixes.add(t._file_prefix())
-    assert len(prefixes) == 4, prefixes
-    assert any("_stokes_pino-rel-dw0.5_" in p for p in prefixes)
-    assert any("deeponet_stokes_pi-rel-c16-zbc1_" in p for p in prefixes)
-    assert any(p.startswith("deeponet_stokes_data_") for p in prefixes)
-

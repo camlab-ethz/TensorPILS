@@ -1,11 +1,9 @@
 r"""Geometric multigrid V-cycle preconditioner for the structured-grid Poisson stiffness.
 
-Provides :math:`P \approx A^{-1}` as one V-cycle, used by the preconditioned losses
-(``pls`` and preconditioned Deep Ritz). The hierarchy coarsens the structured grid by
-factors of two; the stiffness at every level is **re-discretized** with TensorMesh's
-``LaplaceElementAssembler`` (the only change from the standalone script, which hand-rolled
-the per-level stiffness). Smoother, prolongation/restriction, and the V-cycle recursion
-are unchanged.
+Provides :math:`P \approx A^{-1}` as one V-cycle, used by the preconditioned least-squares
+losses. The hierarchy coarsens the structured grid by factors of two; the operator at every
+level is **re-discretized** with TensorMesh's ``LaplaceElementAssembler`` /
+``MassElementAssembler``.
 
 The V-cycle is a sequence of sparse mat–vecs and element-wise ops, all differentiable, so
 autograd flows through it: for the symmetric ``M`` produced by symmetric Jacobi sweeps,
@@ -54,8 +52,8 @@ class GeometricMultigrid(Preconditioner):
     Defaults ``a2=1, c=0`` give the bare Poisson stiffness :math:`P\approx A^{-1}` (unchanged);
     a positive mass shift ``c>0`` builds the screened-Poisson / reaction--diffusion operator
     :math:`a^2A + cM` used to precondition the Allen--Cahn least-squares residual (the frozen
-    Newton Jacobian :math:`J_0 = a^2A + cM`, :math:`c=1/\dt+3\epsilon^2`; see
-    ``notes/ac_autoregressive/`` §"Preconditioning the least-squares loss").
+    Newton Jacobian :math:`J_0 = a^2A + cM`, :math:`c=1/\Delta t+3\epsilon^2`; see the paper's
+    Allen--Cahn appendix).
 
     Each coarser level uses ``((nx+1)//2, (ny+1)//2)`` (floored at 3). Prolongation is
     bilinear interpolation respecting the row-major node order; restriction is ``R = Pᵀ``.

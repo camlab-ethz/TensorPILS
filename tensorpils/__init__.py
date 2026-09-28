@@ -1,74 +1,71 @@
-"""TensorPILS — Physics-Informed Learning System powered by TensorMesh.
+"""TensorPILS — preconditioned physics-informed neural operator training.
 
-Train neural operators (FNO) on PDEs using losses built from TensorMesh's
-finite-element machinery: supervised data, Galerkin weak-form residual,
-Deep Ritz energy, and a multigrid-preconditioned least-squares loss.
+Code for *Preconditioned Physics-Informed Neural Operator Training*. Neural operators (FNO,
+GAOT) are trained on the Poisson, Allen–Cahn and Stokes equations with loss functions built from
+the finite-element machinery of TensorMesh: supervised data, the physics-informed least-squares
+residual, and its preconditioned counterpart — the residual passed through a multigrid
+preconditioner ``P ≈ A⁻¹`` (or, for the Stokes saddle point, weighted by a block-diagonal one).
 
-The finite-element pieces (analytical solutions, stiffness/mass assembly,
-boundary conditions) are delegated to ``tensormesh``; this package owns the
-structured-grid bridge the FNO needs, the neural model, the losses, and the
-training loop.
+The finite-element pieces (analytical data, stiffness/mass assembly, sparse solves) are
+delegated to ``tensormesh``; this package owns the grid/mesh bridge the neural operators need,
+the preconditioners, the losses, the baselines and the training loop.
 """
 
 from ._version import __version__
-from .meshing import (structured_quad_mesh, structured_quad9_mesh,
+from .meshing import (structured_quad_mesh, obstacle_mesh, topological_boundary_mask,
                       node_to_grid, grid_to_node)
-from .physics import (FEMOperator, PoissonProblem, WaveProblem, ACProblem, StokesProblem,
+from .physics import (FEMOperator, PoissonProblem, ACProblem, StokesProblem,
                       apply_zero_boundary)
 from .preconditioners import (
-    Preconditioner, GeometricMultigrid, SpectralPreconditioner,
-    StokesBlockPreconditioner, StokesBlendPreconditioner, StokesMonolithicMultigrid,
-    build_preconditioner,
+    Preconditioner, GeometricMultigrid, AMGXPreconditioner, SpectralPreconditioner,
+    StokesBlockPreconditioner, build_preconditioner,
 )
-from .data import (PoissonDataset, create_datasets, WaveDataset, create_wave_datasets,
-                   ACDataset, create_ac_datasets, StokesDataset, create_stokes_datasets)
-from .losses import build_loss, build_wave_loss, build_ac_loss, build_stokes_loss
+from .data import (PoissonDataset, StreamingPoissonDataset, create_datasets,
+                   create_scaling_datasets, ACDataset, create_ac_datasets, StokesDataset,
+                   create_stokes_datasets)
+from .losses import build_loss, build_ac_loss, build_stokes_loss
 from .optim import build_optimizer
-from .trainer import (Trainer, PoissonTrainer, RolloutTrainer, WaveTrainer, ACTrainer,
-                      StokesTrainer, BaseTrainer, TrainingStats)
+from .trainer import (BaseTrainer, PoissonTrainer, RolloutTrainer, ACTrainer, StokesTrainer,
+                      TrainingStats)
 
-# ``FNOModel`` lives in ``tensorpils.models`` and pulls in ``neuralop`` on
-# import; import it explicitly (``from tensorpils.models import FNOModel``)
-# so that the FEM/training core stays importable without the heavy dependency.
+# ``FNOModel`` lives in ``tensorpils.models`` and pulls in ``neuralop`` on import, and
+# ``GAOTModel`` in ``tensorpils.gaot``; import them explicitly so that the FEM/training core
+# stays importable without the heavy dependencies.
 
 __all__ = [
     "__version__",
     "structured_quad_mesh",
-    "structured_quad9_mesh",
+    "obstacle_mesh",
+    "topological_boundary_mask",
     "node_to_grid",
     "grid_to_node",
     "FEMOperator",
     "PoissonProblem",
-    "WaveProblem",
     "ACProblem",
     "StokesProblem",
     "apply_zero_boundary",
     "Preconditioner",
     "GeometricMultigrid",
+    "AMGXPreconditioner",
     "SpectralPreconditioner",
     "StokesBlockPreconditioner",
-    "StokesBlendPreconditioner",
-    "StokesMonolithicMultigrid",
     "build_preconditioner",
     "PoissonDataset",
+    "StreamingPoissonDataset",
     "create_datasets",
-    "WaveDataset",
-    "create_wave_datasets",
+    "create_scaling_datasets",
     "ACDataset",
     "create_ac_datasets",
     "StokesDataset",
     "create_stokes_datasets",
     "build_loss",
-    "build_wave_loss",
     "build_ac_loss",
     "build_stokes_loss",
     "build_optimizer",
-    "Trainer",
+    "BaseTrainer",
     "PoissonTrainer",
     "RolloutTrainer",
-    "WaveTrainer",
     "ACTrainer",
     "StokesTrainer",
-    "BaseTrainer",
     "TrainingStats",
 ]

@@ -2,13 +2,12 @@
 
 A preconditioner is an ``nn.Module`` that maps a residual ``r`` to ``P r``, an
 approximation of ``A^{-1} r`` for the Poisson stiffness ``A``. Inputs and outputs are
-node fields on the **full** grid, shape ``[B, N_full]`` or ``[N_full]``, with the
-boundary entries carrying the zero-embedding convention (see the ``preconditioner_notes``
-write-up, "Interior space versus full-grid storage").
+node fields on the **full** node set, shape ``[B, N_full]`` or ``[N_full]``, with the
+boundary entries carrying the zero-embedding convention: a residual that is zero on the
+Dirichlet nodes is mapped to a correction that is zero there too.
 
-Both :class:`~tensorpils.preconditioners.multigrid.GeometricMultigrid` and
-:class:`~tensorpils.preconditioners.spectral.SpectralPreconditioner` implement this
-contract, so the losses and trainer depend only on ``precond(r)`` and ``precond.report()``.
+Every preconditioner in this package implements this contract, so the losses and trainers
+depend only on ``precond(r)`` and ``precond.report()``.
 """
 
 from abc import ABC, abstractmethod

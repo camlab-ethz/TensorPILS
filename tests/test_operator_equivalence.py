@@ -6,7 +6,6 @@ These verify, without importing the standalone reference script or the FNO model
 * the assembled stiffness ``A`` is the correct bilinear-quad Laplacian (symmetric,
   constant null space, interior-positive-definite, O(h^2)-consistent);
 * the mass matrix ``M`` integrates correctly (``sum(M) == area``);
-* the energy gradient equals the residual (the Deep Ritz invariant);
 * the analytical fields match the standalone's spectrum (``r = -0.5`` convention);
 * node ordering / boundary mask are as expected;
 * every physics-informed loss runs forward + backward (incl. the multigrid ones).
@@ -111,19 +110,6 @@ def test_galerkin_consistency_O_h2():
     assert rels[0] / rels[1] > 3.0 and rels[1] / rels[2] > 3.0, rels
 
 
-def test_energy_gradient_equals_residual(problem17):
-    """grad_u of E(u,f)=1/2 u^T A u - u^T M f equals the (unmasked) residual A u - M f."""
-    _, prob = problem17
-    n = prob.n_nodes
-    torch.manual_seed(1)
-    u = torch.randn(3, n, dtype=torch.float64, requires_grad=True)
-    f = torch.randn(3, n, dtype=torch.float64)
-    E = prob.energy(u, f, reduce="sum")
-    (g,) = torch.autograd.grad(E, u)
-    expected = prob._spmm(prob.A, u.detach()) - prob.load_vector(f)
-    assert torch.allclose(g, expected, atol=1e-9)
-
-
 def test_r_convention_matches_standalone():
     """PoissonMultiFrequency(r=-0.5) reproduces the standalone's source/solution (r=0.5)."""
     mesh = structured_quad_mesh(13, 13)
@@ -139,22 +125,14 @@ def test_r_convention_matches_standalone():
     assert np.allclose(u_tm, _ref_solution(pts_np, a_np, r=0.5), atol=1e-10)
 
 
-@pytest.mark.parametrize("loss_type,bc_mode,precondition",
-                         [("galerkin", "penalty", False),
-                          ("deepritz", "penalty", False),
-                          ("deepritz", "hard", False),
-                          ("deepritz", "hard", True),
-                          ("pls", "penalty", False)])
-def test_losses_forward_backward(loss_type, bc_mode, precondition):
+@pytest.mark.parametrize("loss_type", ["galerkin", "pls"])
+def test_losses_forward_backward(loss_type):
     """Every FEM-based loss runs forward + backward and yields finite gradients."""
     nx = ny = 17
     mesh = structured_quad_mesh(nx, ny)
     prob = PoissonProblem(mesh)
-    mg = None
-    if loss_type == "pls" or (loss_type == "deepritz" and precondition):
-        mg = GeometricMultigrid(nx, ny, n_levels=3)
-    crit = build_loss(loss_type, prob, lambda_bc=100.0, bc_mode=bc_mode,
-                      precond=mg, precondition=precondition)
+    mg = GeometricMultigrid(nx, ny, n_levels=3) if loss_type == "pls" else None
+    crit = build_loss(loss_type, prob, precond=mg)
     torch.manual_seed(3)
     u = torch.randn(4, nx * ny, requires_grad=True)
     f = torch.randn(4, nx * ny)

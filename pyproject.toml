@@ -68,3 +68,6 @@ version = {attr = "tensorpils._version.__version__"}
 
 [tool.setuptools.packages.find]
 include = ["tensorpils*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

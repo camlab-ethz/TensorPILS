@@ -322,11 +322,10 @@ def test_label_free_losses_run_on_a_non_grid_node_set():
     assert not model.structured
 
     f = torch.randn(2, coords.shape[0]) * 0.1
-    for name in ("galerkin", "deepritz"):
+    for name in ("galerkin",):
         model.zero_grad()
         u = model.forward_nodes(f.unsqueeze(-1))[..., 0]                 # [B, N], node space
-        loss = build_loss(name, problem, lambda_bc=1.0, bc_mode="hard")(
-            u, f, torch.zeros_like(f))
+        loss = build_loss(name, problem)(u, f, torch.zeros_like(f))
         assert torch.isfinite(loss)
         loss.backward()
         grad = sum(p.grad.abs().sum() for p in model.parameters() if p.grad is not None)

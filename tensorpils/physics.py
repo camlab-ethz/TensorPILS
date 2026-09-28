@@ -1,14 +1,13 @@
 """FEM operators built on TensorMesh's assembled matrices.
 
-Two PDE operators live here, both assembled once from a structured
-:class:`tensormesh.Mesh` and both exposing a batched, autograd-differentiable
-interface used by the physics-informed losses:
+Three PDE operators live here, each assembled once from a :class:`tensormesh.Mesh` and each
+exposing a batched, autograd-differentiable interface used by the physics-informed losses:
 
 * :class:`PoissonProblem` — static :math:`-\\Delta u = f`
-* :class:`WaveProblem`    — time-dependent :math:`u_{tt} = c^2 \\Delta u`
-* :class:`ACProblem`      — time-dependent Allen–Cahn :math:`u_t = a^2 \\Delta u + \\epsilon^2 u(1-u^2)`
+* :class:`ACProblem`      — time-dependent Allen–Cahn :math:`u_t = a^2 \\Delta u + \\epsilon^2 u(1-u^2)`,
+  discretised in time by the convex–concave (Eyre) splitting
 * :class:`StokesProblem`  — static Stokes saddle point :math:`-\\mu\\Delta u + \\nabla p = f`,
-  :math:`\\nabla\\cdot u = 0`, on a Taylor-Hood Q2/Q1 pair
+  :math:`\\nabla\\cdot u = 0`, on a Taylor-Hood P2/P1 pair on triangles
 
 They share :class:`FEMOperator`, which assembles the stiffness ``A`` and mass ``M``
 matrices (via TensorMesh's ``LaplaceElementAssembler`` / ``MassElementAssembler``),
@@ -24,10 +23,8 @@ import meshio
 from tensormesh import (Condenser, Field, LaplaceElementAssembler, Mesh,
                         MassElementAssembler, MixedElementAssembler)
 
-from .meshing import structured_quad_mesh, node_to_grid, grid_to_node
-
-__all__ = ["FEMOperator", "PoissonProblem", "WaveProblem", "ACProblem", "StokesProblem",
-           "UnstructuredStokesProblem", "apply_zero_boundary"]
+__all__ = ["FEMOperator", "PoissonProblem", "ACProblem", "StokesProblem",
+           "apply_zero_boundary"]
 
 
 def apply_zero_boundary(u: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -46,7 +43,7 @@ class FEMOperator(nn.Module):
     Parameters
     ----------
     mesh : tensormesh.Mesh
-        The (structured) quad mesh. ``mesh.boundary_mask`` defines the Dirichlet nodes.
+        The mesh. ``mesh.boundary_mask`` defines the Dirichlet nodes.
     quadrature_order : int, optional
         Gauss order per axis for assembling ``A`` and ``M``. Default ``4`` integrates
         the bilinear-quad stiffness and mass exactly on rectangular cells.
@@ -87,15 +84,7 @@ class FEMOperator(nn.Module):
 
 
 class PoissonProblem(FEMOperator):
-    r"""Discrete FEM operator for :math:`-\Delta u = f` with zero Dirichlet BC.
-
-    Notes
-    -----
-    The energy uses the matrix identity
-    :math:`E(u) = \tfrac12 u^\top A u - u^\top (M f)`, which is exactly the FE energy
-    :math:`\int(\tfrac12|\nabla u_h|^2 - f_h u_h)` and whose gradient w.r.t. ``u`` is the
-    residual :math:`A u - M f` — the property the Deep Ritz / preconditioned losses rely on.
-    """
+    r"""Discrete FEM operator for :math:`-\Delta u = f` with zero Dirichlet BC."""
 
     # ------------------------------------------------------------------ residual
     def residual(self, u: torch.Tensor, f: torch.Tensor) -> torch.Tensor:
@@ -108,75 +97,6 @@ class PoissonProblem(FEMOperator):
         r = self._spmm(self.A, u_bc) - self.load_vector(f)
         return apply_zero_boundary(r, self.boundary_mask)
 
-    # -------------------------------------------------------------------- energy
-    def energy(self, u: torch.Tensor, f: torch.Tensor, reduce: str = "mean") -> torch.Tensor:
-        r"""Deep Ritz energy :math:`E(u) = \tfrac12 u^\top A u - u^\top (M f)`.
-
-        ``u``, ``f``: ``[N]`` or ``[B, N]``. Returns a scalar (``reduce="mean"``/``"sum"``)
-        or the per-sample energy ``[B]`` (``reduce="none"``). Apply any boundary
-        projection to ``u`` *before* calling for hard-BC behaviour.
-        """
-        Au = self._spmm(self.A, u)
-        b = self.load_vector(f)
-        if u.dim() == 1:
-            return 0.5 * (u * Au).sum() - (u * b).sum()
-        e = 0.5 * (u * Au).sum(dim=-1) - (u * b).sum(dim=-1)   # [B]
-        if reduce == "mean":
-            return e.mean()
-        if reduce == "sum":
-            return e.sum()
-        return e
-
-
-class WaveProblem(FEMOperator):
-    r"""Discrete FEM operator for the wave equation :math:`u_{tt} = c^2 \Delta u`
-    with zero Dirichlet BC, in central-difference (explicit) time.
-
-    The semi-discrete form is :math:`M\ddot u + c^2 A u = 0`; replacing
-    :math:`\ddot u` by the second-order central difference gives the nodal residual
-
-    .. math::
-        R = M\,\frac{u^{n+1} - 2u^n + u^{n-1}}{\Delta t^2} + c^2 A\,u^n,
-
-    which the label-free Galerkin loss drives to zero. This mirrors the update
-    :math:`M u^{n+1} = 2M u^n - M u^{n-1} - \Delta t^2 c^2 A u^n` of TensorMesh's
-    ``examples/wave/wave.py``. ``A`` (stiffness) and ``M`` (mass) are the same
-    matrices :class:`PoissonProblem` assembles.
-    """
-
-    # ------------------------------------------------------------------ residual
-    def residual(self, u_prev: torch.Tensor, u_curr: torch.Tensor,
-                 u_next: torch.Tensor, c: float, dt: float) -> torch.Tensor:
-        r"""Boundary-masked central-difference wave residual.
-
-        ``u_prev``/``u_curr``/``u_next`` are :math:`u^{n-1}, u^n, u^{n+1}` in ``[N]`` or
-        ``[B, N]``. Each is projected to zero on the Dirichlet boundary before use and
-        the returned residual is also zeroed there. Fully differentiable in the inputs.
-        """
-        mask = self.boundary_mask
-        up = apply_zero_boundary(u_prev, mask)
-        uc = apply_zero_boundary(u_curr, mask)
-        un = apply_zero_boundary(u_next, mask)
-        accel = (un - 2.0 * uc + up) / (dt * dt)
-        r = self._spmm(self.M, accel) + (c * c) * self._spmm(self.A, uc)
-        return apply_zero_boundary(r, mask)
-
-    # -------------------------------------------------------------------- energy
-    def energy(self, u: torch.Tensor, v: torch.Tensor, c: float,
-               reduce: str = "mean") -> torch.Tensor:
-        r"""Mechanical energy :math:`E = \tfrac12 v^\top M v + \tfrac12 c^2 u^\top A u`
-        (kinetic + potential). ``u``, ``v``: ``[N]`` or ``[B, N]``. Diagnostic only."""
-        Mv = self._spmm(self.M, v)
-        Au = self._spmm(self.A, u)
-        if u.dim() == 1:
-            return 0.5 * (v * Mv).sum() + 0.5 * (c * c) * (u * Au).sum()
-        e = 0.5 * (v * Mv).sum(dim=-1) + 0.5 * (c * c) * (u * Au).sum(dim=-1)   # [B]
-        if reduce == "mean":
-            return e.mean()
-        if reduce == "sum":
-            return e.sum()
-        return e
-
 
 class ACProblem(FEMOperator):
     r"""Discrete FEM operator for the Allen–Cahn equation
@@ -184,221 +104,68 @@ class ACProblem(FEMOperator):
     .. math::
         \partial_t u = a^2 \Delta u + \epsilon^2 u(1-u^2)
 
-    on the unit square with zero Dirichlet BC, in fully-implicit backward Euler time.
-    ``a`` is the diffusion coefficient and ``\epsilon`` the reaction strength (following
-    TensorGalerkin's ``Trainer/ac.py`` and TensorMesh's ``examples/diffusion/allen-cahn``:
-    the large factor multiplies the double-well term, not the Laplacian).
+    on the unit square with zero Dirichlet BC. ``a`` is the diffusion coefficient and
+    ``\epsilon`` the reaction strength (the large factor multiplies the double-well term, not
+    the Laplacian).
 
-    Backward Euler with the reaction evaluated at the new level gives the weak-form nodal
-    residual (group / product FEM, consistent mass ``M`` and stiffness ``A``):
+    Time is discretised by the convex–concave (Eyre) splitting: the convex cubic term is
+    implicit and the concave linear term explicit at the old level, which gives the weak-form
+    nodal step residual (group / product FEM, consistent mass ``M`` and stiffness ``A``)
 
     .. math::
         R = M\,\frac{u^{n+1} - u^n}{\Delta t} + a^2 A\,u^{n+1}
-            - \epsilon^2 M\,\big(u^{n+1} - (u^{n+1})^3\big),
+            + \epsilon^2 M\,\big((u^{n+1})^3 - u^n\big).
 
-    which the label-free Galerkin loss drives to zero. The FEM reference trajectory
-    (:meth:`fem_reference`) solves ``R = 0`` per step by Newton, so it exactly zeroes this
-    residual — the discrete target the physics loss is trained toward. ``A``/``M`` are the
-    same matrices :class:`PoissonProblem` / :class:`WaveProblem` assemble.
+    Its Newton Jacobian :math:`M/\Delta t + a^2A + 3\epsilon^2 M\,\mathrm{diag}(u^2)` is SPD for
+    every ``u`` and ``Δt``, so the scheme is unconditionally energy-stable. The label-free loss
+    drives ``R`` to zero, and the FEM reference trajectory (:meth:`fem_reference`) solves
+    ``R = 0`` per step by Newton, so it exactly zeroes this residual — the discrete target the
+    physics loss is trained toward. ``A``/``M`` are the same matrices :class:`PoissonProblem`
+    assembles.
     """
 
     # ------------------------------------------------------------------ residual
     def residual(self, u_curr: torch.Tensor, u_next: torch.Tensor,
-                 a: float, eps: float, dt: float,
-                 integrator: str = "backward_euler") -> torch.Tensor:
-        r"""Boundary-masked weak-form Allen–Cahn step residual (``/dt`` scaling), by integrator.
+                 a: float, eps: float, dt: float) -> torch.Tensor:
+        r"""Boundary-masked weak-form convex–concave Allen–Cahn step residual (``/dt`` scaling).
 
         ``u_curr``/``u_next`` are :math:`u^n, u^{n+1}` in ``[N]`` or ``[B, N]``. Both are projected
         to zero on the Dirichlet boundary before use and the returned residual is also zeroed
-        there. Fully differentiable in the inputs. The two schemes differ only in the *linear*
-        reaction term (the cubic is implicit in both):
+        there. Fully differentiable in the inputs:
 
-        * ``"backward_euler"`` — fully implicit:
-          :math:`M\frac{u^{n+1}-u^n}{\dt} + a^2Au^{n+1} - \epsilon^2 M(u^{n+1}-(u^{n+1})^3)`.
-        * ``"convex_concave"`` — Eyre split, linear term explicit at :math:`u^n`:
-          :math:`M\frac{u^{n+1}-u^n}{\dt} + a^2Au^{n+1} + \epsilon^2 M((u^{n+1})^3-u^n)`.
+        .. math::
+            M\frac{u^{n+1}-u^n}{\Delta t} + a^2Au^{n+1} + \epsilon^2 M((u^{n+1})^3-u^n).
 
-        Both are the ``/dt``-scaled residual (matching :meth:`fem_reference`), so a least-squares
-        loss built on either has a ``dt``-independent gradient scale. This is the same residual
-        the reference solve zeros, so the ``convex_concave`` reference exactly zeros the
-        ``convex_concave`` residual (and likewise for backward Euler)."""
+        The ``/dt`` scaling matches :meth:`fem_reference`, so a least-squares loss built on it has
+        a ``dt``-independent gradient scale, and the reference exactly zeros this residual."""
         mask = self.boundary_mask
         uc = apply_zero_boundary(u_curr, mask)
         un = apply_zero_boundary(u_next, mask)
-        if integrator == "backward_euler":
-            reaction = (eps * eps) * (un - un ** 3)               # linear term implicit (uⁿ⁺¹)
-        elif integrator == "convex_concave":
-            reaction = (eps * eps) * (uc - un ** 3)               # linear term explicit (uⁿ)
-        else:
-            raise ValueError(f"unknown integrator {integrator!r}; "
-                             "expected 'backward_euler' or 'convex_concave'")
+        reaction = (eps * eps) * (uc - un ** 3)                   # linear term explicit (uⁿ)
         r = self._spmm(self.M, (un - uc) / dt) \
             + (a * a) * self._spmm(self.A, un) \
             - self._spmm(self.M, reaction)
         return apply_zero_boundary(r, mask)
 
-    # ---------------------------------------------- minimizing-movement objective
-    def mm_objective(self, u_curr: torch.Tensor, u_next: torch.Tensor,
-                     a: float, eps: float, dt: float) -> torch.Tensor:
-        r"""Convex–concave minimizing-movement (JKO) objective for one Allen–Cahn step.
-
-        With the Ginzburg–Landau energy split :math:`E = E_{\mathrm{cvx}} + E_{\mathrm{ccv}}`
-        (:math:`E_{\mathrm{cvx}}=\tfrac{a^2}{2}\!\int|\nabla u|^2+\tfrac{\epsilon^2}{4}\!\int u^4
-        + \tfrac{\epsilon^2}{4}|\Omega|`, :math:`E_{\mathrm{ccv}}=-\tfrac{\epsilon^2}{2}\!\int u^2`,
-        so :math:`DE_{\mathrm{ccv}}(u^n)=-\epsilon^2 u^n`), the convex–concave step is the unique
-        minimiser of
-
-        .. math::
-            J(u) = E_{\mathrm{cvx}}(u) + \langle DE_{\mathrm{ccv}}(u^n), u\rangle
-                   + \tfrac{1}{2\dt}\|u-u^n\|_{L^2}^2 .
-
-        Discretised (nodal quartic :math:`\int u^4 \approx (u^4)^\top M\mathbf 1`, lumped mass
-        :math:`M\mathbf 1`), for ``u_next``:math:`=u`, ``u_curr``:math:`=u^n`:
-
-        .. math::
-            J = \tfrac{a^2}{2}u^\top A u + \tfrac{\epsilon^2}{4}\big[(u^4)^\top M\mathbf 1+|\Omega|\big]
-                - \epsilon^2 (u^n)^\top M u + \tfrac{1}{2\dt}(u-u^n)^\top M (u-u^n).
-
-        Its gradient is the convex–concave step residual with the *lumped* mass on the cubic
-        (:math:`\nabla_u J = M\frac{u-u^n}{\dt}+a^2Au+\epsilon^2\operatorname{diag}(M\mathbf 1)u^3
-        -\epsilon^2 M u^n`); minimising :math:`J` is the Deep-Ritz analogue of the least-squares
-        residual loss. Returns ``[B]`` (or scalar for ``[N]``). ``|\Omega|`` is a `u`-independent
-        constant, kept for fidelity to the objective. Boundary-projected like :meth:`residual`."""
-        mask = self.boundary_mask
-        uc = apply_zero_boundary(u_curr, mask)
-        un = apply_zero_boundary(u_next, mask)
-        ones = torch.ones(self.n_nodes, dtype=un.dtype, device=un.device)
-        m1 = self._spmm(self.M, ones)                     # lumped mass vector M·1  [N]
-        omega = m1.sum()                                  # |Ω| = 1ᵀM1
-        Aun = self._spmm(self.A, un)
-        Mun = self._spmm(self.M, un)
-        Muc = self._spmm(self.M, uc)
-        grad_term = 0.5 * (a * a) * (un * Aun).sum(dim=-1)              # a²/2 uᵀA u
-        quartic = 0.25 * (eps * eps) * ((un ** 4) * m1).sum(dim=-1)     # ε²/4 (u⁴)ᵀM1
-        concave = -(eps * eps) * (uc * Mun).sum(dim=-1)                 # -ε² (uⁿ)ᵀM u
-        prox = (0.5 / dt) * ((un - uc) * (Mun - Muc)).sum(dim=-1)       # 1/(2dt)‖u-uⁿ‖²_M
-        return grad_term + quartic + concave + prox + 0.25 * (eps * eps) * omega
-
-    # -------------------------------------------------------------------- energy
-    def energy(self, u: torch.Tensor, a: float, eps: float,
-               reduce: str = "mean") -> torch.Tensor:
-        r"""Ginzburg–Landau energy :math:`E = \tfrac12 a^2 u^\top A u + \epsilon^2 \tfrac14 u^\top M (u^2-1)^2`
-        (gradient + double-well). ``u``: ``[N]`` or ``[B, N]``. Diagnostic only; Allen–Cahn is
-        the ``L^2`` gradient flow of this energy, so it is non-increasing in time."""
-        Au = self._spmm(self.A, u)
-        well = 0.25 * (u * u - 1.0) ** 2                           # W(u)=¼(u²-1)²
-        Mw = self._spmm(self.M, well)
-        if u.dim() == 1:
-            return 0.5 * (a * a) * (u * Au).sum() + (eps * eps) * Mw.sum()
-        e = 0.5 * (a * a) * (u * Au).sum(dim=-1) + (eps * eps) * Mw.sum(dim=-1)   # [B]
-        if reduce == "mean":
-            return e.mean()
-        if reduce == "sum":
-            return e.sum()
-        return e
-
-    # ------------------------------------------ FEM reference solve (legacy dense, kept for now)
-    @torch.no_grad()
-    def fem_reference_old(self, u0: torch.Tensor, a: float, eps: float, dt: float,
-                          n_steps: int, newton_tol: float = 1e-8, newton_max: int = 20,
-                          chunk: int = 64, integrator: str = "convex_concave") -> torch.Tensor:
-        r"""Legacy dense batched Newton reference (superseded by :meth:`fem_reference`; kept for
-        comparison/benchmarking, to be removed). Dense ``torch.linalg.solve`` on the interior
-        block, solves in the caller's dtype.
-
-        Batched implicit + Newton reference trajectory (build-time ground truth).
-
-        Solves ``R(u^{n+1}; u^n) = 0`` each step by Newton on the interior DOFs (Dirichlet nodes
-        held at 0). Uses dense linear algebra on the interior block — appropriate for structured
-        grids up to a few thousand nodes; process ``chunk`` samples at a time to bound memory.
-        ``u0``: ``[N]`` or ``[B, N]``. Returns the trajectory ``[B, n_steps+1, N]`` (or
-        ``[n_steps+1, N]`` for a single sample).
-
-        ``integrator`` selects the time discretisation of the reaction ε²(u−u³):
-
-        * ``"convex_concave"`` (default) — Eyre convex splitting: the convex quartic (cubic term
-          ε²u³) is implicit, the concave part (linear term ε²u) is explicit at ``u^n``. Residual
-          :math:`(M+\Delta t\,a^2A)u+\Delta t\,\varepsilon^2 M u^3-(I+\Delta t\,\varepsilon^2)Mu^n`,
-          Jacobian :math:`J = M/\Delta t + a^2A + 3\varepsilon^2 M\,\mathrm{diag}(u^2)`, which is
-          SPD for every ``u`` and ``Δt`` — unconditionally energy-stable.
-        * ``"backward_euler"`` — fully implicit; the whole reaction is at the new level. Jacobian
-          :math:`J = M/\Delta t + a^2A - \varepsilon^2 M\,\mathrm{diag}(1-3u^2)`.
-
-        The constant part ``L = M/\Delta t + a^2 A`` is formed once; the reaction Jacobian is a
-        per-iterate column scaling of ``M``."""
-        if integrator not in ("convex_concave", "backward_euler"):
-            raise ValueError(f"unknown integrator {integrator!r}; "
-                             "expected 'convex_concave' or 'backward_euler'")
-        single = (u0.dim() == 1)
-        if single:
-            u0 = u0.unsqueeze(0)
-        device, dtype = u0.device, u0.dtype
-        mask = self.boundary_mask.to(device)
-        inner = ~mask
-        idx = torch.nonzero(inner, as_tuple=False).squeeze(1)
-
-        # Dense operators on the interior block (assembled once).
-        M = self.M.to_dense().to(device=device, dtype=dtype)
-        A = self.A.to_dense().to(device=device, dtype=dtype)
-        M_ii = M[idx][:, idx]                                      # [Ni, Ni]
-        A_ii = A[idx][:, idx]                                      # [Ni, Ni]
-        L_ii = M_ii / dt + (a * a) * A_ii                          # constant Newton LHS part
-
-        B = u0.shape[0]
-        traj = torch.zeros(B, n_steps + 1, self.n_nodes, device=device, dtype=dtype)
-        traj[:, 0] = apply_zero_boundary(u0, mask)
-
-        for lo in range(0, B, chunk):
-            hi = min(lo + chunk, B)
-            u_old = traj[lo:hi, 0, idx].clone()                   # [b, Ni]
-            for step in range(1, n_steps + 1):
-                u = u_old.clone()                                 # Newton initial guess
-                for _ in range(newton_max):
-                    # Reaction term and its Jacobian column-scale w (so J = L_ii + M_ii·diag(w)),
-                    # per integrator. Both share the diffusion+mass block L_ii = M/dt + a²A.
-                    if integrator == "backward_euler":
-                        reac = (eps * eps) * (u - u ** 3)         # ε²(u-u³) fully implicit
-                        r_sign = -1.0                             # residual: ... - M·reac
-                        w = (eps * eps) * (3.0 * u * u - 1.0)     # J = L - ε²M diag(1-3u²)
-                    else:                                         # convex_concave (Eyre split)
-                        reac = (eps * eps) * (u ** 3 - u_old)     # cubic implicit, linear explicit
-                        r_sign = +1.0                             # residual: ... + M·reac
-                        w = 3.0 * (eps * eps) * (u * u)           # J = L + 3ε²M diag(u²)  (SPD)
-                    r = (M_ii @ ((u - u_old) / dt).T).T \
-                        + (a * a) * (A_ii @ u.T).T \
-                        + r_sign * (M_ii @ reac.T).T              # [b, Ni]
-                    if r.norm(dim=1).max() < newton_tol:
-                        break
-                    J = L_ii.unsqueeze(0) + (M_ii.unsqueeze(0) * w.unsqueeze(1))   # column-scale
-                    du = torch.linalg.solve(J, -r.unsqueeze(-1)).squeeze(-1)   # [b, Ni]
-                    u = u + du
-                traj[lo:hi, step, idx] = u
-                u_old = u
-        return traj[0] if single else traj
-
-    # ------------------------------------------ FEM reference solve (sparse float64, standard)
+    # ------------------------------------------ FEM reference solve (sparse float64)
     @torch.no_grad()
     def fem_reference(self, u0: torch.Tensor, a: float, eps: float, dt: float,
                       n_steps: int, newton_tol: float = 1e-8, newton_max: int = 20,
-                      chunk: int = 64, integrator: str = "convex_concave",
-                      solver_backend: str = "auto") -> torch.Tensor:
-        r"""Sparse-solve Newton reference trajectory --- the standard build-time ground truth.
+                      chunk: int = 64, solver_backend: str = "auto") -> torch.Tensor:
+        r"""Sparse-solve Newton reference trajectory --- the build-time ground truth.
 
-        Same contract and output as the legacy dense :meth:`fem_reference_old`, but each
-        Newton system is solved with a **batched sparse** solve (``SparseMatrix.solve_batch``:
-        shared sparsity, per-sample values) instead of a dense ``torch.linalg.solve``. This drops
-        the :math:`O(N_i^2)` memory / :math:`O(N_i^3)` factorisation and sidesteps MAGMA's batched
-        dense LU (which fails at large grids). ``solve_batch`` loops per sample internally, so it is
-        genuinely sparse but not GPU-parallel; SPD is auto-detected for the convex--concave path.
+        Solves ``R(u^{n+1}; u^n) = 0`` each step by Newton on the interior DOFs (Dirichlet nodes
+        held at 0). ``u0``: ``[N]`` or ``[B, N]``. Returns the trajectory ``[B, n_steps+1, N]`` (or
+        ``[n_steps+1, N]`` for a single sample), processing ``chunk`` samples at a time.
 
-        The interior Jacobian is ``J = M/dt + a^2 A + M diag(w)`` with ``w = 3 eps^2 u^2``
-        (convex_concave) or ``w = eps^2 (3u^2 - 1)`` (backward_euler); its values are assembled per
-        Newton step as ``L.values + M.values * w[:, col]`` on the shared ``(row,col)`` layout of
-        ``L = M/dt + a^2 A``. ``solver_backend`` is passed through (``"auto"`` picks scipy on CPU,
-        cupy/cuDSS on CUDA if installed)."""
-        if integrator not in ("convex_concave", "backward_euler"):
-            raise ValueError(f"unknown integrator {integrator!r}; "
-                             "expected 'convex_concave' or 'backward_euler'")
+        Each Newton system is solved with a **batched sparse** solve (``SparseMatrix.solve_batch``:
+        shared sparsity, per-sample values). ``solve_batch`` loops per sample internally, so it is
+        genuinely sparse but not GPU-parallel; SPD is auto-detected.
+
+        The interior Jacobian is ``J = M/dt + a^2 A + M diag(w)`` with ``w = 3 eps^2 u^2``; its
+        values are assembled per Newton step as ``L.values + M.values * w[:, col]`` on the shared
+        ``(row,col)`` layout of ``L = M/dt + a^2 A``. ``solver_backend`` is passed through
+        (``"auto"`` picks scipy on CPU, cupy/cuDSS on CUDA if installed)."""
         import numpy as np
         from tensormesh.sparse.matrix import SparseMatrix
 
@@ -438,17 +205,11 @@ class ACProblem(FEMOperator):
             for step in range(1, n_steps + 1):
                 u = u_old.clone()
                 for _ in range(newton_max):
-                    if integrator == "backward_euler":
-                        reac = (eps * eps) * (u - u ** 3)     # ε²(u-u³) fully implicit
-                        r_sign = -1.0
-                        w = (eps * eps) * (3.0 * u * u - 1.0)
-                    else:                                     # convex_concave (Eyre split)
-                        reac = (eps * eps) * (u ** 3 - u_old)
-                        r_sign = +1.0
-                        w = 3.0 * (eps * eps) * (u * u)
+                    reac = (eps * eps) * (u ** 3 - u_old)     # cubic implicit, linear explicit
+                    w = 3.0 * (eps * eps) * (u * u)           # J = L + 3ε²M diag(u²)  (SPD)
                     r = matvec(M_ii, (u - u_old) / dt) \
                         + (a * a) * matvec(A_ii, u) \
-                        + r_sign * matvec(M_ii, reac)         # [b, Ni]
+                        + matvec(M_ii, reac)                  # [b, Ni]
                     if r.norm(dim=1).max() < newton_tol:
                         break
                     J_vals = L_vals.unsqueeze(0) + M_vals.unsqueeze(0) * w[:, col]   # [b, nnz]
@@ -466,9 +227,8 @@ class _StokesBilinearForm(MixedElementAssembler):
     r"""Taylor-Hood Stokes bilinear form
     :math:`\mu\,\nabla u : \nabla v - p\,\nabla\cdot v - q\,\nabla\cdot u`.
 
-    Mirrors TensorMesh's ``examples/fluid/stokes_taylor_hood``; the only difference is
-    that we hand it a *structured* ``quad9`` mesh, so the Q2 velocity field is Q2 and the
-    order-1 pressure field is Q1 on the cell corners.
+    Mirrors TensorMesh's ``examples/fluid/stokes_taylor_hood``. On a ``triangle6`` mesh the
+    order-2 velocity field is P2 and the order-1 pressure field is P1 on the triangle corners.
     """
 
     fields = [Field(trial="u", test="v", order=2, components=2),
@@ -484,30 +244,30 @@ class _StokesBilinearForm(MixedElementAssembler):
 
 
 class StokesProblem(FEMOperator):
-    r"""Discrete Taylor-Hood (Q2/Q1) operator for the stationary Stokes equations
+    r"""Discrete Taylor-Hood **P2/P1** operator for the stationary Stokes equations
 
     .. math::
         -\mu\Delta u + \nabla p = f,\qquad \nabla\cdot u = 0,\qquad u|_{\partial\Omega}=0,
 
-    assembled as the symmetric **saddle-point** system
+    on a triangulation, assembled as the symmetric **saddle-point** system
 
     .. math::
         \mathcal K c = \begin{pmatrix} A & B^\top \\ B & 0\end{pmatrix}
         \begin{pmatrix}\mathbf u \\ \mathbf p\end{pmatrix}
         = \begin{pmatrix}\mathbf b \\ \mathbf 0\end{pmatrix}.
 
-    Unlike the three scalar PDEs above, the unknown is a *pair* of fields living on two
-    grids: velocity on the fine Q2 node grid ``[Ny, Nx]`` (2 components) and pressure on
-    the Q1 corner grid ``[ny_p, nx_p] = [(Ny+1)/2, (Nx+1)/2]`` — the ``[::2, ::2]``
-    subgrid. :meth:`from_grid` performs exactly that split on the FNO's 3-channel output,
-    and :meth:`pack` assembles the monolithic DOF vector in TensorMesh's block layout
-    (velocity first, node-major/component-minor; then pressure).
+    The unknown is a *pair* of fields: velocity (2 components) on the P2 node set, which is the
+    mesh's node set, and pressure on the P1 nodes — the triangle *corners*, an arbitrary subset
+    of the P2 numbering read from the assembly layout (:attr:`p_node_ids`). :meth:`from_nodes`
+    splits a model's 3-channel output accordingly, and :meth:`pack` assembles the monolithic DOF
+    vector in TensorMesh's block layout (velocity first, node-major/component-minor; then
+    pressure).
 
     Two structural facts drive the design:
 
-    * ``A`` decouples across velocity components and equals :math:`\mu` times the Q2
-      scalar stiffness that :class:`FEMOperator` already assembles — so the geometric
-      multigrid built for the scalar Laplacian preconditions the velocity block directly.
+    * ``A`` decouples across velocity components and equals :math:`\mu` times the P2 scalar
+      stiffness that :class:`FEMOperator` already assembles — so a scalar V-cycle preconditions
+      the velocity block directly.
     * :math:`B^\top \mathbf 1 = 0` on the zero-BC velocity space, i.e. the residual is
       **invariant** under a constant pressure shift. The constant mode is therefore a pure
       gauge: it is fixed by :meth:`project_pressure_gauge` (zero mean in the FE
@@ -516,30 +276,28 @@ class StokesProblem(FEMOperator):
     Parameters
     ----------
     mesh : tensormesh.Mesh
-        A structured ``quad9`` mesh from :func:`meshing.structured_quad9_mesh`.
-    nx_p, ny_p : int
-        Pressure (cell-corner) grid size; the fine grid is ``2nx_p-1`` by ``2ny_p-1``.
+        A ``triangle6`` mesh, e.g. from :func:`~tensorpils.meshing.obstacle_mesh`.
     mu : float
         Dynamic viscosity :math:`\mu`.
     """
 
-    def __init__(self, mesh, nx_p: int, ny_p: int, mu: float = 1.0,
-                 quadrature_order: int = 5):
-        # FEMOperator gives us the Q2 scalar stiffness A and Q2 scalar mass M on the fine
-        # grid. A is the per-component velocity block (up to mu); M builds the load vector.
+    def __init__(self, mesh, mu: float = 1.0, quadrature_order: int = 5):
+        # FEMOperator gives us the P2 scalar stiffness A and P2 scalar mass M. A is the
+        # per-component velocity block (up to mu); M builds the load vector.
         super().__init__(mesh, quadrature_order=quadrature_order)
+        if "triangle6" not in list(mesh.cells.keys()):
+            raise ValueError(
+                "Taylor-Hood P2/P1 needs a 'triangle6' mesh (order=2); got cells "
+                f"{list(mesh.cells.keys())}. meshing.obstacle_mesh(order=2) builds one.")
         self.mu = float(mu)
-        self.nx_p, self.ny_p = int(nx_p), int(ny_p)
-        self.nx_u, self.ny_u = 2 * nx_p - 1, 2 * ny_p - 1
-        self.n_u = self.n_nodes                                   # fine (Q2) nodes
-        self.n_p = self.nx_p * self.ny_p
+        self.n_u = self.n_nodes
 
         # --- monolithic saddle-point operator -------------------------------------
         asm = _StokesBilinearForm.from_mesh(mesh, quadrature_order=quadrature_order, mu=mu)
         layout = asm.layout
-        assert layout.n_nodes("u") == self.n_u, "velocity field is not the mesh node set"
-        assert layout.n_nodes("p") == self.n_p, (
-            f"pressure field has {layout.n_nodes('p')} nodes, expected {self.n_p}")
+        if layout.n_nodes("u") != self.n_u:
+            raise RuntimeError("velocity field is not the mesh node set")
+        self.n_p = int(layout.n_nodes("p"))
         self.K = asm()
         self.n_dofs = int(layout.n_dofs)
         self.off_p = int(layout.offsets["p"])                     # = 2 * n_u
@@ -547,12 +305,21 @@ class StokesProblem(FEMOperator):
         # Dirichlet DOFs: all velocity components on the boundary. The pressure gauge is
         # handled by projection, but the reference solve needs a pin to make K invertible.
         self.register_buffer("dirichlet_mask", layout.dof_mask("u", self.boundary_mask))
-        self._pressure_pin = int(layout.dof_index("p", int(layout.node_ids("p")[0])))
+        p_ids = layout.node_ids("p")
+        self._pressure_pin = int(layout.dof_index("p", int(p_ids[0])))
+        # Which P2 nodes carry pressure. The model emits three channels on the P2 node set and
+        # the pressure one is gathered here, so the two spaces need no scatter table.
+        self.register_buffer("p_node_ids", p_ids.long())
 
-        # --- pressure mass matrix (Q1 on the corner grid) --------------------------
-        # The Q1 pressure space on the quad9 mesh is exactly the Q1 space of the corner
-        # grid, so we can assemble M_p with the ordinary scalar machinery.
-        p_mesh = structured_quad_mesh(nx=nx_p, ny=ny_p)
+        # --- P1 pressure mass, on a sub-mesh of the corners -----------------------
+        # node_ids("p") is sorted, so searchsorted maps a global node id to its pressure DOF
+        # index; the sub-mesh is therefore in pressure-DOF order and M_p needs no permutation.
+        corners = mesh.cells["triangle6"][:, :3].long()
+        local = torch.searchsorted(p_ids.long(), corners.reshape(-1)).reshape(corners.shape)
+        p_points = mesh.points[p_ids].detach().cpu().numpy()
+        p_mesh = Mesh(meshio.Mesh(points=p_points,
+                                  cells=[("triangle", local.detach().cpu().numpy())]),
+                      reorder=False)
         self.M_p = MassElementAssembler.from_mesh(
             p_mesh, quadrature_order=quadrature_order)(p_mesh.points)
         # lumped pressure mass (row sums) — the Schur-complement surrogate and the weight
@@ -569,36 +336,17 @@ class StokesProblem(FEMOperator):
         return self
 
     # ------------------------------------------------------------------ packing
-    @property
-    def grid_size(self):
-        """Velocity (fine) grid ``(nx, ny)`` — what the FNO consumes and emits."""
-        return (self.nx_u, self.ny_u)
+    def from_nodes(self, out_nodes: torch.Tensor):
+        """Model output ``[B, n_u, 3]`` -> ``(u_node [B, n_u, 2], p_node [B, n_p])``.
 
-    @property
-    def pgrid_size(self):
-        """Pressure (corner) grid ``(nx, ny)``."""
-        return (self.nx_p, self.ny_p)
-
-    def from_grid(self, out_grid: torch.Tensor):
-        """FNO output ``[B, 3, Ny, Nx]`` → ``(u_node [B, n_u, 2], p_node [B, n_p])``.
-
-        Channels are ``(u_x, u_y, p)``. The pressure channel is read on the ``[::2, ::2]``
-        subgrid — the Q1 corner nodes — which is why the two spaces need no index table.
+        Channels are ``(u_x, u_y, p)`` on the **P2 node set**, and pressure is gathered at the
+        corner nodes. The velocity is used everywhere; the pressure channel's values at the
+        edge-midpoint nodes are simply never read, which costs one third of one channel and
+        buys the model a single uniform output space.
         """
-        nx, ny = self.grid_size
-        ux = grid_to_node(out_grid[:, 0], nx, ny)
-        uy = grid_to_node(out_grid[:, 1], nx, ny)
-        u_node = torch.stack([ux, uy], dim=-1)                    # [B, n_u, 2]
-        p_grid = out_grid[:, 2, ::2, ::2]                         # [B, ny_p, nx_p]
-        p_node = grid_to_node(p_grid, self.nx_p, self.ny_p)       # [B, n_p]
+        u_node = out_nodes[..., :2]
+        p_node = out_nodes[..., self.p_node_ids, 2]
         return u_node, p_node
-
-    def to_grid(self, u_node: torch.Tensor, p_node: torch.Tensor):
-        """Inverse of :meth:`from_grid` for visualization: ``(u [B,2,Ny,Nx], p [B,ny_p,nx_p])``."""
-        nx, ny = self.grid_size
-        u_grid = torch.stack([node_to_grid(u_node[..., 0], nx, ny),
-                              node_to_grid(u_node[..., 1], nx, ny)], dim=-3)
-        return u_grid, node_to_grid(p_node, self.nx_p, self.ny_p)
 
     def pack(self, u_node: torch.Tensor, p_node: torch.Tensor) -> torch.Tensor:
         """``(u [B,n_u,2], p [B,n_p])`` → monolithic DOF vector ``[B, n_dofs]``.
@@ -640,7 +388,7 @@ class StokesProblem(FEMOperator):
     def load_vector(self, f_node: torch.Tensor) -> torch.Tensor:
         r"""Consistent monolithic load :math:`b = (M_u f,\ 0)`. ``f_node``: ``[B, n_u, 2]``.
 
-        ``M_u`` is the Q2 vector mass matrix, which is the scalar ``M`` applied to each
+        ``M_u`` is the P2 vector mass matrix, which is the scalar ``M`` applied to each
         component — the same ``b = Mf`` convention :class:`PoissonProblem` uses, so the
         reference solve and the physics residual share one right-hand side by construction.
         """
@@ -716,116 +464,3 @@ class StokesProblem(FEMOperator):
         r"""FE :math:`L^2` norm :math:`\sqrt{p^\top M_p p}` per sample — ``[B]``."""
         Mp = self._spmm(self.M_p, p_node)
         return (p_node * Mp).sum(dim=-1).clamp_min(0).sqrt()
-
-
-class UnstructuredStokesProblem(StokesProblem):
-    r"""Taylor-Hood **P2/P1 on triangles** — Stokes with no grid anywhere.
-
-    The unstructured counterpart of :class:`StokesProblem`. Every method of the parent is
-    inherited unchanged, because all of them (``pack``/``unpack``, ``residual``,
-    ``project_velocity_bc``, ``project_pressure_gauge``, ``velocity_l2``, ``pressure_l2``,
-    ``fem_reference``) were already pure linear algebra on the assembled ``K``, ``M`` and
-    ``M_p``. Only ``__init__`` and the two grid readers are replaced — which is the measure of
-    how little of the Stokes machinery was actually tied to the image.
-
-    Three things differ, and each is forced by the mesh rather than chosen:
-
-    * **The pressure space is read from the layout, not strided.** On the structured mesh the
-      Q1 nodes are the ``[::2, ::2]`` subgrid, so ``from_grid`` could slice. Here they are
-      ``layout.node_ids("p")`` — the triangle *corners*, an arbitrary subset of the P2 node
-      numbering — so :meth:`from_nodes` gathers instead. Same cost, no assumption.
-    * **``M_p`` is assembled on a P1 sub-mesh built here.** The parent builds a structured Q1
-      grid; the sub-mesh is the triangulation's corner nodes with the corner connectivity
-      (columns ``0:3`` of ``triangle6``, verified to be exactly the pressure node set),
-      re-indexed into pressure-DOF order.
-    * **``grid_size`` raises.** Nothing downstream may silently reshape this problem into an
-      image; :meth:`from_nodes` is the only reader.
-
-    The preconditioner has to change too, outside this class: the block ``P``'s velocity half
-    is a *geometric* V-cycle, which has no hierarchy here. Pass an algebraic one — see
-    :class:`~tensorpils.preconditioners.StokesBlockPreconditioner`'s ``velocity_precond``.
-
-    Parameters
-    ----------
-    mesh : tensormesh.Mesh
-        A ``triangle6`` mesh, e.g. from :func:`~tensorpils.meshing.obstacle_mesh`.
-    mu : float
-        Dynamic viscosity.
-    """
-
-    def __init__(self, mesh, mu: float = 1.0, quadrature_order: int = 5):
-        # Deliberately skips StokesProblem.__init__ (which asserts the structured grid) and
-        # goes straight to the shared FEM assembly. Everything the parent's methods read is
-        # set below, under the same names.
-        FEMOperator.__init__(self, mesh, quadrature_order=quadrature_order)
-        if "triangle6" not in list(mesh.cells.keys()):
-            raise ValueError(
-                "Taylor-Hood P2/P1 needs a 'triangle6' mesh (order=2); got cells "
-                f"{list(mesh.cells.keys())}. meshing.obstacle_mesh(order=2) builds one.")
-        self.mu = float(mu)
-        self.n_u = self.n_nodes
-
-        asm = _StokesBilinearForm.from_mesh(mesh, quadrature_order=quadrature_order, mu=mu)
-        layout = asm.layout
-        if layout.n_nodes("u") != self.n_u:
-            raise RuntimeError("velocity field is not the mesh node set")
-        self.n_p = int(layout.n_nodes("p"))
-        self.K = asm()
-        self.n_dofs = int(layout.n_dofs)
-        self.off_p = int(layout.offsets["p"])
-
-        self.register_buffer("dirichlet_mask", layout.dof_mask("u", self.boundary_mask))
-        p_ids = layout.node_ids("p")
-        self._pressure_pin = int(layout.dof_index("p", int(p_ids[0])))
-        # Which P2 nodes carry pressure. The model emits three channels on the P2 node set and
-        # the pressure one is gathered here, so the two spaces still need no scatter table.
-        self.register_buffer("p_node_ids", p_ids.long())
-
-        # --- P1 pressure mass, on a sub-mesh of the corners -----------------------
-        # node_ids("p") is sorted, so searchsorted maps a global node id to its pressure DOF
-        # index; the sub-mesh is therefore in pressure-DOF order and M_p needs no permutation.
-        corners = mesh.cells["triangle6"][:, :3].long()
-        local = torch.searchsorted(p_ids.long(), corners.reshape(-1)).reshape(corners.shape)
-        p_points = mesh.points[p_ids].detach().cpu().numpy()
-        p_mesh = Mesh(meshio.Mesh(points=p_points,
-                                  cells=[("triangle", local.detach().cpu().numpy())]),
-                      reorder=False)
-        self.M_p = MassElementAssembler.from_mesh(
-            p_mesh, quadrature_order=quadrature_order)(p_mesh.points)
-        self.register_buffer(
-            "m_p_lumped",
-            self._spmm(self.M_p, torch.ones(self.n_p, dtype=self.M_p.dtype)).float())
-
-    # ------------------------------------------------------------------ readers
-    @property
-    def grid_size(self):
-        """``None`` — there is no velocity grid. Use :meth:`from_nodes`.
-
-        ``None`` rather than a raise so the shared trainer ``__init__`` still runs, and
-        ``None`` rather than a plausible pair so that anything which *did* try to reshape
-        fails immediately instead of silently applying the FEM operator to a permuted field.
-        """
-        return None
-
-    @property
-    def pgrid_size(self):
-        """``None`` — there is no pressure grid."""
-        return None
-
-    def from_nodes(self, out_nodes: torch.Tensor):
-        """Model output ``[B, n_u, 3]`` -> ``(u_node [B, n_u, 2], p_node [B, n_p])``.
-
-        Channels are ``(u_x, u_y, p)`` on the **P2 node set**, and pressure is gathered at the
-        corner nodes. The velocity is used everywhere; the pressure channel's values at the
-        edge-midpoint nodes are simply never read, which costs one third of one channel and
-        buys the model a single uniform output space.
-        """
-        u_node = out_nodes[..., :2]
-        p_node = out_nodes[..., self.p_node_ids, 2]
-        return u_node, p_node
-
-    def from_grid(self, out_grid: torch.Tensor):
-        raise AttributeError("unstructured Stokes has no grid; use from_nodes()")
-
-    def to_grid(self, u_node: torch.Tensor, p_node: torch.Tensor):
-        raise AttributeError("unstructured Stokes has no grid")

@@ -23,8 +23,8 @@ coordinate buffer with exactly that formula, so
 
     ``grid_to_node(model(f_grid)[:, 0], nx, ny)``
 
-is the same vector the network emitted at ``self.coords`` — which is what lets the Galerkin /
-Deep Ritz / PLS losses consume it. :func:`tests.test_gaot_model` pins that down against the
+is the same vector the network emitted at ``self.coords`` — which is what lets the FEM
+losses consume it. :func:`tests.test_gaot_model` pins that down against the
 mesh's own ``points``.
 
 **Going unstructured** is then :meth:`GAOTModel.forward_nodes`: hand it ``pndata [B, N, C]``
@@ -217,9 +217,9 @@ class GAOTModel(nn.Module):
     r"""GAOT behind the ``FNOModel`` grid signature — and the door to unstructured meshes.
 
     ``forward`` takes ``[B, C_in, H, W]`` and returns ``[B, C_out, H, W]``, so it substitutes
-    for :class:`~tensorpils.models.FNOModel` everywhere: supervised ``data``, ``galerkin``,
-    ``deepritz`` and ``pls`` all run unchanged, and the comparison against the FNO differs only
-    in the architecture.
+    for :class:`~tensorpils.models.FNOModel` everywhere: supervised ``data``, ``galerkin`` and
+    ``pls`` all run unchanged, and the comparison against the FNO differs only in the
+    architecture.
 
     Parameters
     ----------

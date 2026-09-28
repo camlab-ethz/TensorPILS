@@ -16,7 +16,7 @@ structured".
 Backend
 -------
 One AmgX V-cycle through ``torch_amgx`` (NVIDIA AmgX 2.5). Four facts about that binding
-shape this code, all measured rather than assumed (see ``notes/`` and the experiment README):
+shape this code, all measured rather than assumed:
 
 * **We own the autograd.** ``torch_amgx`` is a binding layer with no autograd; its own module
   docstring says to wrap the solve in a :class:`torch.autograd.Function`. We do, in
@@ -186,10 +186,10 @@ class AMGXPreconditioner(Preconditioner):
             except ImportError as e:
                 raise ImportError(
                     f"torch_amgx imported but its native extension could not load: {e}\n"
-                    "On Euler this is a module-loaded libstdc++ shadowing the system one "
-                    "(gcc/8.5.0 provides GLIBCXX <= 3.4.25; libamgxsh.so needs 3.4.29). Prepend "
-                    "/usr/lib/x86_64-linux-gnu to LD_LIBRARY_PATH -- see "
-                    "experiments/poisson/amg_dropin/README.md."
+                    "A common cause on clusters is an older libstdc++ (e.g. from a loaded gcc "
+                    "module) shadowing the system one: libamgxsh.so needs GLIBCXX_3.4.29. Put "
+                    "the system library directory (e.g. /usr/lib/x86_64-linux-gnu) first on "
+                    "LD_LIBRARY_PATH."
                 ) from e
             raise RuntimeError("torch_amgx.is_available() is False for an unknown reason.")
 

@@ -1,5 +1,5 @@
 """Tests for the data-scaling machinery: the streaming (infinite-data) Poisson dataset,
-the fixed-eval splits, the ``steps_per_epoch`` budget, and patience-based early stopping.
+the fixed-eval splits and the ``steps_per_epoch`` budget.
 
 No ``neuralop`` needed: the trainer tests use a tiny conv net in place of the FNO (the
 trainer only requires a ``[B,1,H,W] -> [B,1,H,W]`` module).
@@ -104,23 +104,12 @@ def test_steps_per_epoch_fixes_batch_count(tmp_path):
     assert len(list(t.train_loader)) == 5    # 5 batches although n_train is only 4
 
 
-def test_patience_early_stop(tmp_path):
-    tr, val, te = create_scaling_datasets(4, 2, 2, K=2, grid_resolution=G, seed=1)
-    t = _trainer(tmp_path, tr, val, te, epochs=50, patience=2)
-    vals = iter([1.0] + [2.0] * 49)          # improves once, then never again
-    t.validate = lambda: (next(vals), 0.0, 0.0)
-    t.train()
-    assert t.stats.best_epoch == 0
-    assert t.stats.stopped_epoch == 2        # first epoch with epoch - best_epoch >= 2
-    assert len(t.stats.train_losses) == 3
-
-
 def test_no_flags_runs_full_budget(tmp_path):
     tr, val, te = create_scaling_datasets(4, 2, 2, K=2, grid_resolution=G, seed=1)
     t = _trainer(tmp_path, tr, val, te, epochs=3)
     t.train()
-    assert t.stats.stopped_epoch == -1
     assert len(t.stats.train_losses) == 3
+    assert len(t.stats.epoch_times) == 3
 
 
 def test_stream_trainer_smoke_and_results_json(tmp_path):

@@ -14,11 +14,7 @@ import torch
 
 __all__ = ["plot_loss_curve", "visualize_sample", "compute_error_distribution",
            "visualize_rollout_sample", "compute_rollout_error_distribution",
-           "visualize_data_trajectory",
-           "visualize_stokes_sample", "compute_stokes_error_distribution",
-           "visualize_unstructured_sample", "compute_unstructured_error_distribution",
-           "visualize_unstructured_stokes_sample",
-           "compute_unstructured_stokes_error_distribution"]
+           "visualize_stokes_sample", "compute_stokes_error_distribution"]
 
 
 def _log_yscale(ax, values):
@@ -41,7 +37,7 @@ def _best_line(ax, value, label_fmt):
 
 def plot_loss_curve(stats, loss_type: str, K: int, save_path: str):
     """Training-diagnostics figure. Panel 0 is always the training loss (optimization health).
-    For the rollout trainers (Allen–Cahn / Wave) the validation panels are the space-time and
+    For the rollout trainer (Allen–Cahn) the validation panels are the space-time and
     final-time relative FEM-L2 (the reported, scale-independent metric that also drives model
     selection); for the static Poisson trainer they stay MSE + FEM-L2 + relative FEM-L2."""
     is_rollout = bool(getattr(stats, "val_st_rel_l2", []))
@@ -51,8 +47,7 @@ def plot_loss_curve(stats, loss_type: str, K: int, save_path: str):
     fig, axes = plt.subplots(n_panels, 1, figsize=(10, 4 * n_panels))
     epochs = range(len(stats.train_losses))
 
-    # Panel 0 — training loss. A variational-energy loss (minimizing-movement, Deep Ritz) can go
-    # non-positive, which log-scale cannot render; fall back to symlog whenever any value ≤ 0.
+    # Panel 0 — training loss. Log scale, falling back to symlog whenever any value ≤ 0.
     # Only finite values decide: NaN/inf epochs (divergence) are left out of the scale choice.
     axes[0].plot(epochs, stats.train_losses, label="Train Loss", linewidth=2)
     axes[0].axvline(stats.best_epoch, color="r", linestyle="--",
@@ -189,7 +184,7 @@ def compute_error_distribution(model, test_dataset, device, apply_eval_bc,
     return median, errs
 
 
-# ==================== autoregressive rollout visualization (wave / AC) ====================
+# ==================== autoregressive rollout visualization (Allen–Cahn) ====================
 
 @torch.no_grad()
 def _rollout_grid(model, traj_grid, device, project_bc, rollout_steps, n_seed_frames):
@@ -277,285 +272,7 @@ def compute_rollout_error_distribution(model, test_dataset, device, project_bc,
     return median, errs
 
 
-# ==================== data trajectory visualization (no model) ====================
-
-def visualize_data_trajectory(dataset, sample_idx: int = 0, n_frames: int = 5,
-                              save_path: str = None, title: str = None,
-                              dt: float = None) -> str:
-    """Filmstrip + amplitude/boundary diagnostics of a *reference* trajectory, straight from a
-    time-dependent dataset (Wave / Allen--Cahn) with **no model** involved.
-
-    Purpose: eyeball the generated data and compare integrators (e.g. backward-Euler vs a
-    convex--concave splitting) in both eyeball- and quantitative norm. ``dataset[sample_idx]``
-    must yield ``(traj_grid [T+1, H, W], ...)`` (the AC/Wave datasets do).
-
-    The top row is the trajectory at ``n_frames`` evenly-spaced times on a shared symmetric
-    colour scale (so decay/coarsening is visible); the bottom panel tracks ``max|u|`` and
-    ``||u||_2`` over time, and the title reports the largest boundary value (a zero-Dirichlet
-    leak check).
-
-    Saves to ``output/data_viz/traj_sample{idx}.png`` by default (git-ignored, next to all
-    other run output); pass ``save_path`` to override. Returns the resolved path.
-    """
-    item = dataset[sample_idx]
-    traj_grid = item[0] if isinstance(item, (tuple, list)) else item
-    tg = traj_grid.detach().cpu().numpy()                    # [T+1, H, W]
-    T1 = tg.shape[0]
-    dt = dt if dt is not None else getattr(dataset, "dt", None)
-
-    if save_path is None:
-        save_path = os.path.join("output", "data_viz", f"traj_sample{sample_idx}.png")
-    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
-
-    ks = np.unique(np.linspace(0, T1 - 1, min(n_frames, T1)).round().astype(int))
-    vlim = max(float(np.abs(tg).max()), 1e-12)               # shared scale -> decay is legible
-
-    frames = tg.reshape(T1, -1)
-    maxabs = np.abs(frames).max(axis=1)
-    l2 = np.sqrt((frames ** 2).sum(axis=1))
-    bmax = float(max(np.abs(tg[:, 0, :]).max(), np.abs(tg[:, -1, :]).max(),
-                     np.abs(tg[:, :, 0]).max(), np.abs(tg[:, :, -1]).max()))
-    tvec = np.arange(T1) * dt if dt is not None else np.arange(T1)
-
-    fig = plt.figure(figsize=(3.0 * len(ks), 5.6))
-    gs = fig.add_gridspec(2, len(ks), height_ratios=[3.0, 1.5], hspace=0.35)
-    im = None
-    for j, k in enumerate(ks):
-        ax = fig.add_subplot(gs[0, j])
-        im = ax.imshow(tg[k], cmap="RdBu_r", origin="lower", vmin=-vlim, vmax=vlim)
-        tlab = f"  t={k * dt:.3g}" if dt is not None else ""
-        ax.set_title(f"k={k}{tlab}", fontsize=10)
-        ax.set_xticks([]); ax.set_yticks([])
-    fig.colorbar(im, ax=fig.axes[:len(ks)], fraction=0.02, pad=0.02)
-
-    axd = fig.add_subplot(gs[1, :])
-    axd.plot(tvec, maxabs, "o-", color="#c0392b", lw=1.6, ms=3)
-    axd.set_xlabel("time $t$" if dt is not None else "frame $k$")
-    axd.set_ylabel(r"$\max|u|$", color="#c0392b")
-    axd.tick_params(axis="y", labelcolor="#c0392b"); axd.grid(alpha=0.3)
-    axr = axd.twinx()
-    axr.plot(tvec, l2, "s--", color="#2c3e50", lw=1.4, ms=3)
-    axr.set_ylabel(r"$\|u\|_2$", color="#2c3e50"); axr.tick_params(axis="y", labelcolor="#2c3e50")
-
-    integ = getattr(dataset, "integrator", None)
-    itag = f", integrator={integ}" if integ else ""
-    sup = title or f"Reference trajectory (sample #{sample_idx}, T={T1 - 1} steps{itag})"
-    fig.suptitle(f"{sup}   |   boundary max$|u|$ = {bmax:.1e}", fontsize=12)
-    fig.savefig(save_path, dpi=150, bbox_inches="tight"); plt.close(fig)
-    print(f"Data trajectory -> {save_path}")
-    return save_path
-
-
-# ------------------------------- Stokes -------------------------------
-
-@torch.no_grad()
-def visualize_stokes_sample(predict, dataset, problem, device, sample_idx: int = 0,
-                            save_path: str = "stokes_sample.png"):
-    """Two-row panel: speed |u| and pressure — reference, prediction, and error.
-
-    ``predict(f_grid) -> (u_node, p_node)`` is the Trainer's own prediction path (input
-    scaling, pressure scaling, BC and gauge projections). It is passed in rather than
-    reconstructed here: a second copy of that pipeline silently drifts out of sync — an
-    earlier version of this file did exactly that and reported 4102 % where the trainer
-    measured 7.7 %.
-
-    Velocity and pressure live on different grids (fine Q2 vs. the Q1 corner subgrid), so
-    each row carries its own colour scale and its own relative FE ``L2`` error.
-    """
-    f_grid, _, u_true, p_true = dataset[sample_idx]
-    u_pred, p_pred = predict(f_grid.unsqueeze(0).to(device))
-    u_pred, p_pred = u_pred[0].cpu(), p_pred[0].cpu()
-
-    err_u = (problem.velocity_l2((u_pred - u_true).unsqueeze(0))
-             / problem.velocity_l2(u_true.unsqueeze(0)).clamp_min(1e-30)).item()
-    err_p = (problem.pressure_l2((p_pred - p_true).unsqueeze(0))
-             / problem.pressure_l2(p_true.unsqueeze(0)).clamp_min(1e-30)).item()
-
-    ug_t, pg_t = problem.to_grid(u_true.unsqueeze(0), p_true.unsqueeze(0))
-    ug_p, pg_p = problem.to_grid(u_pred.unsqueeze(0), p_pred.unsqueeze(0))
-    speed_t = ug_t[0].pow(2).sum(0).sqrt().numpy()
-    speed_p = ug_p[0].pow(2).sum(0).sqrt().numpy()
-    pre_t, pre_p = pg_t[0].numpy(), pg_p[0].numpy()
-    fx, fy = f_grid[0].numpy(), f_grid[1].numpy()
-
-    fig, axes = plt.subplots(3, 3, figsize=(13.5, 11.5))
-
-    def _panel(ax, data, title, **kw):
-        im = ax.imshow(data, origin="lower", extent=[0, 1, 0, 1], **kw)
-        ax.set_title(title, fontsize=10)
-        ax.set_xticks([]); ax.set_yticks([])
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.03)
-
-    # --- row 0: the INPUT (body force) + the reference flow it produces ---------
-    fv = float(np.abs(np.stack([fx, fy])).max())
-    _panel(axes[0, 0], fx, r"INPUT: body force $f_x$", cmap="RdBu_r", vmin=-fv, vmax=fv)
-    _panel(axes[0, 1], fy, r"INPUT: body force $f_y$", cmap="RdBu_r", vmin=-fv, vmax=fv)
-    ax = axes[0, 2]
-    ax.imshow(speed_t, origin="lower", extent=[0, 1, 0, 1], cmap="Blues")
-    ny, nx = speed_t.shape
-    step = max(1, nx // 16)
-    xs = np.linspace(0, 1, nx)[::step]
-    ys = np.linspace(0, 1, ny)[::step]
-    ax.quiver(*np.meshgrid(xs, ys),
-              ug_t[0, 0].numpy()[::step, ::step], ug_t[0, 1].numpy()[::step, ::step],
-              color="#1b2a3a", scale_units="width", scale=None, width=0.005)
-    ax.set_title("reference flow $u$ (quiver)", fontsize=10)
-    ax.set_xticks([]); ax.set_yticks([])
-
-    # --- rows 1-2: ground truth / prediction / error, per field ----------------
-    rows = [("$|u|$", speed_t, speed_p, err_u), ("$p$", pre_t, pre_p, err_p)]
-    for i, (name, ref, pred, rel) in enumerate(rows, start=1):
-        vmin, vmax = float(min(ref.min(), pred.min())), float(max(ref.max(), pred.max()))
-        diff = np.abs(pred - ref)
-        _panel(axes[i, 0], ref, f"GROUND TRUTH: {name} (FEM)",
-               vmin=vmin, vmax=vmax, cmap="jet")
-        _panel(axes[i, 1], pred, f"PREDICTION: {name}", vmin=vmin, vmax=vmax, cmap="jet")
-        _panel(axes[i, 2], diff, f"|error|   rel-$L^2$ = {rel:.2%}", cmap="magma")
-
-    fig.suptitle(f"Stokes Q2/Q1 — sample #{sample_idx}   "
-                 f"velocity grid {speed_t.shape[1]}x{speed_t.shape[0]}, "
-                 f"pressure grid {pre_t.shape[1]}x{pre_t.shape[0]}", fontsize=13)
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=150, bbox_inches="tight"); plt.close(fig)
-    print(f"Visualization -> {save_path}")
-
-
-@torch.no_grad()
-def compute_stokes_error_distribution(predict, dataset, problem, device,
-                                      save_path: str = "stokes_error.png",
-                                      batch_size: int = 32):
-    """Per-sample relative FE ``L2`` error for velocity and pressure; returns the medians.
-
-    ``predict`` is the Trainer's prediction path — see :func:`visualize_stokes_sample`.
-    """
-    from torch.utils.data import DataLoader
-
-    eu, ep = [], []
-    for f_grid, _, u_true, p_true in DataLoader(dataset, batch_size=batch_size):
-        u_true, p_true = u_true.to(device), p_true.to(device)
-        u_pred, p_pred = predict(f_grid.to(device))
-        eu.append((problem.velocity_l2(u_pred - u_true)
-                   / problem.velocity_l2(u_true).clamp_min(1e-30)).cpu())
-        ep.append((problem.pressure_l2(p_pred - p_true)
-                   / problem.pressure_l2(p_true).clamp_min(1e-30)).cpu())
-    eu = (torch.cat(eu) * 100).numpy()
-    ep = (torch.cat(ep) * 100).numpy()
-
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4.2))
-    for ax, errs, name, color in [(axes[0], eu, "velocity", "#2980b9"),
-                                  (axes[1], ep, "pressure", "#c0392b")]:
-        med = float(np.median(errs))
-        ax.hist(errs, bins=min(30, max(5, len(errs) // 4)), color=color, alpha=0.75,
-                edgecolor="white")
-        ax.axvline(med, color="k", ls="--", lw=1.6, label=f"median = {med:.2f}%")
-        ax.set_xlabel(r"relative FE $L^2$ error (%)"); ax.set_ylabel("count")
-        ax.set_title(f"{name}: mean {errs.mean():.2f}%  std {errs.std():.2f}%", fontsize=10)
-        ax.legend(); ax.grid(alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=150, bbox_inches="tight"); plt.close(fig)
-
-    med_u, med_p = float(np.median(eu)), float(np.median(ep))
-    print("\n" + "=" * 50)
-    print("Stokes test-set error distribution")
-    print(f"  n       : {len(eu)}")
-    print(f"  velocity: median {med_u:.4f}%   mean {eu.mean():.4f}%   max {eu.max():.4f}%")
-    print(f"  pressure: median {med_p:.4f}%   mean {ep.mean():.4f}%   max {ep.max():.4f}%")
-    print(f"  saved -> {save_path}")
-    print("=" * 50 + "\n")
-    return med_u, med_p
-
-
-# ==================== unstructured mesh (no image to imshow) ====================
-
-def _triangulation(dataset):
-    """``matplotlib.tri.Triangulation`` from the mesh's own points and triangles.
-
-    Plotting the real triangulation rather than interpolating to a grid is the honest picture:
-    an interpolated image would hide exactly what this experiment is about, namely that the
-    nodes are not on a grid.
-    """
-    import matplotlib.tri as mtri
-    pts = dataset.mesh.points.cpu().numpy()
-    tris = dataset.mesh.cells["triangle"].cpu().numpy()
-    return mtri.Triangulation(pts[:, 0], pts[:, 1], tris)
-
-
-@torch.no_grad()
-def visualize_unstructured_sample(predict, dataset, device, apply_eval_bc, sample_idx: int,
-                                  save_path: str):
-    """Four-panel figure on the mesh: source, FEM label, prediction, absolute error."""
-    tri = _triangulation(dataset)
-    f_node, u_true = dataset[sample_idx]
-    u_pred = apply_eval_bc(predict(f_node.unsqueeze(0).to(device)))[0]
-    u_pred = u_pred.cpu().numpy()
-    f_np, u_np = f_node.cpu().numpy(), u_true.cpu().numpy()
-
-    vmin = float(min(u_np.min(), u_pred.min()))
-    vmax = float(max(u_np.max(), u_pred.max()))
-    err = np.abs(u_pred - u_np)
-    rel_l2 = np.sqrt((err ** 2).sum() / (u_np ** 2).sum()) * 100.0
-
-    fig, ax = plt.subplots(2, 2, figsize=(11, 10))
-    panels = [(ax[0, 0], f_np, "Source $f$", "RdBu_r", None, None),
-              (ax[0, 1], u_np, "FEM reference $u$", "RdBu_r", vmin, vmax),
-              (ax[1, 0], u_pred, "Predicted $u$", "RdBu_r", vmin, vmax),
-              (ax[1, 1], err, f"|err|  (rel $L^2$ = {rel_l2:.2f}%)", "hot", None, None)]
-    for a, v, title, cmap, lo, hi in panels:
-        tpc = a.tripcolor(tri, v, shading="gouraud", cmap=cmap, vmin=lo, vmax=hi)
-        fig.colorbar(tpc, ax=a, fraction=0.046)
-        a.set_title(title)
-        a.set_aspect("equal")
-        a.set_xticks([]); a.set_yticks([])
-    plt.suptitle(f"unstructured mesh, {dataset.n_nodes} nodes  (K={dataset.K}), "
-                 f"sample #{sample_idx}")
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=200, bbox_inches="tight"); plt.close()
-    print(f"Visualization -> {save_path}")
-
-
-@torch.no_grad()
-def compute_unstructured_error_distribution(predict, test_dataset, problem, device,
-                                            apply_eval_bc, save_path: str, batch_size: int = 32):
-    """Per-sample **FEM** relative L2 over the test set. Returns ``(median, errs)``.
-
-    Mass-weighted, not a plain node ratio: on a non-uniform mesh the nodes do not carry equal
-    volume, so an unweighted ratio would be a different quantity from the structured runs'.
-    """
-    errs = []
-    for start in range(0, len(test_dataset), batch_size):
-        items = [test_dataset[i] for i in range(start, min(start + batch_size,
-                                                           len(test_dataset)))]
-        fs = torch.stack([it[0] for it in items]).to(device)
-        us = torch.stack([it[1] for it in items]).to(device)
-        u_pred = apply_eval_bc(predict(fs))
-        e = u_pred - us
-        Me = problem._spmm(problem.M, e)
-        Mu = problem._spmm(problem.M, us)
-        num = (e * Me).sum(dim=1).clamp(min=0).sqrt()
-        den = (us * Mu).sum(dim=1).clamp(min=0).sqrt().clamp(min=1e-12)
-        errs.extend((num / den * 100.0).cpu().tolist())
-    errs = np.array(errs)
-    median, mean, std = np.median(errs), np.mean(errs), np.std(errs)
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.hist(errs, bins=30, color="#3498db", edgecolor="white", alpha=0.85)
-    ax.axvline(median, color="#e74c3c", linestyle="--", linewidth=2, label=f"median {median:.2f}%")
-    ax.axvline(mean, color="#2ecc71", linestyle="-.", linewidth=2, label=f"mean {mean:.2f}%")
-    ax.set_xlabel("FEM relative $L^2$ error (%)"); ax.set_ylabel("Count")
-    ax.set_title("Unstructured-mesh test error distribution")
-    ax.legend(); ax.grid(alpha=0.3)
-    plt.tight_layout(); plt.savefig(save_path, dpi=200, bbox_inches="tight"); plt.close()
-
-    print("\n" + "=" * 50)
-    print("Test set error distribution (unstructured, FEM relative L2)")
-    print(f"  n     : {len(errs)}")
-    print(f"  median: {median:.4f}%")
-    print(f"  mean  : {mean:.4f}%   std: {std:.4f}%")
-    print(f"  min   : {errs.min():.4f}%   max: {errs.max():.4f}%")
-    print(f"  saved -> {save_path}")
-    print("=" * 50 + "\n")
-    return median, errs
-
+# ------------------------------- Stokes (obstacle mesh) -------------------------------
 
 def _tri_from_mesh(mesh, node_ids=None):
     """Triangulation of a ``triangle6`` mesh, optionally restricted to its corner (P1) nodes."""
@@ -571,8 +288,8 @@ def _tri_from_mesh(mesh, node_ids=None):
 
 
 @torch.no_grad()
-def visualize_unstructured_stokes_sample(predict, dataset, problem, device, sample_idx: int,
-                                         save_path: str):
+def visualize_stokes_sample(predict, dataset, problem, device, sample_idx: int,
+                            save_path: str):
     """Six panels on the mesh: velocity magnitude (reference / predicted / error) and pressure.
 
     Drawn on the real triangulation, so the obstacle is a hole in the picture rather than a
@@ -613,7 +330,7 @@ def visualize_unstructured_stokes_sample(predict, dataset, problem, device, samp
         a.set_title(title, fontsize=11)
         a.set_aspect("equal")
         a.set_xticks([]); a.set_yticks([])
-    plt.suptitle(f"Stokes on an unstructured mesh with an obstacle — "
+    plt.suptitle(f"Stokes past an obstacle — "
                  f"{problem.n_u} P2 / {problem.n_p} P1 nodes, sample #{sample_idx}")
     plt.tight_layout()
     plt.savefig(save_path, dpi=200, bbox_inches="tight"); plt.close()
@@ -621,8 +338,8 @@ def visualize_unstructured_stokes_sample(predict, dataset, problem, device, samp
 
 
 @torch.no_grad()
-def compute_unstructured_stokes_error_distribution(predict, test_dataset, problem, device,
-                                                   save_path: str, batch_size: int = 32):
+def compute_stokes_error_distribution(predict, test_dataset, problem, device,
+                                      save_path: str, batch_size: int = 32):
     """Per-sample relative FE ``L²`` for both fields. Returns ``(median_u, errs_u, errs_p)``."""
     import numpy as np
     eu, ep = [], []
@@ -651,7 +368,7 @@ def compute_unstructured_stokes_error_distribution(predict, test_dataset, proble
     plt.tight_layout(); plt.savefig(save_path, dpi=200, bbox_inches="tight"); plt.close()
 
     print("\n" + "=" * 50)
-    print("Test set error distribution (unstructured Stokes, relative FE L2)")
+    print("Test set error distribution (Stokes, relative FE L2)")
     print(f"  n        : {len(eu)}")
     print(f"  velocity : median {np.median(eu):.4f}%   mean {eu.mean():.4f}% +- {eu.std():.4f}")
     print(f"  pressure : median {np.median(ep):.4f}%   mean {ep.mean():.4f}% +- {ep.std():.4f}")

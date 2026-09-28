@@ -1,10 +1,7 @@
 """Tests for the preconditioned Allen–Cahn least-squares loss: the multigrid V-cycle on the
 frozen Newton Jacobian J0 = a²A + cM (c = 1/dt + 3ε²), and its wiring into ACGalerkinLoss.
-
-See notes/ac_autoregressive/ §"Preconditioning the least-squares loss".
 """
 
-import pytest
 import torch
 
 from tensorpils.meshing import structured_quad_mesh
@@ -66,7 +63,7 @@ def test_preconditioned_ac_loss_runs_differs_and_is_differentiable():
     a, eps, dt = 1.0, 2.0, 0.01
     P = build_preconditioner("multigrid", prob, (G, G), mg_levels=3,
                              mg_a2=a * a, mg_c=1.0 / dt + 3.0 * eps * eps)
-    common = dict(a=a, eps=eps, dt=dt, integrator="convex_concave", form="galerkin")
+    common = dict(a=a, eps=eps, dt=dt)
     bare = build_ac_loss(prob, **common)
     prec = build_ac_loss(prob, precond=P, **common)
 
@@ -79,11 +76,3 @@ def test_preconditioned_ac_loss_runs_differs_and_is_differentiable():
     seq2 = torch.randn(3, 2, G * G, requires_grad=True)
     prec(seq2).backward()                                  # autograd flows through the V-cycle
     assert seq2.grad is not None and torch.isfinite(seq2.grad).all()
-
-
-def test_precond_rejected_for_min_movement():
-    mesh = structured_quad_mesh(G, G)
-    prob = ACProblem(mesh)
-    P = build_preconditioner("multigrid", prob, (G, G), mg_levels=3, mg_c=112.0)
-    with pytest.raises(ValueError):
-        build_ac_loss(prob, a=1.0, eps=2.0, dt=0.01, form="min_movement", precond=P)

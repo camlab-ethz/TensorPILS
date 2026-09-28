@@ -1,11 +1,11 @@
-"""Factory for preconditioners: pick multigrid or the spectral (blend/power) family."""
+"""Factory for the scalar preconditioners: geometric multigrid, algebraic multigrid, spectral blend."""
 
 from typing import Optional
 
 from .base import Preconditioner
 from .multigrid import GeometricMultigrid
 from .algebraic import AMGXPreconditioner
-from .spectral import SpectralPreconditioner, SineSpectralPreconditioner
+from .spectral import SpectralPreconditioner
 
 __all__ = ["build_preconditioner"]
 
@@ -14,7 +14,7 @@ def build_preconditioner(kind: str, problem, grid_size, *,
                          mg_levels: int = 4, mg_pre_smooth: int = 2,
                          mg_post_smooth: int = 2, mg_omega: float = 2.0 / 3.0,
                          mg_a2: float = 1.0, mg_c: float = 0.0,
-                         strength: float = 1.0, method: str = "dense",
+                         strength: float = 1.0,
                          amg_sweeps: Optional[int] = None, amg_algorithm: str = "CLASSICAL",
                          amg_smoother: str = "BLOCK_JACOBI", amg_relaxation: float = 0.8,
                          device: Optional[str] = None) -> Preconditioner:
@@ -22,13 +22,13 @@ def build_preconditioner(kind: str, problem, grid_size, *,
 
     Parameters
     ----------
-    kind : {"multigrid", "amg", "blend", "power"}
+    kind : {"multigrid", "amg", "blend"}
         ``"multigrid"`` (default in the CLI) builds the geometric-multigrid V-cycle;
         ``"amg"`` builds the algebraic (AmgX) V-cycle, which uses only the assembled matrix
-        and therefore carries over to unstructured meshes; ``"blend"`` / ``"power"`` build the
-        exact spectral preconditioner.
+        and therefore carries over to unstructured meshes; ``"blend"`` builds the exact spectral
+        blend ``(1-t) I + t A^{-1}``.
     problem : PoissonProblem
-        Source of the stiffness ``A`` and boundary mask (spectral kinds).
+        Source of the stiffness ``A`` and boundary mask (``amg`` and ``blend``).
     grid_size : tuple(int, int)
         ``(nx, ny)`` of the fine grid (multigrid kind).
     mg_* : multigrid V-cycle settings (ignored by spectral kinds). ``mg_a2``/``mg_c`` set the level
@@ -40,11 +40,7 @@ def build_preconditioner(kind: str, problem, grid_size, *,
         needs matching sweep counts. It defaults to ``mg_pre_smooth`` (which must then equal
         ``mg_post_smooth``) so an existing sweep script transfers unchanged.
     strength : float in [0, 1]
-        ``t`` (blend) or ``s`` (power); ignored by multigrid.
-    method : {"dense", "sine"}
-        Realization for the ``blend`` / ``power`` spectral kinds: ``"dense"`` (default) is the
-        eigendecomposition; ``"sine"`` is the fast DST equivalent for a uniform grid (needed at
-        128²/256²). Ignored by multigrid.
+        The blend parameter ``t``; ignored by the multigrid kinds.
     device : optional
         If given, move the preconditioner there.
     """
@@ -73,18 +69,11 @@ def build_preconditioner(kind: str, problem, grid_size, *,
             smoother=amg_smoother, relaxation=amg_relaxation,
             device=(device or "cuda:0"))
         return precond                      # already built on its device; AmgX is CUDA-only
-    elif kind in ("blend", "power"):
-        if method == "sine":
-            nx, ny = grid_size
-            precond = SineSpectralPreconditioner(
-                problem.boundary_mask, nx=nx, ny=ny, kind=kind, strength=strength)
-        elif method == "dense":
-            precond = SpectralPreconditioner.from_problem(problem, kind=kind, strength=strength)
-        else:
-            raise ValueError(f"method must be 'dense' or 'sine', got {method!r}")
+    elif kind == "blend":
+        precond = SpectralPreconditioner.from_problem(problem, kind=kind, strength=strength)
     else:
         raise ValueError(f"Unknown preconditioner kind {kind!r} "
-                         "(expected 'multigrid', 'amg', 'blend', or 'power')")
+                         "(expected 'multigrid', 'amg' or 'blend')")
 
     if device is not None:
         precond = precond.to(device)
