@@ -1,4 +1,4 @@
-"""Assemble the graphical abstract: one 1x3 PNG, sized for a paper.
+"""Assemble the graphical abstract (Figure 1): one 1x3 figure, sized for a paper.
 
 Everything here is derived from one requirement -- it must look right as a full-width 1x3 figure
 in the ICLR template:
@@ -10,14 +10,15 @@ in the ICLR template:
 * **Type near body size.** Body text is 10 pt; labels here are 9 pt and ticks 7.5 pt, the usual
   "slightly smaller than body" convention.
 * **No equations.** Panels are named in words, so the figure reads without the caption.
-* **Downsampled.** The matrices are 4000 x 3844; at 5.5 in they are aggregated to the pixel grid
+* **Downsampled.** The matrices are 4000 x 3969 (every 25th of 10^5 steps, the 63^2 interior
+  modes of the 65 x 65 grid); at 5.5 in they are aggregated to the pixel grid
   by RMS over log-spaced bins rather than subsampled, so nothing is aliased away.
 
-Usage:
+Usage (see run.sh):
     python experiments/graphical_abstract/plot_abstract.py \\
-        --bare output/graphical_abstract/abstract_v1/bare.npz \\
-        --mg   output/graphical_abstract/abstract_v1/mg.npz \\
-        --out  output/graphical_abstract/abstract_v1/graphical_abstract.png
+        --bare output/graphical_abstract/bare.npz \\
+        --mg   output/graphical_abstract/mg.npz \\
+        --out  output/graphical_abstract/graphical_abstract.pdf
 """
 
 import argparse
@@ -111,7 +112,7 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--bare", required=True)
     ap.add_argument("--mg", required=True)
-    ap.add_argument("--out", default="output/graphical_abstract/abstract_v1/graphical_abstract.png")
+    ap.add_argument("--out", default="output/graphical_abstract/graphical_abstract.pdf")
     ap.add_argument("--width", type=float, default=5.5, help="inches; the ICLR text width")
     ap.add_argument("--height", type=float, default=2.15)
     ap.add_argument("--dpi", type=int, default=600)

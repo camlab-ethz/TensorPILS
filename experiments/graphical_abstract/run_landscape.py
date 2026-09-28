@@ -29,7 +29,7 @@ Two implementation notes that make this cheap and exact:
 2. Adam runs in **float32** (the realistic training regime) but every reported error is computed
    in **float64** against a float64 direct solve, so the metric is not itself polluted.
 
-Usage:
+Usage (see run.sh for the settings of Figure 1):
     python experiments/graphical_abstract/run_landscape.py \
         --out output/graphical_abstract/landscape.npz
 """

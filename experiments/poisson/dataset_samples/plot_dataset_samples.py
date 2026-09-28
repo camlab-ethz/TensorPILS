@@ -1,4 +1,5 @@
-"""Sample (source, solution) pairs from the Poisson dataset, for the appendix.
+"""Appendix figure ``poisson_dataset_samples``: sample (source, solution) pairs from the Poisson
+dataset.
 
 A 2x2 grid: one ``(f, u)`` pair at ``K=4`` above one at ``K=10``, the frequency content the paper's
 Poisson experiments actually use. Field styling follows
@@ -8,8 +9,8 @@ Poisson experiments actually use. Field styling follows
 Authored at the text width so ``\\includegraphics[width=\\linewidth]`` does not rescale it and the
 point sizes below are what reaches the page.
 
-Usage:
-    python experiments/poisson/dataset_samples/plot_dataset_samples.py --out_dir ../../paper/precond-pino-paper/figures
+Usage (CPU, seconds):
+    python experiments/poisson/dataset_samples/plot_dataset_samples.py
 """
 
 import argparse
