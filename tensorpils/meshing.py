@@ -174,7 +174,16 @@ def obstacle_mesh(chara_length: float = 0.035, order: int = 2,
                                                             cx, cy, r))
         if not os.path.exists(path):
             os.makedirs(cache_dir, exist_ok=True)
-            _write_obstacle_msh(path, chara_length, order, xlims, ylims, cx, cy, r)
+            # Write under a private name, then rename: runs that start together on a cold cache
+            # (a SLURM array) must never read a half-written file, and os.replace is atomic.
+            fd, tmp = tempfile.mkstemp(suffix=".msh", dir=cache_dir)
+            os.close(fd)
+            try:
+                _write_obstacle_msh(tmp, chara_length, order, xlims, ylims, cx, cy, r)
+                os.replace(tmp, path)
+            finally:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
         return _load_obstacle_msh(path)
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "obstacle.msh")

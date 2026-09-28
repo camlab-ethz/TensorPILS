@@ -81,8 +81,8 @@ def test_grid_roundtrip_matches_node_to_grid():
 def test_shape_contract_matches_fnomodel(in_channels, out_channels):
     """``[B, C_in, H, W] -> [B, C_out, H, W]``, plus the unbatched form ``FNOModel`` accepts.
 
-    ``(2, 1)`` is the wave stepper's shape and ``(2, 3)`` is Stokes ``f -> (u_x, u_y, p)``, so
-    this pins the signature for every ``--pde`` the dispatch can reach.
+    ``(1, 1)`` is Poisson and Allen–Cahn, ``(2, 3)`` is Stokes ``f -> (u_x, u_y, p)`` and
+    ``(2, 1)`` mixes the two, so this pins the signature for every ``--pde`` the dispatch can reach.
     """
     n = 11
     model = _small_model(n, in_channels=in_channels, out_channels=out_channels).eval()

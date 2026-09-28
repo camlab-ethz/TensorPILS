@@ -32,6 +32,19 @@ pytestmark = pytest.mark.skipif(_MESH is None,
 CX, CY, R = 0.40, 0.50, 0.14
 
 
+def _amgx_available():
+    try:
+        import torch_amgx
+        return torch_amgx.is_available()
+    except Exception:
+        return False
+
+
+requires_amgx = pytest.mark.skipif(
+    not _amgx_available(),
+    reason="torch-amgx (CUDA-only) not importable; see the installation notes in README.md")
+
+
 @pytest.fixture(scope="module")
 def mesh():
     return _MESH
@@ -247,6 +260,57 @@ def test_mesh_cache_is_keyed_on_the_geometry(tmp_path):
     assert m1.n_points == m3.n_points and torch.equal(m1.points, m3.points)
 
 
+_SLOW_WRITER = """
+import os, sys, tempfile, time
+import tensorpils.meshing as m
+real = m._write_obstacle_msh
+def slow(path, *args):
+    # Write the file in two halves with a pause, as a network filesystem may: until the second
+    # half lands, `path` exists but holds a truncated mesh.
+    with tempfile.TemporaryDirectory() as d:
+        real(os.path.join(d, "full.msh"), *args)
+        data = open(os.path.join(d, "full.msh"), "rb").read()
+    with open(path, "wb") as fh:
+        fh.write(data[:len(data) // 2]); fh.flush(); time.sleep(3.0); fh.write(data[len(data) // 2:])
+m._write_obstacle_msh = slow
+print(m.obstacle_mesh(chara_length=0.09, cache_dir=sys.argv[1]).n_points)
+"""
+
+_READER = """
+import os, sys, time
+import tensorpils.meshing as m
+path = os.path.join(sys.argv[1], m._obstacle_cache_name(0.09, 2, (0.0, 1.0), (0.0, 1.0),
+                                                        0.40, 0.50, 0.14))
+t0 = time.time()
+while not os.path.exists(path):          # start reading the moment the cache entry appears
+    assert time.time() - t0 < 120, "the writer never produced the cache entry"
+    time.sleep(0.01)
+print(m.obstacle_mesh(chara_length=0.09, cache_dir=sys.argv[1]).n_points)
+"""
+
+
+def test_mesh_cache_is_never_read_half_written(tmp_path):
+    """Runs that start together on a cold cache (a SLURM array) must each read a complete file.
+
+    A second run that finds the cache entry while the first is still writing it used to read a
+    truncated mesh and die in the reader; the cache now writes through a temporary file and an
+    atomic rename, so the entry appears only once it is complete.
+    """
+    import os
+    import subprocess
+    import sys
+
+    import tensorpils
+    env = dict(os.environ, PYTHONPATH=os.path.dirname(os.path.dirname(tensorpils.__file__)))
+    procs = [subprocess.Popen([sys.executable, "-c", code, str(tmp_path)], env=env,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+             for code in (_SLOW_WRITER, _READER)]
+    outs = [p.communicate(timeout=300) for p in procs]
+    assert all(p.returncode == 0 for p in procs), [err[-800:] for _, err in outs]
+    assert len({out.strip().splitlines()[-1] for out, _ in outs}) == 1
+    assert len(list(tmp_path.iterdir())) == 1                      # no temporary file left behind
+
+
 # ----------------------------------------------------------------- preconditioner / losses
 
 def test_block_preconditioner_is_spd(problem):
@@ -293,7 +357,7 @@ def test_pls_requires_a_preconditioner(problem):
         build_stokes_loss("pls", problem, precond=None)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="AmgX is CUDA-only")
+@requires_amgx
 def test_block_preconditioner_takes_an_algebraic_velocity_block(problem):
     """``P = diag(Â⁻¹/μ, ω μ/diag(M_p))`` with an AMG velocity half, and it must be symmetric.
 
@@ -388,8 +452,8 @@ def test_trainer_predict_applies_scalings_and_projections(datasets, tmp_path):
     assert np.isfinite(trainer.train_epoch())
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="AmgX is CUDA-only")
-def test_trainer_runs_an_epoch_and_tags_its_files(datasets):
+@requires_amgx
+def test_trainer_runs_an_epoch_and_tags_its_files(datasets, tmp_path):
     from tensorpils.gaot import GAOTModel
     from tensorpils.trainer import GAOTStokesTrainer
 
@@ -402,7 +466,7 @@ def test_trainer_runs_an_epoch_and_tags_its_files(datasets):
     trainer = GAOTStokesTrainer(
         model=model, train_dataset=tr, val_dataset=va, test_dataset=te,
         loss_type="pls", batch_size=2, epochs=1, device="cuda", schur_omega=16,
-        output_dir="/tmp/tensorpils_stokes_test")
+        output_dir=str(tmp_path))
     trainer.save_checkpoints = False
     assert np.isfinite(trainer.train_epoch())
     assert np.isfinite(trainer.validate())
@@ -415,7 +479,7 @@ def test_trainer_runs_an_epoch_and_tags_its_files(datasets):
 # ----------------------------------------------------------------- the baseline that follows
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="matches the other trainer test")
-def test_pi_deeponet_runs_on_the_mesh(datasets):
+def test_pi_deeponet_runs_on_the_mesh(datasets, tmp_path):
     """The autodiff residual works off the grid, which is why PI-DeepONet is the baseline that
     can follow and PINO is not: PINO's residual is a finite-difference stencil and does not
     exist here, while this one differentiates through a coordinate trunk.
@@ -433,7 +497,7 @@ def test_pi_deeponet_runs_on_the_mesh(datasets):
     trainer = PIDeepONetStokesTrainer(
         model=model, train_dataset=tr, val_dataset=va, test_dataset=te,
         batch_size=2, epochs=1, device="cuda", n_colloc=64, lambda_bc_pi=0.1,
-        output_dir="/tmp/tensorpils_pidon_stokes_test")
+        output_dir=str(tmp_path))
     trainer.save_checkpoints = False
     assert np.isfinite(trainer.train_epoch())
     assert np.isfinite(trainer.validate())
