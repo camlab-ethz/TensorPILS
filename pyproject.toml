@@ -5,26 +5,26 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tensorpils"
 dynamic = ["version"]
-description = "Physics-Informed Learning System powered by TensorMesh (neural operators trained with FEM-derived losses)"
+description = "Preconditioned physics-informed training of neural operators with finite-element losses"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 authors = [
-    {name = "Shizheng Wen", email = "shizheng.wen@sam.math.ethz.ch"},
+    {name = "Shizheng Wen", email = "shizheng.wen@math.ethz.ch"},
+    {name = "Marius Zeinhofer", email = "marius.zeinhofer@math.ethz.ch"},
+    {name = "Siddhartha Mishra", email = "siddhartha.mishra@math.ethz.ch"},
 ]
 maintainers = [
-    {name = "Shizheng Wen", email = "shizheng.wen@sam.math.ethz.ch"},
+    {name = "Shizheng Wen", email = "shizheng.wen@math.ethz.ch"},
 ]
 keywords = [
-    "deep-learning",
     "neural-operator",
-    "fourier-neural-operator",
     "physics-informed",
-    "AI4S",
-    "ai-for-science",
-    "pytorch",
+    "preconditioning",
+    "multigrid",
     "finite-element-methods",
-    "fem",
     "partial-differential-equation",
+    "pytorch",
+    "ai-for-science",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -37,31 +37,32 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3 :: Only",
     "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Mathematics",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 requires-python = ">=3.10"
+# torch-amgx (the algebraic multigrid of the Stokes preconditioner) is not on PyPI; see README.md.
 dependencies = [
-    "tensormesh-fem",   # FEM backend; import name is `tensormesh`
-    "neuraloperator",   # provides `neuralop.models.FNO`
-    "torch>=2.0.0",
+    "tensormesh-fem>=0.2.1",    # finite-element assembly; import name `tensormesh`
+    "neuraloperator>=2.0",      # the FNO and PINO's finite differences; import name `neuralop`
+    "torch>=2.0",
     "numpy",
     "scipy",
     "meshio",
+    "gmsh",
     "matplotlib",
     "tqdm",
 ]
 
 [project.optional-dependencies]
-test = [
-    "pytest",
-    "pytest-cov",
-]
+test = ["pytest"]
 
 [project.scripts]
 tensorpils = "tensorpils.cli:main"
 
 [project.urls]
 Repository = "https://github.com/camlab-ethz/TensorPILS"
+Issues = "https://github.com/camlab-ethz/TensorPILS/issues"
 
 [tool.setuptools.dynamic]
 version = {attr = "tensorpils._version.__version__"}

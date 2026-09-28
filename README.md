@@ -1,354 +1,187 @@
 # TensorPILS
 
-**Physics-Informed Learning System powered by [TensorMesh](https://github.com/camlab-ethz/TensorMesh).**
+Code for **Preconditioned Physics-Informed Neural Operator Training**
+by Shizheng Wen\*, Marius Zeinhofer\* and Siddhartha Mishra (ETH Zürich; \*equal contribution).
 
-TensorPILS trains neural operators (currently a Fourier Neural Operator, FNO) to
-solve PDEs with loss functions built from TensorMesh's finite-element machinery — so
-most of them need **no labelled solutions**. Four PDEs are supported, selected with
-`--pde` (all on the unit square with homogeneous Dirichlet BC):
+Physics-informed losses let a neural operator learn from the governing equations alone, without
+a dataset of solutions, but they are badly conditioned: for the finite-element residual
+`L_LS(u) = ½‖Au − b‖²` the Hessian is `A²`, whose condition number grows like `h⁻⁴` under mesh
+refinement. TensorPILS trains neural operators with the **preconditioned least-squares loss**
 
-| `--pde` | Equation | Kind | Operator |
-|---------|----------|------|----------|
-| `poisson` | −Δu = f | static | source → solution |
-| `wave` | uₜₜ = c²Δu | time-dependent (2nd order) | autoregressive stepper `[uⁿ⁻¹, uⁿ] → uⁿ⁺¹` |
-| `ac` | uₜ = a²Δu + ε²u(1−u²) | time-dependent, nonlinear (1st order) | autoregressive stepper `uⁿ → uⁿ⁺¹` |
-| `stokes` | −μΔu + ∇p = f, ∇·u = 0 | static, **saddle point** (mixed Q2/Q1) | `f → (u, p)` in one pass |
+    L_PLS(u) = ½ ‖P (A u − b)‖²,     P ≈ A⁻¹  (one multigrid V-cycle),
 
-The FEM stiffness `A`, mass `M`, the analytical fields / reference solvers, and the
-boundary handling all come from TensorMesh; TensorPILS contributes the structured-grid
-bridge the FNO needs, the model, the losses, the multigrid preconditioner, and the
-training loop.
+whose conditioning is independent of the mesh for elliptic problems. The same construction covers
+nonlinear time stepping (Allen–Cahn) and, as a block-diagonal norm weight
+`½ rᵀ P r`, the Stokes saddle point on an unstructured mesh. It needs no labels, is agnostic to
+the neural operator (FNO or GAOT), and adds no cost at inference.
 
-### Losses
+The name stands for physics-informed least squares on [TensorMesh](https://github.com/camlab-ethz/TensorMesh),
+the differentiable finite-element library that assembles every operator used here.
 
-**Poisson** offers four interchangeable losses — three of them label-free:
+## Installation
 
-| Loss | Idea | Labels? |
-|------|------|---------|
-| `data` | supervised MSE against the analytical solution | yes |
-| `galerkin` | weak-form residual ‖A u − b‖² on node values | no |
-| `deepritz` | energy functional ∫(½\|∇u\|² − f u) dx (+ BC) | no |
-| `pls` | preconditioned least-squares ½‖P(A u − b)‖², P ≈ A⁻¹ from a geometric-multigrid V-cycle | no |
-
-**Wave / Allen–Cahn** are trained as autoregressive time-steppers with a weighted mix
-`λ_gal·galerkin + λ_data·data` (`--loss` presets the mix; `--lambda_galerkin` /
-`--lambda_data` override):
-
-| Loss | Idea | Labels? |
-|------|------|---------|
-| `galerkin` | label-free weak-form residual of the discrete time scheme, summed over the rollout (central-difference for wave, backward-Euler for Allen–Cahn) | no |
-| `data` | supervised MSE against the reference trajectory | yes |
-
-Wave has an analytical multi-frequency solution; Allen–Cahn has **none**, so its
-reference/labels come from a FEM implicit-Euler + Newton solver assembled from TensorMesh
-(`ACProblem.fem_reference`, run at dataset-build time).
-
-**Stokes** is a *mixed* problem: a **Taylor-Hood Q2/Q1** discretisation on a structured
-`quad9` mesh gives the symmetric indefinite saddle-point system `K = [[A, Bᵀ], [B, 0]]`,
-and the FNO emits velocity and pressure together (`(u_x, u_y, p)`, pressure read on the
-Q1 corner subgrid). Reference solutions are the discrete Taylor-Hood solve of the same
-right-hand side the residual uses.
-
-| Loss | Idea | Labels? |
-|------|------|---------|
-| `data` | supervised FE-norm error against the discrete solution, each field scaled by its own magnitude | yes |
-| `galerkin` | bare least squares ½‖Kc − b‖² — **the negative control** | no |
-| `pls` | preconditioned least squares ½ rᵀ**P**r, P = diag(Â⁻¹, Ŝ⁻¹) | no |
-
-The saddle point changes what preconditioning means. `K` is indefinite, so the bare
-residual gives a Gauss–Newton matrix `JᵀK²J` with κ = O(h⁻⁴) — measured 1.9 × 10¹¹ at `65²`,
-which costs it an order of magnitude in error at a fixed budget. And no
-block-diagonal `P` approximates `K⁻¹`, so the Poisson trick of *applying* `P` (½‖P r‖²)
-would square the conditioning right back. What works is using `P` as a **norm weight**:
-½ rᵀPr has Gauss–Newton matrix `JᵀKPKJ` and conditioning O(h⁻²). Here `Â⁻¹` is a
-geometric-multigrid V-cycle on the velocity block and `Ŝ⁻¹ = ω·μ·diag(M_p)⁻¹` the lumped
-pressure-mass surrogate for the inverse Schur complement.
-
-Two knobs on top of that, both measured in
-[`experiments/stokes/`](experiments/stokes/) rather than assumed:
-
-- `--stokes_precond monolithic` builds a **monolithic** Stokes V-cycle with an inexact
-  symmetric Uzawa smoother instead. That *is* an approximate inverse, so it unlocks the
-  applied form at **O(1)** conditioning (measured κ ≈ 11 at `33²`, against 8.7·10⁶ for the
-  weighted block form) — and mesh-independently so. But conditioning alone is not enough: the
-  nodal norm `½‖Pr‖²` is ~350× pressure-dominated for this dataset, so the metric has to be
-  fixed too (`--stokes_pls_form applied_fe`, the `auto` choice, divides each field block by its
-  own FE norm). That single change moves velocity error 19.34 % → **4.33 %**, the best
-  label-free result and better than supervised training. Since `Pr ≈ c − c*`, that loss *is*
-  the supervised objective computed from the residual.
-  Conversely the weighted form is impossible with a monolithic `P`: an approximate inverse of an
-  indefinite operator is indefinite, so `½rᵀPr` is unbounded below and diverges.
-- `--stokes_precond_strength t` blends `P_t = (1−t)·αI + t·P`, so `t=0` reproduces the bare
-  loss and `t=1` the preconditioner — one knob spanning the whole conditioning axis.
-
-`--schur_omega` means opposite things in the two: as a *norm weight* it is unconstrained and
-wants ω ≈ 16 (15× better conditioning than the default 0.5), while inside the Uzawa
-*iteration* the ω ∈ (0,1] restriction is real and ω = 2 diverges.
-
-## Install
-
-TensorPILS depends on `tensormesh-fem` (import name `tensormesh`) and
-`neuraloperator` (import name `neuralop`).
+Python ≥ 3.10 on Linux with an NVIDIA GPU:
 
 ```bash
-# On the cluster, activate the shared environment first:
-source ~/venvs/tensorgalerkin/bin/activate
-module load stack/.2024-04-silent gcc/8.5.0
-module load mesa-glu/9.0.2
-module load ffmpeg
-
-# If tensormesh-fem is not already installed, install the local checkout:
-pip install -e ../TensorMesh
-
-# Install TensorPILS in development mode:
+git clone https://github.com/camlab-ethz/TensorPILS.git
+cd TensorPILS
+pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
 pip install -e ".[test]"
+pip install https://github.com/sparsexlab/torch-amgx/releases/download/v0.1.0a14/torch_amgx-0.1.0a14-0_cu128_torch211-cp311-cp311-manylinux_2_34_x86_64.manylinux_2_35_x86_64.whl
 ```
 
-## Marius' Euler Install
+The second command pulls in [`tensormesh-fem`](https://pypi.org/project/tensormesh-fem/) ≥ 0.2.1
+(finite elements, import name `tensormesh`) and
+[`neuraloperator`](https://github.com/neuraloperator/neuraloperator) ≥ 2.0 (the FNO, import name
+`neuralop`).
 
-Cluster-specific setup for the ETH **Euler** cluster, verified working (GPU run on an
-RTX 2080 Ti). This deviates from the generic Install above: `pyproject.toml` requires
-Python `>=3.10`, but Euler's `stack/.2024-04-silent` (used in the generic notes) only
-ships Python 3.9.18. Use the `2024-05` stack, which provides a CUDA-enabled Python 3.11.
+**PyTorch and torch-amgx.** Any PyTorch ≥ 2.0 runs the Poisson and Allen–Cahn experiments. The
+Stokes preconditioner applies its velocity block with NVIDIA AmgX through
+[`torch-amgx`](https://github.com/sparsexlab/torch-amgx), which is not on PyPI and whose wheels are
+built for particular PyTorch and CUDA versions (release v0.1.0a14: PyTorch 2.11 with CUDA 12.6 or
+12.8, or PyTorch 2.6 with CUDA 12.4), hence the pinned PyTorch above. The wheel shown is for
+Python 3.11; the [releases page](https://github.com/sparsexlab/torch-amgx/releases) has one for each
+Python version. Without torch-amgx everything except the Stokes `L_PLS` runs, and the tests that
+need it are skipped.
 
-### One-time setup
+**Gmsh.** The obstacle mesh of the Stokes experiments is generated with Gmsh, whose Python wheel
+needs the system OpenGL utility library (`libGLU.so.1`, e.g. `apt install libglu1-mesa`).
+
+**Optional.** `torch-scatter` and `torch-cluster` speed up the graph operations of GAOT; without
+them a pure-PyTorch fallback is used.
+
+The commands above were tested in a clean environment with Python 3.11 on an NVIDIA RTX 4090, where
+`pytest` passes (the four tests of the optional GAOT extensions are skipped).
+
+## Quick start
+
+Every run is one call of the command-line interface (`python -m tensorpils.cli`, or the
+equivalent `tensorpils` command). Poisson on the 65 × 65 grid with the preconditioned loss:
 
 ```bash
-# 1. Clone both repos as siblings in $HOME.
-#    TensorMesh from the maintained camlab repo (public); TensorPILS is private (use a PAT).
-cd ~
-git clone https://github.com/camlab-ethz/TensorMesh.git
-git clone https://github.com/Shizheng-Wen/TensorPILS.git
-cd ~/TensorPILS && git checkout marius
-
-# 2. Load the module stack that provides a CUDA-enabled Python >= 3.10.
-conda deactivate                        # leave conda (base) if it is active
-module purge
-module load stack/2024-05 gcc/13.2.0    # deprecated/frozen but fine; exposes python/3.11.6_cuda
-module load python/3.11.6_cuda
-module load ffmpeg/6.0                  # NB: mesa-glu (generic README) is absent here and not needed
-                                        #     (viz.py renders via matplotlib/Agg, no OpenGL)
-
-# 3. Create and activate the virtual environment.
-python -m venv ~/venvs/tensorgalerkin
-source ~/venvs/tensorgalerkin/bin/activate
-pip install --upgrade pip
-
-# 4. Install TensorMesh (editable, from the clone) then TensorPILS.
-pip install -e ~/TensorMesh
-pip install -e ".[test]"                # run from ~/TensorPILS
+python -m tensorpils.cli --pde poisson --model fno --loss pls --mg_omega 0.8888888888888888 \
+    -k 10 --grid_resolution 65 --n_train 1024 --epochs 500 --lr 3e-4 --lr_min 3e-5
 ```
 
-Verify the install:
+`--loss galerkin` trains the unpreconditioned residual `L_LS` and `--loss data` the supervised
+baseline; `--loss pino` and `--model deeponet --loss pideeponet` are the PINO and physics-informed
+DeepONet baselines, whose exact settings for each table row are in the launchers of
+[`experiments/`](experiments/README.md). The other two problems of the paper:
 
 ```bash
-python -c "import torch, tensormesh, neuralop, tensorpils; print('torch', torch.__version__)"
-tensorpils --help
+# Allen-Cahn: one time step of the convex-concave scheme, residual preconditioned by a V-cycle
+python -m tensorpils.cli --pde ac --model fno --loss galerkin --ac_precond multigrid \
+    --ac_eps 32 -k 4 --grid_resolution 129 --dt 0.01 --n_steps 10 --rollout_steps 10 \
+    --batch_size 16 --lr 3e-4 --lr_min 3e-5
+
+# Stokes flow around a circular obstacle, P2/P1 elements on an unstructured mesh:
+# GAOT with the block preconditioner
+python -m tensorpils.cli --pde stokes --model gaot --loss pls --schur_omega 16 \
+    --mesh_h 0.035 -k 10 --lr 1e-3 --lr_min 1e-6
 ```
 
-### Reusable session script
+Each run writes to `--output_dir` (default `output/`): `results/<run>.json` with the configuration,
+the per-epoch statistics and the test errors, the best-validation checkpoint in `checkpoints/`,
+and diagnostic plots. `python -m tensorpils.cli --help` lists every option.
 
-Module loads and venv activation are **per-session** — they reset on every new login and
-inside every batch job. The venv and the clones themselves are persistent. Save the setup
-once so you never retype it:
+## Reproducing the paper
+
+[`experiments/`](experiments/README.md) holds one directory per experiment, each with a README
+(setup, commands, expected numbers, compute), the launchers and the scripts that turn the runs
+into the paper's tables and figures:
+
+| Paper | Directory |
+|---|---|
+| Figure 1 (Adam on a linear model) | [`experiments/graphical_abstract`](experiments/graphical_abstract/README.md) |
+| Table 1, Poisson | [`experiments/poisson/benchmark`](experiments/poisson/benchmark/README.md) |
+| Figure 2 (conditioning sweep) | [`experiments/poisson/blend_sweep`](experiments/poisson/blend_sweep/README.md) |
+| Figure 3 (infinite-data limit) | [`experiments/poisson/infinite_data`](experiments/poisson/infinite_data/README.md) |
+| Table 1, Allen–Cahn; Figure 4 | [`experiments/allen_cahn/benchmark`](experiments/allen_cahn/benchmark/README.md) |
+| Table 1, Stokes; Figure 5; preconditioner ablation | [`experiments/stokes/benchmark`](experiments/stokes/benchmark/README.md) |
+| Backbone comparison (appendix) | [`experiments/poisson/backbone`](experiments/poisson/backbone/README.md) |
+
+For example, the Poisson rows of Table 1:
 
 ```bash
-cat > ~/env_tensorpils.sh << 'EOF'
-#!/bin/bash
-# TensorPILS session setup — `source ~/env_tensorpils.sh` each login / in job scripts
-module purge
-module load stack/2024-05 gcc/13.2.0
-module load python/3.11.6_cuda
-module load ffmpeg/6.0
-source ~/venvs/tensorgalerkin/bin/activate
-EOF
+bash experiments/poisson/benchmark/run.sh          # 15 runs: 5 methods x 3 seeds
+python experiments/poisson/benchmark/summarize.py
 ```
 
-### Resume workflow (after reconnecting to Euler)
+Table 1 of the paper (test relative L² error in %, mean ± half-range over three seeds):
 
-Each time you reconnect, the shell environment is empty; reload it and work on a **compute
-node** (never train on the login node):
+| PDE | `L_PLS` (ours) | `L_data` (supervised) | PINO | PI-DeepONet |
+|---|---|---|---|---|
+| Poisson | 5.1 ± 0.8 | 4.7 ± 0.8 | 33.1 ± 1.1 | 21.4 ± 4.7 |
+| Allen–Cahn | 3.2 ± 0.3 | 2.0 ± 0.2 | 5.3 ± 1.6 | 90.0 ± 1.7 |
+| Stokes, velocity | 1.6 ± 0.2 | 3.3 ± 0.2 | — | 39.7 ± 2.1 |
+| Stokes, pressure | 0.85 ± 0.04 | 1.79 ± 0.16 | — | 36.7 ± 0.6 |
 
-```bash
-# 1. Log in and re-establish the environment.
-ssh euler
-source ~/env_tensorpils.sh              # re-loads modules + activates the venv
+Training on a GPU is not bitwise reproducible, so a rerun agrees with these numbers within the
+spread over seeds rather than digit for digit.
 
-# 2. Request a compute node. Interactive GPU session for tests/debugging:
-srun --time=00:20:00 --gpus=1 --mem-per-cpu=4G --pty bash
-source ~/env_tensorpils.sh              # fresh shell on the node -> reload env
+## Using the loss in your own code
 
-# 3. Run.
-cd ~/TensorPILS
-tensorpils --loss galerkin --n_train 16 --n_val 8 --n_test 8 -k 2 --epochs 2 --device cuda
+The finite-element operators, the preconditioners and the losses are ordinary PyTorch modules.
+A neural operator trained with `L_PLS` on the Poisson problem:
 
-# 4. Release the GPU when finished.
-exit
+```python
+import torch
+from tensorpils import (structured_quad_mesh, PoissonProblem, build_preconditioner,
+                        build_loss, grid_to_node)
+from tensorpils.models import FNOModel
+
+n, device = 65, "cuda"
+problem = PoissonProblem(structured_quad_mesh(n, n)).to(device)     # Q1 stiffness A, mass M
+P = build_preconditioner("multigrid", problem, grid_size=(n, n),   # one V-cycle, P ≈ A⁻¹
+                         mg_omega=8 / 9, device=device)
+loss_fn = build_loss("pls", problem, precond=P)                     # ½‖P(Au − Mf)‖²
+
+model = FNOModel(n_modes=(16, 16), hidden_channels=64).to(device)
+f = torch.randn(8, 1, n, n, device=device)                          # a batch of sources
+u = model(f)                                                        # [8, 1, n, n]
+loss = loss_fn(grid_to_node(u[:, 0], n, n), grid_to_node(f[:, 0], n, n))  # node values, no labels
+loss.backward()
 ```
 
-For full unattended runs, submit a batch job with `sbatch` (a job script is still TODO)
-rather than holding an interactive `srun` session.
+The losses sum over nodes and average over the batch. Any object with the
+`Preconditioner` interface (`forward(r) -> P r`) can take the place of the V-cycle.
 
-## Usage
-
-After installation a `tensorpils` console command is available (equivalent to
-`python -m tensorpils.cli`):
-
-```bash
-# --- Poisson (default --pde poisson) ---
-tensorpils --loss galerkin --n_train 800 -k 4 --epochs 500     # weak-form residual (label-free)
-tensorpils --loss deepritz --bc_mode hard --precondition       # multigrid-preconditioned Deep Ritz
-tensorpils --loss pls --mg_levels 4 --mg_pre_smooth 2          # preconditioned least-squares
-tensorpils --loss data --n_train 800 -k 4 --epochs 500         # supervised (analytical solution)
-
-# --- Wave (autoregressive time-stepper) ---
-tensorpils --pde wave --loss galerkin --dt 0.005 --n_steps 20 --rollout_steps 4 --epochs 300
-tensorpils --pde wave --loss data --wave_c 1.0 -k 4            # supervised variant
-
-# --- Allen–Cahn (nonlinear; builds a FEM Newton reference at startup) ---
-tensorpils --pde ac --loss galerkin --ac_a 1 --ac_eps 2 --dt 1e-3 --n_steps 20 --rollout_steps 4 --epochs 300
-tensorpils --pde ac --loss data -k 4                          # supervised variant
-
-# --- Stokes (Taylor-Hood Q2/Q1 saddle point; --grid_resolution is the VELOCITY grid, odd) ---
-tensorpils --pde stokes --loss pls --grid_resolution 65 --n_train 512 --epochs 300
-tensorpils --pde stokes --loss galerkin                       # negative control (~10x slower)
-tensorpils --pde stokes --loss data                           # supervised reference
-tensorpils --pde stokes --loss pls --schur_omega 16            # the measured conditioning optimum
-tensorpils --pde stokes --loss pls --stokes_precond monolithic  # P ~ K^-1, applied form, O(1)
-tensorpils --pde stokes --loss pls --stokes_precond_strength 0.9  # blend: t=0 bare -> t=1 P
-```
-
-Useful flags: `--pde {poisson,wave,ac,stokes}`, `--bc_mode {penalty,hard}` (Poisson
-`data`/`deepritz`), `--precondition` (multigrid-preconditioned Deep Ritz),
-`--grid_resolution`, `--n_modes`, `--hidden_dim`, `--num_layers`, `--optimizer`,
-`--device`, `--eval_only --checkpoint <path>`. Time-dependent PDEs add `--dt`,
-`--n_steps`, `--rollout_steps`, `--discount_factor`, `--lambda_galerkin`,
-`--lambda_data`; Allen–Cahn adds `--ac_a`, `--ac_eps`, `--ac_r`; Stokes adds
-`--stokes_mu`, `--stokes_r`, `--schur_omega`, `--stokes_precond {block,monolithic}`,
-`--stokes_pls_form {auto,weighted,applied}`, `--stokes_precond_strength`, and (monolithic)
-`--uzawa_pre/--uzawa_post/--cheb_degree/--cheb_ratio`. Run
-`tensorpils --help` for the full list.
-
-## Example results
-
-One **label-free** training case per scalar PDE, all on a `64×64` grid with `K=4` and the
-same FNO (`n_modes=(16,16)`, `hidden=64`, 5 layers, ~3.0 M params) on a single GPU. The FNO
-sees no labelled solutions during training — the reference is used only for evaluation.
-The reported error is the **median relative L² error** on the held-out test set
-(grid-space vs. the analytical/FEM reference — the same metric across every loss and PDE);
-for the time-dependent PDEs it is the error of the autoregressive rollout. Stokes has its
-own table below (two fields, two spaces).
-
-> Note: these three numbers predate the always-on evaluation-time boundary projection
-> (2026-07-07), the change of loss reduction to sum-over-nodes, and the Allen–Cahn switch
-> to the convex–concave integrator. They need a re-run before being compared against new
-> results.
-
-| PDE | `--loss` | test rel-L² (median) | val MSE | run |
-|-----|----------|----------------------|---------|-----|
-| Poisson | `pls` | **2.52 %** | 3.9 × 10⁻⁸ | `--loss pls --n_train 1024 --epochs 500 --mg_levels 4` |
-| Wave | `galerkin` | **1.47 %** | 1.0 × 10⁻⁶ | `--pde wave --n_train 512 --dt 0.005 --n_steps 20 --rollout_steps 4 --epochs 300 --lr 2e-3` |
-| Allen–Cahn | `galerkin` | **1.26 %** | 5.9 × 10⁻⁷ | `--pde ac --n_train 512 --ac_eps 2 --dt 1e-3 --n_steps 20 --rollout_steps 4 --epochs 300 --lr 2e-3` |
-
-All three reach ~1–3 % relative error **without labels**, matching supervised training
-(e.g. Poisson `--loss data` reaches 1.76 % on the same setup).
-
-For Poisson, the loss choice illustrates the library's central point: plain `galerkin`
-(the raw residual ‖Au − b‖²) is badly conditioned and stalls at **~64 %** under this
-budget, while `pls` — the *same* residual preconditioned by one geometric-multigrid
-V-cycle (P ≈ A⁻¹) — recovers supervised-like accuracy (2.52 %) with no labels.
-
-### Stokes
-
-Stokes is reported separately because velocity and pressure live in different spaces on
-different grids, so each is scored in its own FE `L²` norm. Velocity grid `65²`
-(pressure `33²`), `K=4`, 512 training samples, 300 epochs, same FNO — only the loss differs:
-
-| `--loss` | velocity rel-L² | pressure rel-L² | labels? | κ of the Gauss–Newton matrix |
-|----------|-----------------|-----------------|---------|------------------------------|
-| `data` (supervised) | 4.00 ± 0.47 % | 3.70 ± 0.51 % | yes | — |
-| `galerkin` (bare ½‖Kc−b‖²) | 51.6 ± 4.5 % | 14.1 ± 0.3 % | no | 1.9 × 10¹¹ |
-| **`pls`** (½ rᵀPr) | **5.89 ± 0.65 %** | **3.70 ± 0.57 %** | **no** | 3.5 × 10⁷ |
-
-Mean ± sample standard deviation over three seeds. The label-free preconditioned loss lands
-within 1.5 pp of supervised training on velocity and **ties it on pressure**, while the bare
-least-squares residual — the *same* residual without the norm weight — is 9× worse.
-
-Under mesh refinement (`33²/65²/129²`, everything else fixed) `pls` is **flat** —
-5.82 / 5.59 / 5.82 % velocity — while `galerkin` degrades to 82 % at `129²`.
-
-**The bare residual is slow, not stuck.** Its validation curve is still descending steeply at
-epoch 300; given 5× the budget at `65²` it reaches 10.3 % velocity, i.e. within 2× of `pls`.
-That is what a conditioning argument actually predicts — a first-order method in a valley of
-aspect ratio 10¹¹ descends slowly, not never — so "does not train" overstates it. The
-`galerkin` spread is large because that arm is nowhere near converged, and no single number
-should be quoted for it at this budget.
-
-## Experiments
-
-Reproducible experiments (description, SLURM sweep script, and plot script) live under
-[`experiments/`](experiments/README.md) — currently the blend-strength conditioning sweep
-and the out-of-distribution generalization study. See that folder's README for an index.
-
-## Outputs
-
-Each run writes under `--output_dir` (default `output/`):
-
-```
-output/
-├── checkpoints/     # best model (.pth), keyed by loss/config
-├── curves/          # training-loss + validation-error curves (.png)
-├── visualization/   # source / ground-truth / prediction / error panels (.png)
-└── error/           # test-set relative-L2 error distribution (.png)
-```
-
-## Ground truth
-
-Evaluation is **always** grid-space MSE against the reference solution, regardless of
-the training loss, so results are comparable across losses and PDEs:
-
-- **Poisson** — analytical multi-mode solution via `tensormesh.dataset.PoissonMultiFrequency`
-  (`r = -0.5`). Label-free losses drive the FNO toward the discrete FEM solution `A⁻¹b`.
-- **Wave** — analytical trajectory `u(t_k)` via `tensormesh.dataset.WaveMultiFrequency`.
-- **Allen–Cahn** — **no analytical solution**; the reference trajectory is produced by a
-  batched FEM implicit-Euler + Newton solver (`ACProblem.fem_reference`, run once at
-  dataset-build time, on the GPU when available). It solves the *same* discrete residual
-  the `galerkin` loss minimizes, so a perfectly trained label-free model matches it.
-- **Stokes** — the discrete Taylor-Hood solution of `K c = (M_u f, 0)`
-  (`StokesProblem.fem_reference`: one batched sparse float64 factorization for the whole
-  dataset). Again the *same* system the residual measures. Velocity and pressure are scored
-  **separately** in their own FE `L²` norms, since they live in different spaces on
-  different grids; the velocity is projected to the zero Dirichlet boundary and the pressure
-  to zero mean (the residual is blind to the constant pressure mode, so it is fixed by
-  projection rather than learned).
-
-## Package layout
+## Repository layout
 
 ```
 tensorpils/
-├── meshing.py        # structured quad (Q1) and quad9 (Q2) grids -> tensormesh.Mesh; grid<->node
-├── physics.py        # FEMOperator base + PoissonProblem / WaveProblem / ACProblem / StokesProblem
-├── preconditioners/  # P for the physics losses (shared Preconditioner interface + factory)
-│   ├── base.py       #   Preconditioner ABC: forward(r)->Pr, report()
-│   ├── multigrid.py  #   GeometricMultigrid V-cycle (computational path)
-│   ├── spectral.py   #   SpectralPreconditioner: convex blend / fractional power
-│   ├── stokes.py     #   StokesBlockPreconditioner: diag(mg/mu, w*mu/diag(M_p)); + blend family
-│   ├── stokes_monolithic.py  #   StokesMonolithicMultigrid: P ~ K^-1 (symmetric Uzawa smoother)
-│   └── factory.py    #   build_preconditioner(kind, ...)
-├── data.py           # create_datasets / create_wave_datasets / create_ac_datasets / create_stokes_datasets
-├── models.py         # FNOModel (wraps neuralop.models.FNO)
-├── losses.py         # Poisson (build_loss) + Wave / AC / Stokes losses (build_*_loss)
-├── optim.py          # build_optimizer
-├── trainer.py        # BaseTrainer; PoissonTrainer; StokesTrainer; RolloutTrainer -> Wave / AC
-├── viz.py            # loss curves / sample panels / (rollout) error distribution
-└── cli.py            # argparse entry point (the `tensorpils` command), dispatch on --pde
+├── meshing.py          structured quad grids, the obstacle mesh, grid <-> node ordering
+├── physics.py          finite-element operators: Poisson, Allen-Cahn, Stokes (via TensorMesh)
+├── preconditioners/    geometric multigrid, AmgX algebraic multigrid, spectral blend, Stokes block
+├── losses.py           L_data, L_LS, L_PLS for each problem
+├── data.py             datasets: random sources, FEM reference solutions
+├── models.py           FNO (from neuraloperator)
+├── gaot/               GAOT, the geometry-aware operator transformer (vendored)
+├── baselines/          PINO, DeepONet and physics-informed DeepONet
+├── trainer.py          training loops for the static and the time-stepping problems
+└── cli.py              command-line interface
+experiments/            launchers and analysis scripts of every table and figure
+tests/                  unit tests (pytest)
 ```
 
-Reproducible experiments live under `experiments/` (preconditioner sweeps, loss comparison,
-OOD generalization) — see `experiments/README.md`.
+The tests run with `pytest`; those of the AmgX preconditioner are skipped when `torch-amgx` or a
+GPU is unavailable.
 
-Extend by: adding a loss (`nn.Module` + `build_*_loss` / `build_loss` branch); an optimizer
-(`optim.build_optimizer`); a **preconditioner** (implement the `Preconditioner` interface,
-register in `build_preconditioner`); or a **new PDE** — subclass `physics.FEMOperator` with a
-`residual`, add a `create_*_datasets`, and either mirror `PoissonTrainer` (static) or subclass
-`RolloutTrainer` (time-dependent, as wave and Allen–Cahn do).
+GAOT in `tensorpils/gaot/` is transcribed from [camlab-ethz/GAOT](https://github.com/camlab-ethz/GAOT)
+with the changes listed in its module docstring, so that a single environment runs every
+experiment.
+
+## Citation
+
+```bibtex
+@article{wen2026preconditioned,
+  title   = {Preconditioned Physics-Informed Neural Operator Training},
+  author  = {Wen, Shizheng and Zeinhofer, Marius and Mishra, Siddhartha},
+  journal = {arXiv preprint},
+  year    = {2026}
+}
+```
+
+## License
+
+Apache License 2.0, see [LICENSE](LICENSE).
