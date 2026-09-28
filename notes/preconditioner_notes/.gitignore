@@ -1,9 +1,0 @@
-# LaTeX build artifacts (regenerate with pdflatex)
-*.aux
-*.log
-*.out
-*.pdf
-*.fls
-*.fdb_latexmk
-*.synctex.gz
-build.log
