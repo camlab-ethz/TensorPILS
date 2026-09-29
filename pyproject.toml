@@ -10,8 +10,8 @@ readme = "README.md"
 license = {text = "Apache-2.0"}
 authors = [
     {name = "Shizheng Wen", email = "shizheng.wen@math.ethz.ch"},
-    {name = "Marius Zeinhofer", email = "marius.zeinhofer@math.ethz.ch"},
     {name = "Siddhartha Mishra", email = "siddhartha.mishra@math.ethz.ch"},
+    {name = "Marius Zeinhofer", email = "marius.zeinhofer@math.ethz.ch"},
 ]
 maintainers = [
     {name = "Shizheng Wen", email = "shizheng.wen@math.ethz.ch"},

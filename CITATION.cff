@@ -8,11 +8,11 @@ authors:
   - family-names: Wen
     given-names: Shizheng
     affiliation: ETH Zürich
-  - family-names: Zeinhofer
-    given-names: Marius
-    affiliation: ETH Zürich
   - family-names: Mishra
     given-names: Siddhartha
+    affiliation: ETH Zürich
+  - family-names: Zeinhofer
+    given-names: Marius
     affiliation: ETH Zürich
 preferred-citation:
   type: article
@@ -20,8 +20,8 @@ preferred-citation:
   authors:
     - family-names: Wen
       given-names: Shizheng
-    - family-names: Zeinhofer
-      given-names: Marius
     - family-names: Mishra
       given-names: Siddhartha
+    - family-names: Zeinhofer
+      given-names: Marius
   year: 2026
