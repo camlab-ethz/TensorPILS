@@ -213,7 +213,5 @@ TensorPILS is released under the [Apache License 2.0](LICENSE). `tensorpils/gaot
 <p align="center">
   <a href="https://camlab.ethz.ch/"><img src="assets/affiliations/CAMLab_logo.png" alt="CAMLab, ETH Zürich" height="60"/></a>
   &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://ai.ethz.ch/"><img src="assets/affiliations/eth_ai_center_logo.png" alt="ETH AI Center" height="60"/></a>
-  &nbsp;&nbsp;&nbsp;
   <a href="https://ethz.ch/"><img src="assets/affiliations/eth-logo-pos.png" alt="ETH Zürich" height="60"/></a>
 </p>
