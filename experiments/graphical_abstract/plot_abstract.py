@@ -10,7 +10,7 @@ in the ICLR template:
 * **Type near body size.** Body text is 10 pt; labels here are 9 pt and ticks 7.5 pt, the usual
   "slightly smaller than body" convention.
 * **No equations.** Panels are named in words, so the figure reads without the caption.
-* **Downsampled.** The matrices are 4000 x 3969 (every 25th of 10^5 steps, the 63^2 interior
+* **Downsampled.** The matrices are 4000 x 3969 (every one of the 4000 steps, the 63^2 interior
   modes of the 65 x 65 grid); at 5.5 in they are aggregated to the pixel grid
   by RMS over log-spaced bins rather than subsampled, so nothing is aliased away.
 

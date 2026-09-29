@@ -18,8 +18,11 @@ right panel the relative L² error.
   (`K = 4`), initial guess `u₀ = 0` (so the initial error `−u*` is entirely smooth).
 - On a uniform grid the 2D discrete sine modes are exact eigenvectors of `A`, so every modal
   projection comes from one discrete sine transform; `run_landscape.py` verifies this at start-up.
-- Adam runs in float32; every reported error is computed in float64 against a direct solve. The
-  learning rate is tuned over nine values at a budget of `10⁴` steps, then the run takes `10⁵`.
+- Adam runs in float32 for 4000 steps, with learning rate `1e-3` cosine-annealed to `1e-5`, the
+  same for both losses; every reported error is computed in float64 against a direct solve.
+  These settings were not recorded with the paper's figure and are reconstructed from it: they
+  reproduce its curves (the drop of `L_PLS` to about `2·10⁻⁶` within 200 steps, `L_LS` falling
+  from 1 to about 0.55). Without `--lr`, `run_landscape.py` tunes the learning rate itself.
 
 ## Run
 
