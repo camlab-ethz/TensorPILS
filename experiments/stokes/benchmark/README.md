@@ -72,6 +72,13 @@ Preconditioner ablation (seed 42, test relative L² in %):
 Individual runs are not bitwise reproducible on a GPU; expect agreement within the seed spread.
 Epoch times depend on the hardware and its load.
 
+At the learning rate `1e-3`, `L_PLS` training occasionally shows a loss spike, after which the
+validation error recovers over the following epochs. Of nine runs with `ω_S = 16` (the paper's
+and later reruns of seeds 42 and 43), five spiked; eight ended between 1.31 and 1.76 % velocity
+and 0.79 and 0.90 % pressure error, and one, which spiked early (epochs 72 and 138), ended at
+3.2 % and 1.3 %. A run far above the table is therefore most likely such a spike; its validation
+curve in `results/*.json` shows it.
+
 ## Compute
 
 One run of 500 epochs takes 25–50 minutes on an RTX 4090 and a few GB of GPU memory. `run.sh` is

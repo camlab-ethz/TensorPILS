@@ -117,7 +117,8 @@ Table 1 of the paper (test relative L² error in %, mean ± half-range over thre
 | Stokes, pressure | 0.85 ± 0.04 | 1.79 ± 0.16 | — | 36.7 ± 0.6 |
 
 Training on a GPU is not bitwise reproducible, so a rerun agrees with these numbers within the
-spread over seeds rather than digit for digit.
+spread over seeds rather than digit for digit (for the occasional loss spike of Stokes `L_PLS`, see
+[`experiments/stokes/benchmark`](experiments/stokes/benchmark/README.md)).
 
 ## Using the loss in your own code
 
