@@ -61,6 +61,7 @@ test = ["pytest"]
 tensorpils = "tensorpils.cli:main"
 
 [project.urls]
+Paper = "https://arxiv.org/abs/2609.36216"
 Repository = "https://github.com/camlab-ethz/TensorPILS"
 Issues = "https://github.com/camlab-ethz/TensorPILS/issues"
 

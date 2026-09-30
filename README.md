@@ -2,7 +2,7 @@
 
 <p align="center">
   <strong>Preconditioned physics-informed training of neural operators.</strong><br/>
-  Official implementation of <em>Preconditioned Physics-Informed Neural Operator Training</em>
+  Official implementation of <a href="https://arxiv.org/abs/2609.36216"><em>Preconditioned Physics-Informed Neural Operator Training</em></a>
 </p>
 
 <p align="center">
@@ -11,6 +11,7 @@
 </p>
 
 <p align="center">
+  <a href="https://arxiv.org/abs/2609.36216">Paper</a> &nbsp;|&nbsp;
   <a href="#installation">Installation</a> &nbsp;|&nbsp;
   <a href="#quickstart">Quickstart</a> &nbsp;|&nbsp;
   <a href="#results">Results</a> &nbsp;|&nbsp;
@@ -19,7 +20,7 @@
 </p>
 
 <p align="center">
-  <!-- arXiv: <a href="https://arxiv.org/abs/XXXX.XXXXX"><img src="https://img.shields.io/badge/arXiv-XXXX.XXXXX-b31b1b" alt="arXiv"/></a> -->
+  <a href="https://arxiv.org/abs/2609.36216"><img src="https://img.shields.io/badge/arXiv-2609.36216-b31b1b" alt="arXiv:2609.36216"/></a>
   <img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python 3.10+"/>
   <img src="https://img.shields.io/badge/PyTorch-2.0%2B-ee4c2c?logo=pytorch&logoColor=white" alt="PyTorch 2.0+"/>
   <a href="https://github.com/camlab-ethz/TensorMesh"><img src="https://img.shields.io/badge/FEM-TensorMesh-2b7bb9" alt="Built on TensorMesh"/></a>
@@ -198,7 +199,7 @@ If you use this code, please cite:
 @article{wen2026preconditioned,
   title   = {Preconditioned Physics-Informed Neural Operator Training},
   author  = {Wen, Shizheng and Mishra, Siddhartha and Zeinhofer, Marius},
-  journal = {arXiv preprint},
+  journal = {arXiv preprint arXiv:2609.36216},
   year    = {2026}
 }
 ```
